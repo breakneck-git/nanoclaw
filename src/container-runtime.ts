@@ -6,13 +6,23 @@ import { execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 
+import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
+
+const envConfig = readEnvFile(['CREDENTIAL_PROXY_HOST', 'CONTAINER_HOST_GATEWAY']);
 
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'container';
 
-/** Hostname containers use to reach the host machine. */
-export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
+/** Hostname/IP containers use to reach the host machine.
+ * Apple Container: 192.168.64.1 (vmnet gateway)
+ * Docker Desktop:  host.docker.internal
+ * Override via CONTAINER_HOST_GATEWAY env var.
+ */
+export const CONTAINER_HOST_GATEWAY =
+  process.env.CONTAINER_HOST_GATEWAY ||
+  envConfig.CONTAINER_HOST_GATEWAY ||
+  'host.docker.internal';
 
 /**
  * Address the credential proxy binds to.
@@ -21,7 +31,9 @@ export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
  *   falling back to 0.0.0.0 if the interface isn't found.
  */
 export const PROXY_BIND_HOST =
-  process.env.CREDENTIAL_PROXY_HOST || detectProxyBindHost();
+  process.env.CREDENTIAL_PROXY_HOST ||
+  envConfig.CREDENTIAL_PROXY_HOST ||
+  detectProxyBindHost();
 
 function detectProxyBindHost(): string {
   if (os.platform() === 'darwin') return '127.0.0.1';
