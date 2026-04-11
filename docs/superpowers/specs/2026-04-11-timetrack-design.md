@@ -21,12 +21,12 @@ No connection to NanoClaw. Claude subscription (Max) is used for classification 
 
 | Field | Type | Notes |
 |-------|------|-------|
-| Entry | title | App name + window title |
+| Entry | title | Window title of the focus block |
 | Start | date (datetime) | Start timestamp of focus block |
 | End | date (datetime) | End timestamp of focus block |
-| Часы | formula | Existing formula — verify it doesn't depend on deleted Duration (min) |
-| Время | text | **Actual active seconds** written by sync script, e.g. `1847s` |
-| Note | text | Context for AI: URL, full window titles, app list |
+| Часы | formula | Converts `Время` to numeric minutes: `23м` → 23, `2ч` → 120. Read-only, not written by sync script. |
+| Время | text | Active duration from AW, written by sync script as `{N}м` (e.g. `23м`). `Часы` formula reads this field. |
+| Note | text | Context for AI classifier: window titles, URLs |
 | Task | relation → Tasks | Set by classification task |
 | Classified | checkbox | **New field.** True = processed by classifier |
 
@@ -82,11 +82,11 @@ Note: ActivityWatch stores timestamps in UTC. Sync script converts to local time
 
 | Field | Value |
 |-------|-------|
-| Entry | `{app} — {title}` (truncated to 100 chars) |
+| Entry | Window title (truncated to 100 chars) |
 | Start | Start timestamp of block (ISO-8601, local TZ) |
 | End | End timestamp of block (ISO-8601, local TZ) |
-| Время | `{N}s` — actual active seconds (sum of AW event durations within block) |
-| Note | `{app}: {title}\n[url: {url}]` — context for AI classifier |
+| Время | `{N}м` — active minutes rounded from AW event durations (e.g. `23м`) |
+| Note | App name, URL (if browser), any context useful for task identification |
 
 If `aw-watcher-web` is available, the URL for browser windows is appended to Note. This significantly improves AI classification.
 
