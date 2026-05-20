@@ -645,4 +645,40 @@ describe('upsertContact', () => {
     expect(row.notes).toBe('second');
     expect(row.tags.split(',').sort()).toEqual(['a', 'b', 'c']);
   });
+
+  it('is_bot survives subsequent patch that omits is_bot (sticky non-null)', () => {
+    upsertContact(
+      'g',
+      { kind: 'user', is_bot: 1 },
+      { identity: { tg_id: '42' }, source: 'sender' },
+    );
+    upsertContact(
+      'g',
+      { first_name: 'updated' },
+      { identity: { tg_id: '42' }, source: 'sender' },
+    );
+    const row = db
+      .prepare(`SELECT is_bot, first_name FROM contacts WHERE ident = ?`)
+      .get('g|id:42') as { is_bot: number; first_name: string };
+    expect(row.is_bot).toBe(1);
+    expect(row.first_name).toBe('updated');
+  });
+
+  it('kind survives subsequent patch that omits kind (sticky non-null)', () => {
+    upsertContact(
+      'g',
+      { kind: 'channel', title: 'Durov' },
+      { identity: { tg_id: '99' }, source: 'sender' },
+    );
+    upsertContact(
+      'g',
+      { title: 'Durov Updated' },
+      { identity: { tg_id: '99' }, source: 'sender' },
+    );
+    const row = db
+      .prepare(`SELECT kind, title FROM contacts WHERE ident = ?`)
+      .get('g|id:99') as { kind: string; title: string };
+    expect(row.kind).toBe('channel');
+    expect(row.title).toBe('Durov Updated');
+  });
 });

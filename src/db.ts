@@ -740,9 +740,13 @@ export function promoteContactIdent(
  * Identity resolution order: tg_id → username → name (else throw).
  *
  * Per-column conflict rules:
- *   - first_name/last_name/title/phone/link/is_bot/bio/tg_id/username:
- *       COALESCE(excluded.X, contacts.X) — sticky non-null, never blanks out
- *   - kind/source/last_seen: overwrite (excluded.X)
+ *   - first_name/last_name/title/phone/link/is_bot/kind/bio/tg_id/username:
+ *       sticky non-null — preserve existing value when patch omits the field.
+ *       For NOT NULL columns (`is_bot`, `kind`) the JS binding is `null` when
+ *       omitted, and the SQL wraps it in COALESCE(@X, contacts.X) on UPDATE
+ *       and COALESCE(@X, <default>) on INSERT so the NOT NULL constraint is
+ *       satisfied with a default on fresh rows.
+ *   - source/last_seen: overwrite (excluded.X)
  *   - enriched: MAX(contacts.enriched, excluded.enriched)
  *   - first_seen: preserved (no update)
  *   - seen_count: contacts.seen_count + 1
@@ -781,13 +785,30 @@ export function upsertContact(
   }
 
   const now = new Date().toISOString();
-  const binds = {
+  const binds: {
+    ident: string;
+    scope: string;
+    tg_id: string | null;
+    username: string | null;
+    kind: string | null;
+    is_bot: number | null;
+    first_name: string | null;
+    last_name: string | null;
+    title: string | null;
+    phone: string | null;
+    link: string | null;
+    bio: string | null;
+    first_seen: string;
+    last_seen: string;
+    source: string;
+    enriched: number;
+  } = {
     ident,
     scope,
     tg_id: opts.identity.tg_id ?? null,
     username: usernameLower,
-    kind: patch.kind ?? 'user',
-    is_bot: patch.is_bot ?? 0,
+    kind: patch.kind ?? null,
+    is_bot: patch.is_bot ?? null,
     first_name: patch.first_name ?? null,
     last_name: patch.last_name ?? null,
     title: patch.title ?? null,
@@ -802,6 +823,16 @@ export function upsertContact(
 
   // ON CONFLICT(ident) DO UPDATE: per-column rules in the spec. notes/tags are
   // deliberately omitted from UPDATE SET — they belong to the agent, not host.
+  //
+  // `is_bot` and `kind` are NOT NULL columns, so we bind null when the patch
+  // omits them and wrap with COALESCE on both sides:
+  //   - INSERT:  COALESCE(@kind, 'user') / COALESCE(@is_bot, 0) supplies the
+  //              fresh-row default without violating NOT NULL.
+  //   - UPDATE:  COALESCE(@kind, contacts.kind) / COALESCE(@is_bot, contacts.is_bot)
+  //              preserves the existing value when the caller omitted it.
+  // We reference the bind directly in the UPDATE clause (not `excluded.X`)
+  // because `excluded.X` reflects the COALESCEd INSERT value, not the original
+  // null intent — using the named bind keeps the "omitted" signal intact.
   db.prepare(
     `
     INSERT INTO contacts
@@ -809,14 +840,15 @@ export function upsertContact(
        first_name, last_name, title, phone, link, bio,
        first_seen, last_seen, seen_count, source, enriched)
     VALUES
-      (@ident, @scope, @tg_id, @username, @kind, @is_bot,
+      (@ident, @scope, @tg_id, @username,
+       COALESCE(@kind, 'user'), COALESCE(@is_bot, 0),
        @first_name, @last_name, @title, @phone, @link, @bio,
        @first_seen, @last_seen, 1, @source, @enriched)
     ON CONFLICT(ident) DO UPDATE SET
       tg_id      = COALESCE(excluded.tg_id, contacts.tg_id),
       username   = COALESCE(excluded.username, contacts.username),
-      kind       = excluded.kind,
-      is_bot     = COALESCE(excluded.is_bot, contacts.is_bot),
+      kind       = COALESCE(@kind, contacts.kind),
+      is_bot     = COALESCE(@is_bot, contacts.is_bot),
       first_name = COALESCE(excluded.first_name, contacts.first_name),
       last_name  = COALESCE(excluded.last_name, contacts.last_name),
       title      = COALESCE(excluded.title, contacts.title),
