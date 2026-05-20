@@ -3,8 +3,9 @@
 Design spec for letting the NanoClaw agent operate on the full data of every Telegram message it receives — including forward origin, mentioned/forwarded people, reply targets, and media — with a passive long-term contacts memory and on-demand media access.
 
 > **Revision history**
-> - **v2 (2026-05-20, after critical review)** — addresses 40+ defects found by parallel auditors (bot-api, storage, ipc-mcp, media-vision, regression-fit, completeness). Key structural pivot: the structured metadata block lives in a **separate DB column**, not embedded in `messages.content`, to avoid `escapeXml` mangling and `TRIGGER_PATTERN ^` regression. Multiple smaller fixes (sender_chat, external_reply, COALESCE merge, mime synthesis, command flags, retry, error contract) folded into the relevant sections.
-> - v1 (initial) — committed `ea6a614`. Showstoppers found during review; see "Pre-implementation lessons" at the end.
+> - **v3 (2026-05-20, after round 2 critical review)** — addresses ~25 verified defects against v2. Three v2 changes were CRITICAL: (a) message-loop filter `content != ''` silently dropped media-only messages, (b) the proposed `_nanoclaw_error_code` field was stripped by MCP SDK's Zod `$strip`, (c) `writeIpcFile`'s hardcoded filename collided with v2's `reqId` scheme. v3 fixes each plus the high/medium tail (sender_chat detection rule, `edited_channel_post` hook, `promoteContactIdent` merge, `errors/` sweep removal, pdftotext corruption detection, HEIC fallback, outbound storage chokepoint, debounce mechanism, mixed-history envelope shape, etc.).
+> - v2 (2026-05-20) — committed `f9036ad`. Addressed 41 v1 defects. Round 2 review found ~25 new defects (3 critical).
+> - v1 (2026-05-20) — committed `ea6a614`. Two showstoppers (escapeXml mangle, TRIGGER_PATTERN anchor).
 
 ## Context
 
@@ -21,12 +22,15 @@ The user wants the bot to:
 
 ## Behavior changes (summary)
 
-- Every inbound Telegram message attaches a single machine-readable XML block (`<m>...</m>`) to its delivery — **stored in a new `messages.meta` column, not interleaved into `content`**. The legacy `[Forwarded from ...]` / `[Reply to ...]` string prefixes are removed. `content` keeps only the user's raw text (so `TRIGGER_PATTERN` and existing text-based logic keep working unchanged).
-- `formatMessages` (the function that wraps each row into `<message>...</message>` for the agent prompt) emits the metadata block alongside the text **without `escapeXml`-ing it** — we control the block's content, the user text is still escaped.
+- Every inbound Telegram message attaches a single machine-readable XML block (`<m>...</m>`) to its delivery — **stored in a new `messages.meta` column, NOT interleaved into `content`**. The legacy `[Forwarded from ...]` / `[Reply to ...]` string prefixes are removed. `content` keeps only the user's raw text.
+- The existing message-loop filter `WHERE content != '' AND content IS NOT NULL` in `getNewMessages`/`getMessagesSince` is relaxed to **`WHERE (content != '' AND content IS NOT NULL) OR meta IS NOT NULL`** so a photo-with-no-caption is still delivered to the agent (the meta block carries the photo's file_id and structure).
+- `formatMessages` (the function that wraps each row into `<message>...</message>` for the agent prompt) emits the metadata block alongside the text **without `escapeXml`-ing it** — we control the block's content, the user text is still escaped. The `<text>` tag is emitted only when content is non-empty (consistent with all other optional tags).
 - Auto-vision is removed. Photos are no longer base64-inlined into the prompt. Media (any type) is represented in the structured block by its Telegram `file_id`; the agent calls `view_media` only when the user asks.
-- A new SQLite table `contacts` holds a deterministic, per-group log of everyone the bot has seen — forward authors (user / hidden user / chat / channel), vCard contacts, direct senders, and mentioned identifiers (`text_mention` entities are upserted from the inline `User` object; bare `@username` entities are best-effort resolved via `getChat`, which the Bot API only documents as working for channels and public supergroups).
-- The agent gets four new MCP tools: `lookup_contacts`, `annotate_contact`, `view_media`, `lookup_messages`. Each carries a precise `description` so the model knows when to invoke it.
-- File and IPC isolation remain group-scoped; the container has no direct DB or Telegram access — both reach through the existing per-group IPC namespace. The `contacts.json` snapshot mounted into the container is the same data the DB holds for that group's scope, by design — there's no privacy gain in pretending otherwise; the actual boundary is the per-group mount.
+- A new SQLite table `contacts` holds a deterministic, per-group log of everyone the bot has seen — forward authors (user / hidden user / chat / channel), vCard contacts, direct senders, mentioned identifiers (`text_mention` entities are upserted from the inline `User` object; bare `@username` entities are best-effort resolved via `getChat`, which the Bot API only documents as working for channels and public supergroups).
+- The agent gets four new MCP tools: `lookup_contacts`, `annotate_contact`, `view_media`, `lookup_messages`. Each carries a precise `description` so the model knows when to invoke it. Structured error data uses the documented `_meta` extension point of MCP content blocks (top-level extra fields are stripped by the SDK's Zod `$strip`).
+- All Telegram update kinds that can deliver new content are wired: `message`, `edited_message`, `channel_post`, `edited_channel_post`. Edits write `meta.edited=<ts>` and update `timestamp = max(message.date, edit_date)` so the message-loop's `WHERE timestamp > cursor` re-picks the edit.
+- File and IPC isolation remain group-scoped; the container has no direct DB or Telegram access — both reach through the existing per-group IPC namespace. The `contacts.json` snapshot mounted into the container is the same data the DB holds for that group's scope, by design — the boundary is the per-group mount.
+- Outbound bot text flows through a single chokepoint `routeOutbound(channels, jid, text, opts)` in `src/router.ts` which now (a) calls `channel.sendMessage` (b) on success calls `storeOutboundMessage(jid, text, channelMessageId)`. Direct `channel.sendMessage` calls outside `routeOutbound` are forbidden going forward (linted out by code review; existing call sites are migrated to `routeOutbound`).
 
 ## Structured message block
 
@@ -37,35 +41,39 @@ Format: a single `<m>` element. It lives in a new column `messages.meta TEXT`. A
 <m id="123" date="2026-05-20T10:00:00Z" ...>  ← from messages.meta, NOT escaped
   ...
 </m>
-<text>escaped user text</text>                  ← from messages.content, escaped
+<text>escaped user text</text>                  ← from messages.content, escaped; OMITTED if empty
 </message>
 ```
 
-XML matches existing project conventions (`<message>`, `<context>`, `<internal>`). All tags except `<m>` itself and `<text>` are optional and omitted when empty.
+When `messages.meta` is NULL (pre-migration rows): emit the legacy shape — `<message sender="..." time="...">${escapeXml(content)}</message>` — so the agent sees the pre-v3 format verbatim. The agent's system context explains both shapes once.
 
 ```
 <m id="123" date="2026-05-20T10:00:00Z" media_group_id="42" edited="2026-05-20T10:01:00Z">
-  <from id="222222222" un="vasya" name="Вася" premium="1" lang="ru"/>
-  <!-- OR, when the post is from a chat/anonymous admin/auto-forward, instead of <from>: -->
+  <from id="222222222" un="vasya" name="Вася" is_bot="0" premium="1" lang="ru"/>
+  <!-- OR, when sender_chat is set (anonymous admin / linked-channel auto-forward), <from> is SKIPPED entirely
+       and <sender_chat> is emitted instead. Detection rule below. -->
   <sender_chat id="-1001..." kind="channel" un="durov" title="Durov"/>
   <fwd kind="channel" chat_id="-1001..." un="durov" title="Durov"
        sig="Pavel" orig_date="2026-05-01T..." orig_msg_id="123"
        link="https://t.me/durov/123"/>
-  <reply mid="120" external="0" from_id="999" un="petya" name="Петя"
+  <reply external="0" mid="120" from_id="999" un="petya" name="Петя" is_bot="0"
          snippet="первые ≤500 символов цитируемого">
     <media type="photo" file_id="AgAC..." file_unique_id="..." mime="image/jpeg" w="1280" h="960"/>
   </reply>
-  <!-- For Bot API external_reply (cross-chat / cross-topic) the same <reply external="1"> shape is used,
-       with origin attributes mirroring <fwd>. -->
+  <!-- For Bot API external_reply (cross-chat / cross-topic): same <reply external="1"> shape, origin
+       attributes mirror <fwd>, and ALL payload tags supported at top level (media, contact, location,
+       venue, poll, story) may appear as children. -->
   <reply_to_story chat_id="..." story_id="..."/>
   <quote>фрагмент Bot API 7.0 ручной цитаты</quote>
   <media type="document" file_id="BQAC..." file_unique_id="..." mime="application/pdf"
          name="report.pdf" size="20480"/>
+  <!-- Stickers carry both type discriminator and synthesized mime: -->
+  <media type="sticker" sticker_kind="regular" file_id="..." mime="image/webp" w="512" h="512" emoji="🐬"/>
   <entities>
     <url>https://example.com</url>
     <mention>target_user</mention>
     <textlink href="https://y.com">текст</textlink>
-    <text_mention id="111" un="ivan" name="Иван"/>
+    <text_mention id="111" un="ivan" name="Иван" is_bot="0"/>
     <custom_emoji id="5368324170671202286"/>
     <hashtag>news</hashtag>
     <cashtag>BTC</cashtag>
@@ -78,32 +86,36 @@ XML matches existing project conventions (`<message>`, `<context>`, `<internal>`
 </m>
 ```
 
-Tag reference. *All attributes optional unless marked **req**.*
+Tag reference. *All attributes optional unless marked **req**. All tags except `<m>` itself are optional and omitted when empty.*
 
 | Tag | Source (Bot API field on `Message`) | Notes |
 |---|---|---|
-| `<m>` (req) | the message itself | `id`=message_id; `date`=ISO; `media_group_id` when present (album correlation); `edited`=ISO of edited_message edit, omitted on first delivery |
-| `<from>` | `from?: User` | Omitted when `from` is absent (channel posts, anonymous admins, linked-channel auto-forwards). `un` is username without `@`. |
-| `<sender_chat>` | `sender_chat?: Chat` | Emitted INSTEAD of `<from>` when the message is on behalf of a chat (anonymous admin in supergroup, linked channel auto-forward). `kind` ∈ {private, group, supergroup, channel}. |
-| `<fwd>` | `forward_origin` (Bot API 7.0+) | `kind` ∈ {user, hidden_user, chat, channel}. `link` is derivable **only** for `kind='channel'` (only `MessageOriginChannel` carries `message_id`). For `kind='chat'`, `link` is omitted. Legacy `forward_from*` fields are NOT used (not present in grammy ≥3.x types). |
-| `<reply>` | `reply_to_message?: Message` OR `external_reply?: ExternalReplyInfo` | `external="0"` for in-chat reply, `external="1"` when sourced from `external_reply` (cross-chat / linked-channel discussion group). The external case carries `origin` attributes (same shape as `<fwd>`) plus media. |
-| `<reply_to_story>` | `reply_to_story?: Story` | New top-level reply target distinct from message replies. |
-| `<quote>` (text) | `quote?.text` (Bot API 7.0+) | The manual partial-text quotation Telegram added in 7.0. |
-| `<media>` | `photo` / `video` / `voice` / `audio` / `document` / `sticker` / `animation` / `video_note` | `type`, `file_id` (req), `file_unique_id`, `mime`, `size`, type-specific (`w`,`h`,`duration`,`name`,`emoji`). For **stickers and photos**, the Bot API does NOT include a `mime_type` field; the host **synthesizes**: stickers→`is_animated=true` → `application/x-tgsticker`; `is_video=true` → `video/webm`; else → `image/webp`. Photos → always `image/jpeg` (Telegram convention). |
-| `<media transcript=... transcript_status=...>` | voice/video_note | Voice transcription via Groq path is preserved. `transcript_status` ∈ {ok, failed, missing_key, skipped}. When `ok`, `transcript` holds the text; otherwise the attribute is absent and the user-visible text body in `<text>` falls back to a placeholder. |
-| `<entities>` | `message.entities` | Children: `<url>`, `<mention>` (text-only @, lowercase, no `@`), `<textlink href>`text`</textlink>`, `<text_mention id un name/>`, `<custom_emoji id/>`, `<hashtag>`, `<cashtag>`, `<bot_command>`, `<phone>`, `<email>`. Formatting-only entities (`bold`, `italic`, `code`, `pre`, `spoiler`, `blockquote`) are dropped — agent gets the visible text anyway. |
-| `<contact>` | `message.contact?: Contact` | `phone`, `name`, `user_id`, `vcard_raw` (full vCard string preserved for later parsing). |
+| `<m>` (req) | the message itself | `id`=message_id; `date`=ISO; `media_group_id` when present; `edited`=ISO of edit (when message is an edited_* update) |
+| `<from>` | `from?: User` | **Skipped entirely when `message.sender_chat` is set** (Bot API populates a synthetic GroupAnonymousBot/Channel_Bot `from` in those cases — including its real-looking fields. v3 always prefers `sender_chat` when both exist. Detection rule: `if (message.sender_chat) emit sender_chat else if (message.from) emit from`.). `is_bot` always emitted. `un` is username without `@`. |
+| `<sender_chat>` | `sender_chat?: Chat` | Emitted INSTEAD of `<from>` when present. `kind` ∈ {private, group, supergroup, channel}. |
+| `<fwd>` | `forward_origin` (Bot API 7.0+) | `kind` ∈ {user, hidden_user, chat, channel}. **Unknown kinds** (future Bot API additions) emit `<fwd kind="unknown" raw="{json-escaped}"/>` so we never silently drop forward context. `link` is derivable **only** for `kind='channel'` (only `MessageOriginChannel` carries `message_id`); omitted for other kinds. Legacy `forward_from*` fields are NOT used (not present in grammy ≥3.x). |
+| `<reply>` | `reply_to_message?: Message` OR `external_reply?: ExternalReplyInfo` | `external="0"` for in-chat reply, `external="1"` for `external_reply` (cross-chat / linked-channel discussion group). The external case carries origin attributes (same shape as `<fwd>`) **plus all top-level payload tags that can appear there**: `<media>`, `<contact>`, `<location>`, `<location ... venue=...>`, `<poll question=...>`, `<reply_to_story>`. Drops poll options (just the question), dice (just the value/emoji). |
+| `<reply_to_story>` | `reply_to_story?: Story` | Story has only `chat`, `id`. No media — agent cannot `view_media` on it. |
+| `<quote>` (text) | `quote?.text` (Bot API 7.0+) | Manual partial-text quotation. |
+| `<media>` | `photo` / `video` / `voice` / `audio` / `document` / `sticker` / `animation` / `video_note` | `type`, `file_id` (req), `file_unique_id`, `mime`, `size`, type-specific (`w`,`h`,`duration`,`name`,`emoji`). For **stickers**, the Bot API has no `mime_type` — host **synthesizes**: `is_animated=true` → `application/x-tgsticker`; `is_video=true` → `video/webm`; else → `image/webp`. Sticker also carries `sticker_kind` ∈ {regular, mask, custom_emoji} (orthogonal to format). Photos always synthesize `image/jpeg` (Telegram convention; PhotoSize has no mime field). |
+| `<media transcript=... transcript_status=...>` | voice/video_note | Voice transcription via Groq path is preserved. `transcript_status` mapping: `ok` (Groq returned non-empty text → stored in `transcript`); `failed` (Groq HTTP/network error); `missing_key` (`GROQ_API_KEY` absent); `skipped` (voice path disabled by config / file too large). When non-`ok`, `transcript` is omitted. |
+| `<entities>` | `message.entities` | Children: `<url>`, `<mention>` (text-only @, lowercase, no `@`), `<textlink href>`text`</textlink>`, `<text_mention id un name is_bot/>`, `<custom_emoji id/>`, `<hashtag>`, `<cashtag>`, `<bot_command>`, `<phone>`, `<email>`. Formatting-only entities (`bold`, `italic`, `code`, `pre`, `spoiler`, `blockquote`) dropped. |
+| `<contact>` | `message.contact?: Contact` | `phone`, `name`, `user_id`, `vcard_raw`. |
 | `<location>` | `message.location` / `message.venue` | `lat`, `lon`, `title`, `address`. |
 
 All block construction lives in one module so every channel handler is one-line: `const meta = buildMetaBlock(message);` and `onMessage` carries `meta` as a separate field on `NewMessage`.
 
-### Handling edited messages
+### Handling all four message-update kinds
 
-When Telegram delivers `edited_message`, the host upserts the same `messages` row (PK is `(id, chat_jid)`) — `meta` is rewritten with `edited=<ts>`, contacts re-upserted (in case the edit added/removed entities). The agent receives the EDITED row on the next message-loop tick as if it were new; the previous version is no longer in DB. **Trade-off accepted:** the agent doesn't see the edit history. Rationale: the user can re-state if needed, and storing diff history multiplies storage cost. Listed in known limitations.
+Bot API delivers four distinct updates:
+- `message` (non-channel new) and `channel_post` (channel new) — INSERT new row.
+- `edited_message` (non-channel edit) and `edited_channel_post` (channel edit) — INSERT OR REPLACE the existing `(id, chat_jid)` row; `meta.edited` is set, `timestamp = max(message.date, edit_date)` so the message-loop's `WHERE timestamp > cursor` re-picks the edited row. Contacts re-upserted in case the edit changed entities.
+
+The host wires all four hooks. Skipping `edited_channel_post` would silently swallow channel edits (the Bot API type-narrows `edited_message` away from channel chats).
 
 ### Albums (`media_group_id`)
 
-Telegram delivers a multi-photo album as **N separate Updates** sharing one `media_group_id`. Only the first usually carries the caption. The host writes each as its own `<m media_group_id="...">` row; the agent correlates them via the shared id. No server-side reassembly in v1.
+Telegram delivers a multi-photo album as **N separate Updates** sharing one `media_group_id`. Only the first usually carries the caption. The host writes each as its own `<m media_group_id="...">` row; the agent correlates via the shared id. No server-side reassembly in v1.
 
 ## Contacts memory
 
@@ -116,6 +128,7 @@ CREATE TABLE IF NOT EXISTS contacts (
   tg_id       TEXT,
   username    TEXT,                     -- lowercased, no '@'
   kind        TEXT NOT NULL,            -- 'user' | 'hidden_user' | 'chat' | 'channel'
+  is_bot      INTEGER NOT NULL DEFAULT 0,
   first_name  TEXT,
   last_name   TEXT,
   title       TEXT,                     -- for chat/channel
@@ -131,122 +144,151 @@ CREATE TABLE IF NOT EXISTS contacts (
   tags        TEXT                      -- agent-written, NEVER overwritten by host upsert
 );
 CREATE INDEX IF NOT EXISTS contacts_scope_username ON contacts(scope, username);
-CREATE INDEX IF NOT EXISTS contacts_scope_tg_id ON contacts(scope, tg_id);
+CREATE INDEX IF NOT EXISTS contacts_scope_tg_id    ON contacts(scope, tg_id);
 ```
 
-Identity resolution at upsert: prefer `tg_id` (`"<scope>|id:<tgId>"`); else lowered `username` (`"<scope>|un:<u>"`); else `lowered(first_name+last_name)` (`"<scope>|name:<n>"`). When a row was first written under `un:` and a later inbound reveals `tg_id`, the host **promotes** the row in a single transaction: copy fields and `notes`/`tags` from the `un:` row into a new `id:` row via `INSERT OR REPLACE`, then delete the `un:` row. This eliminates the v1 duplicate-row hazard the original spec acknowledged.
+`is_bot` is required because Bot API's `User.is_bot` is required (`@grammyjs/types/manage.d.ts:43`) and the agent needs it to decide DM feasibility.
 
-### Upsert merge semantics
+### Identity resolution and `promoteContactIdent` MERGE
+
+Identity at upsert: prefer `tg_id` (`"<scope>|id:<tgId>"`); else lowered `username` (`"<scope>|un:<u>"`); else `lowered(first_name+last_name)` (`"<scope>|name:<n>"`).
+
+When a row was first written under `un:` and a later inbound reveals `tg_id`, the host **promotes** in a single SQLite transaction. The promotion is a **column-wise MERGE**, not `INSERT OR REPLACE`, because the `id:` row may ALREADY exist (e.g. agent annotated it earlier):
+
+```sql
+BEGIN;
+-- Pull existing id-row if any
+-- Compute merged values:
+--   first_name, last_name, title, phone, link, bio : COALESCE(id_row.X, un_row.X)
+--   notes  : id_row.notes IF NOT NULL ELSE un_row.notes   (id-row wins; never NULL-overwrite)
+--   tags   : append-unique(id_row.tags, un_row.tags)
+--   first_seen : MIN(id_row.first_seen, un_row.first_seen)
+--   last_seen  : MAX(id_row.last_seen,  un_row.last_seen)
+--   seen_count : id_row.seen_count + un_row.seen_count
+--   enriched   : MAX(id_row.enriched, un_row.enriched)
+INSERT INTO contacts (ident, scope, tg_id, username, kind, ...) VALUES (...)
+  ON CONFLICT(ident) DO UPDATE SET ... = merged_value ...;
+DELETE FROM contacts WHERE ident = '<scope>|un:<u>';
+COMMIT;
+```
+
+Column `notes` is NEVER NULL-overwritten on the id-row even by promotion. Column `tags` is append-unique. This preserves agent-written annotations across promotion.
+
+### Upsert merge semantics (regular path)
 
 The host upsert uses `ON CONFLICT(ident) DO UPDATE SET` with explicit per-column rules (matches the convention in `src/db.ts:194-211`):
 
 | Column | Conflict rule |
 |---|---|
-| `first_name`, `last_name`, `title`, `phone`, `link` | `COALESCE(excluded.X, contacts.X)` — keep existing non-null, fill in from new |
+| `first_name`, `last_name`, `title`, `phone`, `link`, `is_bot` | `COALESCE(excluded.X, contacts.X)` |
 | `bio` | `COALESCE(excluded.bio, contacts.bio)` — getChat-supplied, sticky |
 | `kind`, `source` | overwrite (most recent observation wins) |
-| `enriched` | `MAX(contacts.enriched, excluded.enriched)` — once true, stays true |
+| `enriched` | `MAX(contacts.enriched, excluded.enriched)` |
 | `first_seen` | preserved (`contacts.first_seen`) |
 | `last_seen` | overwrite (`excluded.last_seen`) |
 | `seen_count` | `contacts.seen_count + 1` |
 | `notes`, `tags` | **NEVER touched by host** — only `annotate_contact` writes |
 
-This guarantees notes/tags written by the agent are never clobbered by a subsequent inbound, and enriched bio survives sparse later observations.
-
 ### Scope and main-group cross-scope view
 
 Per-group isolation by default: `contacts.scope = group_folder`. The agent in group X queries only X's contacts.
 
-The **main group** sees a UNION across all groups, following the existing precedent at `src/container-runner.ts:884` (`writeGroupsSnapshot` emits all groups when `isMain`). Rationale: the user usually issues "напиши Пете" in their main chat, and Petya was learned in a sibling group. The snapshot writer emits `contacts.json` filtered to the consuming group's scope when not main, OR the union for main.
+The **main group** sees a UNION across all groups, following the existing precedent at `src/container-runner.ts:884` (`writeGroupsSnapshot` emits all groups when `isMain`). The snapshot writer emits `contacts.json` filtered to the consuming group's scope when not main, OR the union for main.
 
 ### Host upsert rules (when and what)
 
-Order on every inbound message (BEFORE `storeMessage`, to keep upsert observable to the agent on the same turn):
+Order on every inbound (BEFORE `storeMessage`, to keep upsert observable to the agent on the same turn):
 
 | Trigger | Source value | Notes |
 |---|---|---|
-| `message.from` | `sender` | When `from` is present |
-| `message.sender_chat` | `sender` | When the message is on behalf of a chat (anonymous admin / auto-forward); upserted with `kind='channel'` or `'chat'` |
-| `forward_origin` (any kind) or, in `external_reply`, its origin | `forward` | `hidden_user` keys on lowered name (best effort) |
-| `reply_to_message.from` | `reply` | Only when reply target carries a `from` |
-| `external_reply` origin author | `reply` | When external_reply present, its `origin` carries the author |
+| `message.from` | `sender` | When `from` is present AND `sender_chat` is NOT present (otherwise from is the synthetic GroupAnonymousBot/Channel_Bot — skip) |
+| `message.sender_chat` | `sender` | Replaces the from-upsert when present. Upserted with `kind='channel'` or `'chat'`. |
+| `forward_origin` (any kind) or, in `external_reply`, its origin | `forward` | `hidden_user` keys on lowered name |
+| `reply_to_message.from` | `reply` | When reply target carries a `from` |
+| `external_reply` origin author | `reply` | When external_reply present, its origin carries the author |
 | `message.contact` (vCard) | `vcard` | populates `phone`; if `user_id` present, key on it |
-| `entities[type='text_mention'].user` | `text_mention` | The entity already carries a full `User` object — upsert immediately, no network call |
+| `entities[type='text_mention'].user` | `text_mention` | Entity carries full `User` object — upsert immediately, no network call. `is_bot` propagated. |
 | `entities[type='mention']` (bare `@username`) | (queued for enrichment) | See below |
 
-**`@username` (bare mention) enrichment** is fire-and-forget after delivery, with explicit scope:
+**`@username` enrichment** is fire-and-forget after delivery, with explicit scope:
 
-- Only attempt `getChat('@'+username)` when the username plausibly resolves: per Bot API docs, this works for **channels and public supergroups**. For private users, getChat returns `Bad Request: chat not found` ≈always — so the spec **does not** claim enrichment for arbitrary user mentions.
-- A baseline row is upserted on first sight (`source='mention'`, `enriched=0`) so the agent's `lookup_contacts` at least knows the username exists.
-- The host queues one getChat per (scope, username) per 24h. On success → upsert `source='getChat'`, `enriched=1`, `bio`, and (if returned) `tg_id`/`title`/`first_name`. On 400/404 → leave row at `enriched=0` and skip future attempts for 7 days.
-- Rate limiting: in-process token bucket of 1 getChat/sec (Telegram's documented soft cap). Overflow is queued, not dropped.
+- Bot API contract (`@grammyjs/types/methods.d.ts:1180-1182`): `getChat({chat_id})` accepts `@channelusername` form ONLY for channels and public supergroups. Private user `@username` returns `Bad Request: chat not found` ≈always. v3 does **not** promise enrichment for user mentions.
+- A baseline row is upserted on first sight (`source='mention'`, `enriched=0`) so `lookup_contacts` at least knows the username exists.
+- One getChat attempt per (scope, username), then cached: success → 24h skip; failure → 7d skip.
+- Rate limit: in-process token bucket of 1 getChat/sec. Overflow queued, not dropped.
 
 ## On-demand media (`view_media`)
 
-Container has no Telegram token or network to Telegram (credential proxy only forwards to Anthropic). The host performs every download. Mechanism: request/response over file IPC.
+Container has no Telegram token or network to Telegram (credential proxy only forwards to Anthropic). Host performs every download. Mechanism: request/response over file IPC.
 
 ### Flow
 
 1. Agent reads a `file_id` from the structured block of the current message, its `<reply>` block, or a historical message via `lookup_messages`.
 2. Agent calls `view_media({ file_id, mode?: 'auto'|'image'|'text', pages?: 'N-M' })`.
-3. The tool writes `data/ipc/<group>/media-requests/<reqId>.json` (filename returned by `writeIpcFile`) and **polls** `data/ipc/<group>/media-responses/<reqId>.json` with a **120s bounded timeout** (revised from v1's 30s; a 20MB document on a slow link can exceed 30s end-to-end).
-4. Host watcher (extended `src/ipc.ts`): validates the request comes from the group's IPC namespace (existing per-group isolation = authorization), pre-checks `message.document.file_size` (already in the structured block) against the **20MB Bot API cap** — if exceeded, writes a structured error response immediately (no `getFile` attempt). Else: calls Telegram `getFile(file_id)` → downloads → routes by mime → writes response → deletes the request file.
-5. Tool reads the response, returns it as an MCP content block.
+3. The tool writes the request file with a deterministic, caller-supplied filename via the extended `writeIpcFile(dir, data, filenameOverride?)`. **`writeIpcFile` is updated in v3** to accept an optional filename override; without the override it preserves its existing `${Date.now()}-${rand}.json` behavior (back-compat). The override is `${reqId}.json` where `reqId = "${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}"`.
+4. The tool polls `data/ipc/<group>/media-responses/<reqId>.json` with **`pollResponseFile(reqId, 120000, 100)`** — 120s ceiling, 100ms cadence (chosen as the existing host watcher's `IPC_POLL_INTERVAL=1000` is the binding lower bound, so faster polling buys nothing on the server side but keeps client latency tight). Optionally upgraded to `fs.watch` when available.
+5. Host watcher (extended `src/ipc.ts`): authorizes by the per-group IPC namespace (the request file is in this group's dir → it belongs to this group); pre-checks `message.document.file_size` against the **20MB Bot API cap** — if exceeded, writes a structured error response immediately (no `getFile` attempt). Else: calls Telegram `getFile(file_id)` → downloads → routes by mime → writes response → deletes the request file.
+6. Tool reads the response, returns it as an MCP content block.
 
-### reqId generation and correlation
+### Retry, timeout, response sweep
 
-`reqId = "${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}"` — collision odds vanishingly small in the per-group window. Request filename equals reqId; the response filename must equal the request reqId (the host reads the request filename, writes the response under the same name). Concurrent calls in one agent turn each poll only their own `<reqId>.json` — no shared watcher state.
-
-### Retry and timeout
-
-- Telegram `getFile` and the actual file download retry on 429/503/5xx with exponential backoff up to 3 attempts (mirrors the existing `credential-proxy` policy at `src/credential-proxy.ts:28+`). On 4xx other than 429 → no retry.
-- If 120s elapses before a response file appears, the tool returns a structured timeout error. The host's watcher independently sweeps `media-requests/` on startup AND every 5 minutes: any request file older than 180s gets a timeout-error response written, then the request is unlinked. This handles host restarts mid-flight, crashed containers, and runaway downloads.
-- `media-responses/` files older than 180s are unlinked unconditionally (sweep at startup + every 5 min). Container is expected to read+unlink under normal flow; the sweep handles missed cases.
+- Telegram `getFile` and the actual file download retry on 429/503/5xx with exponential backoff: **initial attempt + 3 retries = 4 total attempts**, backoffs 1s, 2s, 4s, 8s (`Math.min(1000*2^attempt, 8000)`, mirroring `src/credential-proxy.ts:28+`). Total max ≈15s. On 4xx other than 429 → no retry.
+- If 120s elapses, tool returns `TIMEOUT`. Host watcher independently sweeps `media-requests/` on startup and every 5 minutes: any request file older than 180s gets a `TIMEOUT` response written then the request is unlinked.
+- `media-responses/` files older than 180s are unlinked unconditionally (sweep at startup + every 5 min).
+- **`errors/` directory is NOT swept.** It is the existing quarantine destination for unrecoverable IPC files (parse failures, exhausted retries) — its purpose is operator review and a TTL defeats that. v3 only sweeps the new request/response namespaces.
 
 ### Mime routing (`mode='auto'` default)
 
 | Mime / type | Handling | MCP content returned |
 |---|---|---|
-| `image/*` (incl. image documents, static stickers via synthesized mime) | download → `processImage()` (existing helper at `src/image.ts`) — always re-encodes to JPEG quality 85 | `{ type:'image', data, mimeType:'image/jpeg' }` |
-| `application/x-tgsticker` (animated TGS), `video/webm` (video sticker), `video/mp4` (video) | not downloaded | `{ type:'text', text:'тип X не отображается; <descriptor: kind, duration, size>' }` |
-| `application/pdf` (default `mode:'auto'` or `mode:'text'`) | `pdftotext -layout -enc UTF-8 -nopgbrk - -` (stdin/stdout); truncate output to ≤500KB with `…[truncated]` marker | `{ type:'text', text }` |
-| `application/pdf` (`mode:'image'`, with `pages:'N-M'`, **default `'1-1'`, hard cap 10 pages**) | `pdftoppm -jpeg -r 150 -f N -l M <tmpfile> <prefix>` then read each `<prefix>-K.jpg` (then unlink) | array of `{ type:'image', data, mimeType:'image/jpeg' }`, one per page; reject if N..M is open-ended or spans > 10 pages |
-| `text/*`, JSON/YAML/Markdown | UTF-8 decode, trim to ≤200KB | `{ type:'text', text }` |
-| voice (any), audio (non-image) | not downloaded by view_media; transcript already lives in `<m><media transcript=...>` | `{ type:'text', text:'voice: see message transcript' }` |
-| other (office, archives, unknown) | no download | `{ type:'text', text:'тип X не отображается; <descriptor>' }` |
+| `image/jpeg`, `image/png`, `image/gif`, `image/webp` (incl. image documents, static stickers via synthesized mime) | download → `processImage()` (existing helper at `src/image.ts`) — always re-encodes to JPEG quality 85 at ≤1024px long edge | `{ type:'image', data, mimeType:'image/jpeg' }` |
+| `image/heic`, `image/heif`, `image/tiff` (and any other image mime sharp doesn't decode) | sharp's prebuilt binary on macOS does not support HEIC (libheif not bundled). Host attempts `processImage`; on throw, returns `UNSUPPORTED_TYPE` with a hint to convert | `isError` |
+| `application/x-tgsticker` (animated TGS), `video/webm` (video sticker), `video/mp4` (video), `video/quicktime` | not downloaded | text descriptor + `_meta.unsupported_kind` |
+| `application/pdf` (default `mode:'auto'` or explicit `mode:'text'`) | `pdftotext -layout -enc UTF-8 -nopgbrk - -` (stdin/stdout). After exit: if stderr contains `Syntax Error`/`May not be a PDF file`, return `EXTRACTOR_OUTPUT_INVALID`. If stdout empty, same. Else truncate to ≤500KB with `…[truncated]` marker. | `{ type:'text', text }` |
+| `application/pdf` (explicit `mode:'image'`, with `pages:'N-M'`, default `'1-1'`, hard cap 10 pages) | write PDF buffer to a `mkdtemp` directory; `pdftoppm -jpeg -r 150 -f N -l M <tmpfile> <prefix>` then read each `<prefix>-K.jpg`; rmdir at end (always, including error paths via `try/finally`) | array of `{ type:'image', data, mimeType:'image/jpeg' }` |
+| `text/*`, `application/json`, `application/yaml` | UTF-8 decode, trim to ≤200KB | `{ type:'text', text }` |
+| voice (any mime), audio (non-image) | not downloaded by view_media; transcript lives in `<m><media transcript=...>` if Groq path succeeded | `{ type:'text', text:'voice: see message transcript' }` |
+| other (office, archives, unknown) | not downloaded | `{ type:'text', text:'тип X не отображается; <descriptor>' }` |
 
-`pdftotext` / `pdftoppm` come from `poppler-utils` (macOS: `brew install poppler`). When the binary is absent, the host returns the structured error `EXTRACTOR_MISSING` — the rest of the system keeps working.
+`pdftotext` / `pdftoppm` come from `poppler-utils` (macOS: `brew install poppler`). When absent, host returns `EXTRACTOR_MISSING`.
 
 ### Error contract
 
-All `view_media` and `lookup_messages` errors return as **MCP tool errors** (`isError: true`) with structured content:
+All `view_media` and `lookup_messages` errors return as MCP tool errors using the documented `_meta` extension point (top-level extra fields are dropped by the MCP SDK's Zod `$strip`):
 
 ```json
 { "isError": true,
-  "content": [{ "type": "text",
-                "text": "<error_code>: <human message>",
-                "_nanoclaw_error_code": "<code>" }] }
+  "content": [{
+    "type": "text",
+    "text": "<error_code>: <human message>",
+    "_meta": {
+      "error_code": "<code>",
+      "retryable": true|false,
+      "retry_after_ms": 60000   // optional, for transient errors with hint
+    }
+  }]
+}
 ```
 
-Error codes:
+| Code | When | `retryable` |
+|---|---|---|
+| `TIMEOUT` | 120s polling exhausted | true |
+| `UPSTREAM_ERROR` | `getFile` non-retryable error after host's own retries | true |
+| `FILE_TOO_LARGE` | `file_size > 20MB` (pre-flight) | false |
+| `FILE_EXPIRED` | Telegram `getFile` returns "file is too old" | false |
+| `EXTRACTOR_MISSING` | `pdftotext`/`pdftoppm` not on PATH | false |
+| `EXTRACTOR_OUTPUT_INVALID` | pdftotext returned `Syntax Error`/empty for what should be a PDF | false |
+| `UNSUPPORTED_TYPE` | mime not in any image/text branch, OR `processImage` failed (e.g. HEIC) | false |
+| `PAGES_OUT_OF_RANGE` | `pages` exceeds 10-page cap or invalid range | false |
+| `AUTH_REJECTED` | request was in another group's IPC namespace (won't happen normally) | false |
 
-| Code | When |
-|---|---|
-| `TIMEOUT` | 120s polling exhausted |
-| `FILE_TOO_LARGE` | `file_size > 20MB` (pre-flight) |
-| `FILE_EXPIRED` | Telegram `getFile` returns "file is too old" |
-| `EXTRACTOR_MISSING` | `pdftotext`/`pdftoppm` not on PATH |
-| `UNSUPPORTED_TYPE` | mime not in any image/text branch |
-| `PAGES_OUT_OF_RANGE` | `pages` exceeds 10-page cap or invalid range |
-| `UPSTREAM_ERROR` | `getFile` non-retryable error after retries |
-
-The agent SDK surfaces tool errors visibly to the model (not silently consumed), so the agent can explain to the user "не смог посмотреть файл — слишком большой" instead of hallucinating around an opaque failure.
+The `text` field also redundantly prefixes the code so even a `_meta`-blind parser gets the signal. The agent SDK surfaces tool errors visibly to the model.
 
 ### Reply / forward "посмотри" workflows
 
-- User replies to a media message with "посмотри X" → new message's `<m><reply><media file_id=.../></reply></m>` → agent calls `view_media(file_id)`. Works for both `reply_to_message` (in-chat) and `external_reply` (cross-chat: linked-channel discussion groups).
+- User replies to a media message with "посмотри X" → new message's `<m><reply><media file_id=.../></reply></m>` → agent calls `view_media(file_id)`. Works for both `reply_to_message` (in-chat) and `external_reply` (cross-chat).
 - User forwards a media message and adds their own text including "посмотри" → the forward IS the current message; its `<m>` has top-level `<media file_id=.../>` AND the text the user added is in `<text>`. Agent → `view_media(file_id)`.
-- Historical media → agent finds the `file_id` via `lookup_messages` (returns each row's `meta` column including `<media>`) → `view_media(file_id)`. Telegram file_ids are stable for the originating bot ("`file_id` may be used to download or reuse this file" — Bot API docs and FAQ).
+- Historical media → agent finds the `file_id` via `lookup_messages` → `view_media(file_id)`. Telegram file_ids are stable for the originating bot.
 
 ## Conversation access (`lookup_messages`)
 
@@ -259,103 +301,138 @@ lookup_messages({
   since?, until?,     // ISO range
   query?,             // substring, case-insensitive LIKE on text (NOT on meta)
   include_bot?,       // default false — bot's own replies excluded
-  limit?              // default 50; server clamps to ≤200
+  limit?              // default 50; server clamps to [1, 200]
 }) -> formatted text (same style as formatMessages) including each row's meta + text
 ```
 
-Hard caps enforced server-side:
-- `limit` clamped to `[1, 200]` regardless of caller input.
-- Response body truncated to ≤500KB; on truncation, a final `<truncated count="N"/>` row is appended so the agent knows there's more.
-- When ALL filters are empty (`{}`), defaults to last 50 messages in the group's chats — never returns the full table.
+Hard caps enforced server-side: `limit` clamped to `[1, 200]`; response body ≤500KB; on truncation, append `<truncated count="N"/>` to the result. When ALL filters empty (`{}`), defaults to last 50 messages in the group's chats.
 
-**`include_bot` honesty:** bot outbound replies are currently NOT stored in `messages` — verified via grep. This implementation therefore **also adds** writing outbound bot text to `messages` with `is_from_me=1, is_bot_message=1` so `include_bot=true` actually returns the bot's past replies. Without this, the parameter is dead. The storage hook is in the wrapped `channel.sendMessage` lambda at `src/index.ts` (around the scheduler/IPC outbound paths and the streaming output callback).
+### Outbound storage (single chokepoint)
 
-Reply chain walking is just repeated calls: `<reply mid="X">` → `lookup_messages({tg_message_id: X})` → its `<reply mid="Y">` → another call. No special primitive.
+`include_bot=true` requires that the bot's outbound replies be in `messages`. In v3:
+
+1. `Channel.sendMessage(jid, text, opts?)` returns `Promise<{ messageId?: string } | void>` (signature widened). Telegram implementation captures grammy's `api.sendMessage` return value (full `Message` object) and extracts `message_id.toString()`. Gmail captures the RFC-2822 Message-ID from the `users.messages.send` response (used as the outbound id).
+2. **All outbound flows through `routeOutbound` in `src/router.ts`** (single chokepoint). Direct `channel.sendMessage(...)` calls outside `routeOutbound` are migrated to `routeOutbound`. The remaining call sites that wrap `routeOutbound` (scheduler lambda, IPC outbound lambda, streaming-output callback, remote-control replies — index.ts:304, 647/667/676/682, 769, 777) all benefit automatically.
+3. `routeOutbound` on success calls `storeOutboundMessage(jid, text, channelMessageId)` which inserts into `messages` with `is_from_me=1, is_bot_message=1`, `id=channelMessageId`, and goes through the same `INSERT OR IGNORE INTO chats` pre-check that fixes the FK pragma issue.
+
+If a channel's sendMessage doesn't return a messageId (e.g. some future channel returns void), `storeOutboundMessage` synthesizes `id="out-${Date.now()}-${rand}"` AND sets a `meta` block `<m kind="outbound-synthetic"/>` so the agent can tell. `lookup_messages({tg_message_id})` filters synthetic ids out unless the caller explicitly opts in (rare).
+
+Reply chain walking is just repeated calls: `<reply mid="X">` → `lookup_messages({tg_message_id: X})` → its `<reply mid="Y">` → another call.
 
 ## MCP tool descriptions
 
-Each new tool ships a verbose `description` (mirrors the style of existing `schedule_task` description). The exact text is part of this spec because the agent's invocation behavior depends on it:
+Each new tool ships a verbose `description` (mirrors `schedule_task` style):
 
 **`view_media`**:
-> Fetch a Telegram media file by `file_id` and return it to the conversation. Use this when the user asks to look at / view / show / посмотри / покажи a photo, image, sticker, document, or PDF that you have a `file_id` for (from the current message's `<media>`, its `<reply><media>`, or a historical row from `lookup_messages`). `mode` defaults to `auto`: images come back as images, PDFs as extracted text, text files as text. Use `mode:'image'` with `pages:'1-3'` for visual PDF rendering (max 10 pages). Returns an MCP error with a specific error_code on failure — relay the code to the user instead of guessing.
+> Fetch a Telegram media file by `file_id` and return it to the conversation. Use this when the user asks to look at / view / show / посмотри / покажи a photo, image, sticker, document, or PDF that you have a `file_id` for (from the current message's `<media>`, its `<reply><media>`, or a historical row from `lookup_messages`). `mode` defaults to `auto`: images come back as images, PDFs as extracted text, text files as text. Use `mode:'image'` with `pages:'1-3'` for visual PDF rendering (max 10 pages). On failure returns an MCP tool error with `_meta.error_code` (TIMEOUT, FILE_TOO_LARGE, FILE_EXPIRED, EXTRACTOR_MISSING, EXTRACTOR_OUTPUT_INVALID, UNSUPPORTED_TYPE, PAGES_OUT_OF_RANGE, UPSTREAM_ERROR) and `_meta.retryable`. Relay the code to the user instead of guessing.
 
 **`lookup_messages`**:
 > Search this group's stored message history. Use this when the user references something older than what's visible in the current context, when walking a reply chain (`<reply mid="X">`), or when you need to find a specific message by id/sender/date. Filters: `tg_message_id`, `sender_id`, `since`/`until`, `query` (text substring). Default returns last 50; max 200. Does NOT call out to Telegram — purely local DB.
 
 **`lookup_contacts`**:
-> Search this group's known people/contacts. Use this when the user references "Петя" / "тот чувак из канала Х" / "@username" / a phone number and you need contact details (id, username, bio, notes, tags). Pass `query` for free-text, `username` for exact (lowercase, no `@`), `tg_id` for exact. Returns at most `limit` rows (default 50).
+> Search this group's known people/contacts. Use this when the user references "Петя" / "тот чувак из канала Х" / "@username" / a phone number and you need contact details (id, username, bio, notes, tags, is_bot). Pass `query` for free-text, `username` for exact (lowercase, no `@`), `tg_id` for exact. Returns at most `limit` rows (default 50). Note: bare `@username` mentions resolve only for public channels/supergroups; for private users the row may exist with `enriched=0` (just the username), not full bio.
 
 **`annotate_contact`**:
-> Attach a note or tag to a known contact so you remember the relationship later. Use this when the user tells you something durable about a person ("Петя — мой партнёр", "она занимается дизайном"). Identify the contact by ONE of `ident`, `username`, `tg_id`. `notes` REPLACES previous notes (use it for the canonical summary); `tags` APPENDS new comma-separated tags. The host never touches these fields outside this tool.
+> Attach a note or tag to a known contact so you remember the relationship later. Use this when the user tells you something durable about a person ("Петя — мой партнёр", "она занимается дизайном"). Identify the contact by ONE of `ident`, `username`, `tg_id`. `notes` REPLACES previous notes; `tags` APPENDS new comma-separated tags. The host never touches these fields outside this tool.
 
 ## Files touched
 
 Host (`src/`):
-- **NEW** `src/channels/telegram-meta.ts` — `buildMetaBlock(message): string` from a Telegram `Message`. Handles `from`/`sender_chat`, `forward_origin` (all 4 kinds), `reply_to_message` AND `external_reply` AND `reply_to_story`, `quote`, all `<media>` types with synthesized mime, full `<entities>` enumeration, `<contact>`, `<location>`. Pure function, fully unit-testable.
+- **NEW** `src/channels/telegram-meta.ts` — `buildMetaBlock(message): string`. Handles `from` skip when `sender_chat` present, all 4 forward kinds + unknown fallback, `reply_to_message` AND `external_reply` (with full payload) AND `reply_to_story`, `quote`, all `<media>` types with synthesized mime + sticker_kind, full `<entities>` enumeration, `<contact>`, `<location>`. Pure function, unit-testable.
 - **NEW** `src/channels/telegram-enrich.ts` — bounded-rate `getChat` resolver; in-memory dedupe (24h success / 7d failure).
-- **MOD** `src/channels/telegram.ts` — every message handler (text/photo/document/voice/sticker/animation/contact/location/video AND `edited_message`) builds meta via `telegram-meta`, passes it as `NewMessage.meta`. Removes the auto-vision `processImage` call in `message:photo` and the `ImageAttachment[]` propagation. Trigger detection continues to test against `message.text` only (unchanged path; the rewrite preserves it for non-text handlers via caption checks where applicable).
-- **MOD** `src/db.ts` — add `meta TEXT` column to `messages` (idempotent `ALTER TABLE ... ADD COLUMN` with try/catch, matching existing migration style); `contacts` schema + `upsertContact` (with COALESCE merge rules) + `promoteContactIdent` (id-promotion) + `getContactsForGroup({scope, includeUnion?})` + `annotateContact` + `lookupMessages` (group-scoped, clamped, with `truncated` marker).
-- **MOD** `src/ipc.ts` — extend with request handlers for `media-requests/` and `lookup-requests/`, response writers for the matching `-responses/` dirs, **actual TTL sweep** for both request and response files (180s, runs on startup and every 5 min) AND for the existing `errors/` dir (which currently has no cleanup — confirmed by grep). Per-group `contacts.json` snapshot writer with **debounce (≥500ms)** — coalesces upsert bursts so a 20-message Telegram burst doesn't trigger 60 disk writes.
-- **MOD** `src/container-runner.ts` — ensure new IPC sub-dirs exist when materializing per-group IPC; the `pendingImages` Map and `hasImages` branch in `src/index.ts` are removed in this same change set, along with the unused `pushWithImages` consumer in the agent-runner (no channel currently writes `NewMessage.images`).
-- **MOD** `src/router.ts` — `formatMessages` reads `messages.meta` alongside `content`; emits unescaped `<m>...</m>` followed by `<text>${escapeXml(content)}</text>` inside the `<message>` envelope. Keeps `content`-only fallback for rows that have no meta (pre-migration history).
-- **MOD** `src/index.ts` — `NewMessage` gains `meta?: string`; `storeMessage` receives and persists it; outbound bot text is stored via a new `storeOutboundMessage` call so `lookup_messages({include_bot:true})` actually has data; delete `pendingImages`+`hasImages`.
+- **MOD** `src/channels/telegram.ts` — wire ALL FOUR update kinds: `bot.on('message:*')`, `bot.on('edited_message:*')`, `bot.on('channel_post:*')`, `bot.on('edited_channel_post:*')`. Each handler builds meta via `telegram-meta`, passes it as `NewMessage.meta`. Remove the auto-vision `processImage` call in `message:photo` and the `ImageAttachment[]` propagation.
+- **MOD** `src/db.ts` — add `meta TEXT` column to `messages` (idempotent `ALTER TABLE ... ADD COLUMN` with try/catch); relax the `getNewMessages`/`getMessagesSince` filter to `(content != '' AND content IS NOT NULL) OR meta IS NOT NULL`; storeMessage carries `meta`; new `storeOutboundMessage(jid, text, channelMessageId)`; `contacts` schema + `upsertContact` (with COALESCE merge rules) + `promoteContactIdent` (column-wise MERGE in transaction) + `getContactsForGroup({scope, includeUnion?})` + `annotateContact` + `lookupMessages` (group-scoped, clamped, with `truncated` marker).
+- **MOD** `src/ipc.ts` — extend with request handlers for `media-requests/` and `lookup-requests/`, response writers for matching `-responses/` dirs, **TTL sweep ONLY for the new namespaces** (180s, startup + 5min). The existing `errors/` directory is left alone (operator-review semantics preserved). Per-group `contacts.json` snapshot writer with **trailing-edge debounce, 500ms, per-scope timer**: each upsert (`upsert`/`annotate`/`promote`) calls `scheduleSnapshot(scope)` which `clearTimeout`+`setTimeout` keyed on scope; on fire writes current scope's snapshot. On SIGTERM, `flushAllSnapshots()` synchronously fires every pending timer before exit.
+- **MOD** `src/container-runner.ts` — ensure new IPC sub-dirs exist when materializing per-group IPC; the `pendingImages` Map and `hasImages` branch in `src/index.ts` are removed in this same change set, along with the unused `pushWithImages` consumer in the agent-runner.
+- **MOD** `src/router.ts` — `formatMessages` reads `messages.meta` alongside `content`. When meta present: emit `<message ...>${meta}\n${content?'<text>'+escapeXml(content)+'</text>':''}</message>`. When meta NULL: emit legacy `<message ...>${escapeXml(content)}</message>`. **`routeOutbound` becomes the outbound chokepoint**: calls `channel.sendMessage(...)`, awaits the returned `{messageId?}`, on success calls `storeOutboundMessage`. Throws propagate.
+- **MOD** `src/types.ts` — `Channel.sendMessage` signature returns `Promise<{ messageId?: string } | void>`. `NewMessage.meta?: string`.
+- **MOD** `src/index.ts` — every direct `channel.sendMessage(...)` migrated to `routeOutbound(channels, jid, text, opts)`. `pendingImages`+`hasImages` deleted.
+- **MOD** `src/channels/gmail.ts` — `sendMessage` returns `{ messageId: rfc2822id }` from the gmail send response.
 
 Container (`container/agent-runner/src/`):
-- **MOD** `ipc-mcp-stdio.ts` — register 4 tools with the descriptions above. Shared helper `pollResponseFile(reqId, timeoutMs)` for `view_media`/`lookup_messages`. Each call holds its own reqId; concurrent calls are independent. On timeout, returns `isError:true` with `_nanoclaw_error_code: 'TIMEOUT'`.
+- **MOD** `ipc-mcp-stdio.ts` — register 4 tools with the descriptions above. `writeIpcFile` extended to accept an optional `filenameOverride: string` parameter (when given, writes to `dir/<filenameOverride>` instead of generating a default). Shared helper `pollResponseFile(reqId, timeoutMs=120000, intervalMs=100)` for `view_media`/`lookup_messages`. Each call holds its own reqId. On timeout, returns `isError: true` with `_meta.error_code='TIMEOUT'`, `_meta.retryable=true`.
 
 Tests:
-- **NEW** `src/channels/telegram-meta.test.ts` — pure-function tests: forward (user/hidden/chat/channel), reply (in-chat + external_reply + reply_to_story), quote, all media types (incl. sticker mime synthesis: static webp / animated tgs / video webm), entities (all 10 emitted kinds), vCard, location, edited_message marker, sender_chat path (anonymous admin / linked-channel auto-forward).
-- **MOD** `src/db.test.ts` — `upsertContact` insert→update with COALESCE preservation (notes/tags never touched, bio sticky, seen_count increments); `promoteContactIdent` (un→id row consolidation); group-scope isolation; main-group union read.
-- **NEW** `src/ipc-mediarequest.test.ts` — happy path (stub Telegram getFile, write request, expect response file with correct reqId), timeout path (no response within 120ms test override → tool gets TIMEOUT), oversized-file pre-flight (FILE_TOO_LARGE without calling getFile), startup sweep (orphan request gets TIMEOUT response written and request unlinked).
+- **NEW** `src/channels/telegram-meta.test.ts` — pure-function tests: forward (user/hidden/chat/channel + unknown kind fallback), reply (in-chat + external_reply with media+contact+location+poll+story + reply_to_story), quote, all media types (sticker mime synthesis static webp / animated tgs / video webm + sticker_kind regular/mask/custom_emoji), entities (all 10 emitted kinds incl. text_mention.is_bot), vCard, location, edited_message AND edited_channel_post markers, sender_chat detection (suppresses `<from>`), anonymous-admin / linked-channel auto-forward path.
+- **MOD** `src/db.test.ts` — `upsertContact` insert→update with COALESCE preservation; `promoteContactIdent` column-wise MERGE when id-row pre-exists with notes/tags (verify notes preserved, tags appended); group-scope isolation; main-group union read; relaxed message-loop filter delivers photo-no-caption.
+- **NEW** `src/ipc-mediarequest.test.ts` — happy path (stub Telegram getFile, write request, expect response file with correct reqId); timeout path (no response → tool gets TIMEOUT with `_meta.retryable=true`); oversized-file pre-flight (FILE_TOO_LARGE without calling getFile); pdftotext corruption (EXTRACTOR_OUTPUT_INVALID); startup sweep (orphan request gets TIMEOUT response written and request unlinked); `_meta.error_code` survives MCP serialization (round-trip through the SDK).
 
 ## Known limitations / risks
 
 - **Edited messages lose history** — the previous version of a message is overwritten in `messages`. The user has the original in their Telegram client; the agent does not. Recovery would require diff storage; not in v1.
-- **`getChat` resolves only public channels/supergroups** — per Bot API contract. User mentions of private accounts will appear in contacts with `enriched=0` and only the username; the agent should not promise to "look someone up" by bare `@username` alone.
+- **`getChat` resolves only public channels/supergroups** — per Bot API contract. User mentions of private accounts appear in contacts with `enriched=0`; the agent should not promise to "look someone up" by bare `@username` alone.
 - **`pdftotext` / `pdftoppm` not installed** → `view_media` returns `EXTRACTOR_MISSING`. Document `brew install poppler` for macOS.
-- **Telegram DM limitation**: Telegram bots cannot DM an arbitrary user — the user must have `/start`ed the bot. "Write to that person" therefore means: bot composes a draft / supplies a t.me link / invokes an external tool, unless the recipient has already interacted with the bot.
-- **Animated/video stickers and videos are not viewable** — `view_media` returns a descriptor, not pixels. Frame extraction is out of scope.
-- **20MB file cap** — Telegram Bot API limit, not ours; pre-flight returns `FILE_TOO_LARGE` immediately.
-- **PII storage**: third-party identifiers (names, usernames, phones from vCards) per explicit user consent. The host-side DB is the primary store; the per-group `contacts.json` snapshot is mounted into the same group's container by design (it's how the agent reads contacts) — this is **not** a privacy regression vs the structured block in messages, which contains the same identifiers and is also mounted.
-- **Token cost**: meta block adds ~150–300 chars per message in the formatted prompt; 200-msg context ≈ 30–60KB extra. Acceptable.
-- **Mixed history transition**: rows written before this change have no `meta` column populated; `formatMessages` falls back to emitting their `content` (which still has the legacy `[Forwarded from X]` strings). The agent therefore sees two formats during the transition window. A one-shot backfill job is **out of scope for v1** — the legacy prefix is human-readable so the agent copes.
-- **Snapshot is the same data as the DB rows it serves** — explicit. Group-isolation is enforced at the mount boundary, not by "the DB isn't mounted" (which was a misleading framing in v1).
-- **First-turn freshness for `@mention` enrichment**: the snapshot is debounced ≥500ms AND `getChat` is async post-delivery. If the user types "@some_channel что про него знаешь" and the agent calls `lookup_contacts` within the same turn, the enrichment may not yet have completed. The agent should handle a missing/`enriched=0` row gracefully (say "не знаю про @X, проверю позже" rather than hallucinate) and may retry in the next turn. Tool description explicitly documents that `lookup_contacts` is local DB only.
-- **Media + caption trigger in non-text handlers** (pre-existing): `TRIGGER_PATTERN ^@Andy\b` is currently tested against `m.content.trim()`, and the bot-mention rewriter at `src/channels/telegram.ts` lives only inside `message:text`. A photo with caption `@andy_ai_bot посмотри` in a non-main group already fails to trigger. v1's structured-block prepend made this worse (broke all triggers); v2 restores the prior behavior but **does not fix the pre-existing media-caption gap**. Out of scope for this spec; flagged for a separate fix.
+- **HEIC / HEIF / TIFF input** is not supported by the bundled `sharp` binary (libheif is not part of sharp's default prebuild). `view_media` returns `UNSUPPORTED_TYPE`. macOS users sharing iPhone photos as a Document hit this; sharing as a Photo upload via the Telegram client converts to JPEG and is unaffected.
+- **Telegram DM limitation**: bots cannot DM an arbitrary user — the user must have `/start`ed the bot. "Write to that person" therefore means: bot composes a draft / supplies a t.me link / invokes an external tool, unless the recipient has already interacted with the bot.
+- **Animated/video stickers and videos are not viewable** — `view_media` returns a descriptor, not pixels.
+- **20MB file cap** — Telegram Bot API limit, not ours; pre-flight returns `FILE_TOO_LARGE`.
+- **`processImage` resizes to 1024px long edge** — the existing helper's default. Anthropic vision accepts up to 1568px; v3 deliberately keeps the existing helper to avoid touching multiple call sites. Visible quality is fine; a future micro-fix could raise the cap.
+- **PII storage**: third-party identifiers (names, usernames, phones, bios) per explicit user consent. The host-side DB is the primary store; the per-group `contacts.json` snapshot is mounted into the same group's container by design — group isolation is enforced at the mount boundary.
+- **Token cost**: meta block adds ~150–400 chars per message (heavier rows for forwards-with-entities-with-vcard). 200-msg context ≈ 40–80KB extra. Tool descriptions add ~450 tokens to `tools/list` (≈doubles current tool description payload — still well within reasonable system-prompt budget).
+- **Mixed history transition**: rows written before v3 have NULL `meta`; `formatMessages` falls back to emitting the legacy shape `<message>${escapeXml(content)}</message>` (no `<m>` envelope). The agent sees two formats during the transition window. A one-shot backfill is out of scope; the legacy prefix is human-readable so the agent copes.
+- **First-turn freshness for `@mention` enrichment**: snapshot is debounced ≥500ms AND `getChat` is async post-delivery. If the user types "@some_channel что про него знаешь" and the agent calls `lookup_contacts` within the same turn, enrichment may not have completed. The agent should handle a missing/`enriched=0` row gracefully (the tool description warns about this).
+- **Media + caption trigger in non-text handlers** (pre-existing): bot-mention rewriter only in `message:text`. Media with `@andy_ai_bot посмотри` caption in a non-main group doesn't trigger. v3 doesn't fix this (out of scope); flagged for a separate change.
+- **Synthetic outbound ids for non-Telegram channels** — if a future channel's `sendMessage` returns void, outbound rows get `id="out-<ts>-<rand>"` with a `<m kind='outbound-synthetic'/>` meta. `lookup_messages({tg_message_id})` filters these out by default.
+- **MessageOrigin evolution** — Bot API has historically added forward-origin variants (v7.0 introduced the union itself). v3 emits `<fwd kind='unknown' raw='{...}'/>` for any future variant, so forward context isn't silently dropped on Telegram upgrades.
 
 ## Out of scope (v1)
 
-- Cross-group contact merging (a user appearing in main AND family-group remains two `contacts` rows; main's union snapshot returns both — the agent reconciles via `annotate_contact`).
+- Cross-group contact merging.
 - Office document formats (.docx / .xlsx) extraction.
 - Video / GIF frame extraction; OCR on stickers.
-- Full-text search index (FTS5) on `messages` — v1 uses LIKE; revisit if `lookup_messages` becomes slow.
-- Multi-channel media (Gmail attachments, Slack files) — Telegram only in v1. Gmail keeps its existing `[Email from ...]` text prefix; the agent encounters mixed grammar in the main group's prompt (Telegram has `<m>`, Gmail has `[Email from ...]`). Acceptable for v1; documented.
+- Full-text search index (FTS5) on `messages` — v1 uses LIKE.
+- Multi-channel media (Gmail attachments, Slack files).
 - Diff-history for edited messages.
 
 ## Verification
 
 - Unit: `npx vitest run src/channels/telegram-meta.test.ts src/db.test.ts src/ipc-mediarequest.test.ts` — all branches green.
 - Integration (manual):
-  1. Forward a channel post → `contacts` row appears with `kind='channel'`, derivable `link`, `enriched` later set to 1 via `getChat`.
-  2. Reply to a media post asking "посмотри" → bot calls `view_media`, returns the image. Verify both in-chat reply and cross-chat reply (linked-channel discussion group, hitting `external_reply`).
+  1. Forward a channel post → `contacts` row with `kind='channel'`, derivable `link`, `enriched` later set to 1 via `getChat`.
+  2. Reply to a media post asking "посмотри" (both in-chat AND cross-chat in a linked-channel discussion group, hitting `external_reply`).
   3. Mention `@some_public_channel` → after a few seconds, `contacts` row has `enriched=1` and `bio`.
-  4. Mention `@some_private_user` → row created with `enriched=0`, no bio; no spurious retry storm in logs.
+  4. Mention `@some_private_user` → row created with `enriched=0`, no bio; no spurious retry storm.
   5. Album of 3 photos with one caption → 3 `<m media_group_id="...">` rows, agent correlates.
-  6. Anonymous admin post in supergroup → `<sender_chat>` instead of `<from>` in meta; contacts row keyed on sender_chat id.
-- Regression: existing message loop, scheduler, threadId routing, FIFO drain, sender allowlist, trigger detection, **escapeXml on user text** — all unchanged. Existing test suite stays green.
+  6. **Anonymous admin post in supergroup** → `<sender_chat>` instead of `<from>` in meta; contacts row keyed on sender_chat id (NOT the synthetic GroupAnonymousBot).
+  7. **Photo with no caption** → row appears in `getNewMessages` (filter relaxation); agent sees `<m><media type=photo file_id=.../></m>` with no `<text>`.
+  8. **Corrupt PDF** sent as document → `view_media` returns `EXTRACTOR_OUTPUT_INVALID` (not silently empty).
+  9. **HEIC document** → `view_media` returns `UNSUPPORTED_TYPE` with conversion hint.
+  10. **Bot replies to user** → row appears in `messages` with real Telegram `message_id`; `lookup_messages({tg_message_id: <id>})` finds it.
+  11. **Edit a channel post** in a chat where bot is in the channel → row gets `meta.edited=<ts>` AND new timestamp; message-loop re-delivers; contacts re-upsert.
+  12. **`_meta.error_code` round-trip** — induce a `FILE_TOO_LARGE` and verify the agent's tool result has `_meta.error_code === 'FILE_TOO_LARGE'` (not stripped by MCP).
+- Regression: existing message loop, scheduler, threadId routing, FIFO drain, sender allowlist, trigger detection, escapeXml on user text — all unchanged. Existing test suite stays green.
 
-## Pre-implementation lessons (from v1 review)
+## Pre-implementation lessons (from v1 and v2 review)
 
-Recorded so the next round of reviewers can verify they're addressed:
-- v1 stored meta inside `messages.content` → escaped by `formatMessages` → unparseable XML. v2 separates `meta` and `text`.
-- v1 placed `<m>` block at the start of `content` → `TRIGGER_PATTERN = ^@Andy\b` no longer matched → bot stopped responding in non-main groups. v2's `content` is unchanged; trigger detection works as before.
-- v1 promised `getChat` enrichment for all `@mentions` → fails by Bot API contract for private users. v2 narrows the promise + adds a 7-day failure-cache.
-- v1 missed `external_reply`, `reply_to_story`, `sender_chat`. v2 covers all three.
+Recorded so the next reviewer can verify they're addressed:
+- v1 stored meta inside `messages.content` → escaped by `formatMessages` → unparseable XML. v2 separated `meta` and `text`.
+- v1 placed `<m>` block at the start of `content` → `TRIGGER_PATTERN = ^@Andy\b` no longer matched. v2 kept content as raw text.
+- v1 promised `getChat` enrichment for all `@mentions` → fails by Bot API contract for private users. v2 narrowed the promise.
+- v1 missed `external_reply`, `reply_to_story`, `sender_chat`. v2 covered all three (sender_chat detection rule was still incomplete; v3 fixes that).
 - v1 collapsed all forward kinds into one `<fwd>` schema with a `link` attribute that was never derivable for `kind='chat'`. v2 only emits `link` for `kind='channel'`.
-- v1 left COALESCE-merge semantics implicit → notes/tags risked being clobbered. v2 spells them out.
-- v1 wrote contacts.json snapshot on every upsert with no debounce → up to 4 snapshot rebuilds per inbound. v2 specifies ≥500ms debounce.
-- v1 hand-waved "TTL sweep similar to errors/" — but `errors/` has no actual sweep. v2 specifies the sweep (180s, every 5 min, on startup) and adds it to `errors/` too.
-- v1 set `view_media` timeout at 30s — below typical 20MB Telegram download time. v2 raises to 120s and adds size pre-flight to short-circuit oversized files.
-- v1 left `include_bot` parameter on `lookup_messages` dead because outbound bot text is never stored. v2 adds the storage hook.
-- v1 left tool descriptions undefined. v2 ships them inline.
-- v1 listed `legacy forward_from*` as a fallback, but grammy ≥3.x dropped those fields. v2 removes the dead reference.
+- v1 left COALESCE-merge semantics implicit → notes/tags risked being clobbered. v2 spelled them out (but promotion still clobbered the id-row; v3 fixes with column-wise MERGE).
+- v1 wrote contacts.json snapshot on every upsert with no debounce. v2 specified ≥500ms (mechanism unspecified; v3 specifies trailing-edge per-scope with SIGTERM flush).
+- v1 hand-waved "TTL sweep similar to errors/" — but `errors/` has no actual sweep. v2 specified a 180s sweep (including `errors/`, which v3 removes — `errors/` is operator-review quarantine, not transient).
+- v1 set `view_media` timeout at 30s → below typical 20MB Telegram download. v2 raised to 120s and added size pre-flight.
+- v1 left `include_bot` parameter on `lookup_messages` dead. v2 added a storage hook (vague call-site enumeration; v3 pins a single chokepoint at `routeOutbound`).
+- v1 left tool descriptions undefined. v2 shipped them.
+- v1 listed `legacy forward_from*` as a fallback, but grammy ≥3.x dropped those fields. v2 removed the dead reference.
+- **v2 critical defect 1**: photo-no-caption had `content=""`, which the message-loop filter excludes. v3 relaxes the filter to `OR meta IS NOT NULL`.
+- **v2 critical defect 2**: `_nanoclaw_error_code` as a top-level field on `TextContent` is stripped by MCP SDK's Zod `$strip`. v3 uses the documented `_meta` extension point and redundantly prefixes the code in `text`.
+- **v2 critical defect 3**: existing `writeIpcFile` hardcodes its own filename and ignores caller intent, so v2's `<reqId>.json` polling could never match the file on disk. v3 extends `writeIpcFile` with an optional `filenameOverride` parameter.
+- **v2 high defect**: `promoteContactIdent` via `INSERT OR REPLACE` clobbers a pre-existing id-row's notes/tags. v3 does an explicit column-wise MERGE in the same transaction, preserving notes (id-row wins on non-null) and append-uniqueing tags.
+- **v2 high defect**: `errors/` directory sweep destroyed operator-review quarantine. v3 only sweeps the new request/response namespaces.
+- **v2 high defect**: `pdftotext` exits 0 even on corrupt PDF, returning empty stdout. v3 checks stderr for `Syntax Error`/`May not be a PDF file` AND treats empty-stdout-on-PDF as `EXTRACTOR_OUTPUT_INVALID`.
+- **v2 high defect**: `sender_chat` and `from` coexist (Bot API places a synthetic GroupAnonymousBot user in `from` when `sender_chat` is set). v3 detection rule: if `sender_chat` is present, skip `<from>` and the from-upsert entirely.
+- **v2 high defect**: `edited_message` doesn't fire for channel posts (Bot API splits into `edited_channel_post`). v3 wires all four update kinds.
+- **v2 high defect**: `storeOutboundMessage` had no concrete id strategy. v3 widens `Channel.sendMessage` to return `{messageId?}`, captures the real Telegram message_id from grammy's send response, and routes all outbound through `routeOutbound` as a single chokepoint.
+- **v2 medium**: HEIC unsupported by sharp's default build. v3 explicit `UNSUPPORTED_TYPE` branch.
+- **v2 medium**: `external_reply` carries contact/location/poll/story/etc. — v2's `<reply external="1">` only mirrored origin+media. v3 enumerates the full set.
+- **v2 medium**: `text_mention` dropped `is_bot`. v3 emits it and adds the column to `contacts`.
+- **v2 medium**: poll cadence for `pollResponseFile` unspecified. v3 pins 100ms (host watcher is 1s, so 100ms is fast enough to not add latency, slow enough to not burn CPU).
+- **v2 medium**: debounce mechanism value-only. v3 specifies trailing-edge per-scope timers with SIGTERM flush.
+- **v2 medium**: `Sticker.type ∈ {regular, mask, custom_emoji}` is independent of `is_animated/is_video`. v3 emits `sticker_kind` attribute alongside the mime.
+- **v2 medium**: `MessageOrigin` switch had no fallback. v3 emits `<fwd kind="unknown" raw="..."/>`.
+- **v2 low**: retry budget "up to 3 attempts" ambiguous. v3 pins "initial + 3 retries = 4 total".
+- **v2 low**: voice `transcript_status` state machine underspecified. v3 maps each value to its trigger.
+- **v2 low**: tool-description token budget not addressed. v3 acknowledges in known limitations.
