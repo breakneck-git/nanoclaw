@@ -1,11 +1,12 @@
-# Rich Message Capture + Persistent People Memory Implementation Plan (v3)
+# Rich Message Capture + Persistent People Memory Implementation Plan (v4)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Spec:** `docs/superpowers/specs/2026-05-20-rich-message-capture-design.md` at commit `92ef68a` (v11, 1401 lines). All spec line references below are re-derived against this commit (v1 plan had systematically stale refs after v10/v11 spec additions shifted content by 50-300 lines).
 
 **Plan revisions:**
-- **v3 (this version, round-2 fixes)** — closes 13 v2 defects: Task 0 `git add -A` replaced with enumerated allowlist + secrets guard (CLAUDE.md compliance); Task 10 Step 3 adds module-scope placement directive + external_reply.origin trigger-3 branch + matching test; Task 15 preserves `processImage` body verbatim before deletion, Task 18 re-inlines it as a code block (not gloss); Task 20 spec line refs corrected (1024-1040 → 1159-1180 for scaffold; 1170-1196 → 1289-1313 for test body); Task 14 adds concrete multi-line worked example with per-site `opts` preservation rules; Tasks 16a/16b/16c/19/22 placeholder test bodies replaced with concrete `it()` implementations; Task 8b split mandatory into 8b-1/8b-2/8b-3; Task 17 adds container mount-path verification step.
+- **v4 (this version, round-3 fixes)** — closes 5 v3 residuals: Task 10 Step 1 adds 2 missing trigger-3 tests (`type=chat`, `type=hidden_user`) — was 2 of 4 in v3; Task 8b split now produces 3 actual `### Task 8b-1/8b-2/8b-3` sub-headings each with own Files/Steps blocks (was prose-only in v3); Task 19 CROSS_GROUP_REJECTED test body now concrete (was `/* ... */` in v3); Task 19 commit step renumbered Step 4 → Step 6 (off-by-one).
+- v3 (commit 605319d, round-2 fixes) — closed 13 v2 defects. Task 0 `git add -A` replaced with enumerated allowlist + secrets guard (CLAUDE.md compliance); Task 10 Step 3 adds module-scope placement directive + external_reply.origin trigger-3 branch + matching test; Task 15 preserves `processImage` body verbatim before deletion, Task 18 re-inlines it as a code block (not gloss); Task 20 spec line refs corrected (1024-1040 → 1159-1180 for scaffold; 1170-1196 → 1289-1313 for test body); Task 14 adds concrete multi-line worked example with per-site `opts` preservation rules; Tasks 16a/16b/16c/19/22 placeholder test bodies replaced with concrete `it()` implementations; Task 8b split mandatory into 8b-1/8b-2/8b-3; Task 17 adds container mount-path verification step.
 - v2 (commit 3d95622) — closed 19 v1 defects including systemic spec-line-ref staleness.
 - v1 (commit b95ba90) — initial plan.
 
@@ -813,13 +814,84 @@ describe('buildMetaBlock — media_group_id', () => {
 });
 ```
 
-Fill EACH `/* ... */` body — no `it.skip`, no placeholder. The bodies are mechanical: construct a grammy `Message` object with the right shape, call `buildMetaBlock`, assert substring or parse with xml2js. **Round-2 split (MANDATORY — was advisory in v2):** because there are ~25 test bodies to fill, do NOT execute this as a single task. Instead, treat Task 8b as THREE sub-tasks each producing its own commit:
+Fill EACH `/* ... */` body — no `it.skip`, no placeholder. The bodies are mechanical: construct a grammy `Message` object with the right shape, call `buildMetaBlock`, assert substring or parse with xml2js.
 
-- **Task 8b-1** — forward_origin (5 cases) + `<reply>` (in-chat + external_reply payload + reply_to_story) + `<quote>` + `<entities>` (10 entity types + caption_entities merge). Commit: `feat(telegram): buildMetaBlock forward/reply/quote/entities coverage`.
-- **Task 8b-2** — all 8 media types + sticker mime cascade + voice/video_note transcript. Commit: `feat(telegram): buildMetaBlock media + sticker + transcript coverage`.
-- **Task 8b-3** — `<contact>` + `<location>` + `<poll>` + `<story>` + `<via_bot>` + `<link_preview>` + `<m auto_fwd="1">` + edited markers + `media_group_id`. Commit: `feat(telegram): buildMetaBlock contact/location/poll/story/via_bot/link_preview/auto_fwd/edited coverage`.
+**Round-2 split (MANDATORY):** ~25 test bodies — do NOT execute this as a single task. Instead, treat Task 8b as THREE sub-tasks below, each producing its own commit. (Round-3 fix: previously declared advisory; now broken into real `###` sub-tasks for autonomous dispatch.)
 
-Each sub-task follows the standard 5-step TDD cycle (write failing tests → run FAIL → implement → run PASS → commit).
+---
+
+### Task 8b-1: buildMetaBlock — forward / reply / quote / entities coverage
+
+**Files:**
+- Modify: `src/channels/telegram-meta.ts`
+- Modify: `src/channels/telegram-meta.test.ts`
+
+**Scope:** `<fwd>` (5 cases: user/hidden_user/chat/channel/unknown), `<reply>` (in-chat + external_reply with full payload), `<reply_to_story>` (top-level), `<quote>`, `<entities>` (all 10 entity types — url/mention/text_link/text_mention/custom_emoji/hashtag/cashtag/bot_command/phone_number/email + caption_entities merge + formatting-entities drop).
+
+- [ ] **Step 1: Write failing tests** — inline `it()` bodies for each of the cases above using `parseStringPromise` from `xml2js` for strict parsing, plus substring assertions for attribute values. Use the test-skeleton patterns from Task 8b Step 1 (above) as a template — replace each `/* ... */` with the actual fixture construction + assertions.
+
+- [ ] **Step 2: Run, expect FAIL** — `npx vitest run src/channels/telegram-meta.test.ts -t "forward|reply|quote|entities"`.
+
+- [ ] **Step 3: Implement handlers** in `buildMetaBlock` for forward_origin (switch on `origin.type`, NOT `origin.kind`), reply (in-chat vs external_reply discriminator), reply_to_story, quote, entities (iterate both `message.entities` and `message.caption_entities`, dedupe by `(offset, length, type)`).
+
+- [ ] **Step 4: Run, expect PASS**
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/channels/telegram-meta.ts src/channels/telegram-meta.test.ts
+git commit -m "feat(telegram): buildMetaBlock forward/reply/quote/entities coverage"
+```
+
+---
+
+### Task 8b-2: buildMetaBlock — media / sticker mime / transcript coverage
+
+**Files:**
+- Modify: `src/channels/telegram-meta.ts`
+- Modify: `src/channels/telegram-meta.test.ts`
+
+**Scope:** `<media>` for all 8 types (photo/video/voice/audio/document/sticker/animation/video_note); sticker mime cascade (`is_animated`→`application/x-tgsticker`; `is_video`→`video/webm`; else→`image/webp`); sticker_kind orthogonal attribute; photo synthesized `image/jpeg`; voice/video_note `transcript` + `transcript_status` attributes (ok/failed/missing_key/skipped).
+
+- [ ] **Step 1: Write failing tests** — use `it.each(['photo','video','voice','audio','document','sticker','animation','video_note'])('emits <media type="%s" file_id>...')` for the 8-type matrix; separate `describe` for sticker mime cascade with 3 fixture variants; separate `describe` for voice transcript.
+
+- [ ] **Step 2: Run, expect FAIL**
+
+- [ ] **Step 3: Implement** in `buildMetaBlock`: switch on `message.photo/video/voice/audio/document/sticker/animation/video_note` (mutex — only one set at a time); inside `sticker` branch, mime cascade in priority order; voice/video_note pull `transcript` from inbound transcription path.
+
+- [ ] **Step 4: Run, expect PASS**
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/channels/telegram-meta.ts src/channels/telegram-meta.test.ts
+git commit -m "feat(telegram): buildMetaBlock media + sticker mime + transcript coverage"
+```
+
+---
+
+### Task 8b-3: buildMetaBlock — contact / location / poll / story / via_bot / link_preview / auto_fwd / edited / media_group_id
+
+**Files:**
+- Modify: `src/channels/telegram-meta.ts`
+- Modify: `src/channels/telegram-meta.test.ts`
+
+**Scope:** `<contact>` (phone/name/user_id/vcard_raw), `<location>` (lat/lon/title/address from `message.location` OR `message.venue`), `<poll>` (question/type only, options dropped), `<story>` (chat_id/story_id), `<via_bot>` (id/un/name), `<link_preview>` (url/disabled/above_text/small/large — emitted ONLY when ≥1 field explicitly set), `<m auto_fwd="1">` (when `is_automatic_forward === true`), edited markers (`meta.edited`=ISO of edit_date), `<m media_group_id="...">` (album messages).
+
+- [ ] **Step 1: Write failing tests** — concrete bodies per scope. For `link_preview`, include negative test (`message.link_preview_options === undefined` → NO `<link_preview>` tag emitted). For `auto_fwd`, include negative test (unset → no attribute on `<m>`).
+
+- [ ] **Step 2: Run, expect FAIL**
+
+- [ ] **Step 3: Implement** remaining handlers in `buildMetaBlock`. For `<link_preview>`, the predicate is: emit when ANY of `is_disabled`, `url`, `prefer_small_media`, `prefer_large_media`, `show_above_text` is explicitly set (not just `is_disabled` — per spec line 207 round-10 disambiguation).
+
+- [ ] **Step 4: Run, expect PASS**
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/channels/telegram-meta.ts src/channels/telegram-meta.test.ts
+git commit -m "feat(telegram): buildMetaBlock contact/location/poll/story/via_bot/link_preview/auto_fwd/edited coverage"
+```
 
 - [ ] **Step 2: Run, expect FAIL** for new cases.
 
@@ -956,7 +1028,9 @@ describe('processContactsFromContext — all 7 triggers', () => {
   it('trigger 2: forward_origin type=channel → upsertContact source=forward + link derivable', () => { /* ... */ });
   it('trigger 3: reply_to_message.from → upsertContact source=reply', () => { /* ... */ });
   it('trigger 3: external_reply.origin type=user → upsertContact source=reply (round-2 fix)', () => { /* ... */ });
+  it('trigger 3: external_reply.origin type=chat (anonymous admin) → upsertContact source=reply with kind=chat', () => { /* ... */ });
   it('trigger 3: external_reply.origin type=channel → upsertContact source=reply with kind=channel', () => { /* ... */ });
+  it('trigger 3: external_reply.origin type=hidden_user → NO upsert (no identity available)', () => { /* ... */ });
   it('trigger 4: msg.contact → upsertContact source=vcard with phone+vcard_raw', () => { /* ... */ });
   it('trigger 5: entity type=text_mention → upsertContact source=text_mention for each entity', () => { /* ... */ });
   it('trigger 6: entity type=mention (bare @username) → queueEnrich for each entity', () => { /* ... */ });
@@ -1942,8 +2016,23 @@ describe('annotate_contact host handler', () => {
   });
 
   it('CROSS_GROUP_REJECTED when identifier points at another group\'s contact', async () => {
-    /* upsertContact('other_group', ...); attempt annotate from 'g' scope → response with error_code='CROSS_GROUP_REJECTED' */
-    // expand following the above pattern when implementing this task
+    const ipcRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'annotate-xg-'));
+    fs.mkdirSync(path.join(ipcRoot, 'g', 'contact-write-requests'), { recursive: true });
+    fs.mkdirSync(path.join(ipcRoot, 'g', 'contact-write-responses'), { recursive: true });
+    // Seed contact in DIFFERENT scope
+    upsertContact('other_group', { kind: 'user' }, { identity: { tg_id: '777' }, source: 'sender' });
+    // Request annotation from scope 'g' for that other_group contact
+    const reqPath = path.join(ipcRoot, 'g', 'contact-write-requests', 'req2.json');
+    fs.writeFileSync(reqPath, JSON.stringify({ identifier: { tg_id: '777' }, notes: 'cross-group attempt' }));
+    await handleAnnotateContactRequest(ipcRoot, 'g', 'req2');
+    // Assert response carries CROSS_GROUP_REJECTED
+    const respPath = path.join(ipcRoot, 'g', 'contact-write-responses', 'req2.json');
+    const resp = JSON.parse(fs.readFileSync(respPath, 'utf-8'));
+    expect(resp.isError).toBe(true);
+    expect(resp._meta.error_code).toBe('CROSS_GROUP_REJECTED');
+    // Assert NO mutation occurred on the other_group row
+    const row = db.prepare(`SELECT notes FROM contacts WHERE ident = ?`).get('other_group|id:777') as { notes: string | null };
+    expect(row.notes).toBeNull();
   });
 });
 ```
@@ -1956,7 +2045,7 @@ describe('annotate_contact host handler', () => {
 
 - [ ] **Step 5: Run, expect PASS**.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/ipc.ts src/ipc.test.ts
