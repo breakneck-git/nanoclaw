@@ -304,6 +304,27 @@ export interface ContactRow {
   tags: string | null; // comma-separated; agent-owned
 }
 
+/**
+ * Subset of ContactRow that callers may set via upsertContact. Identity columns
+ * (`ident`, `scope`, `tg_id`, `username`, `source`, `enriched`, timestamps,
+ * `seen_count`, `notes`, `tags`) are NOT in patch — they flow via opts.identity
+ * / opts directly, or are agent-owned (notes/tags) and reach the row only via
+ * annotateContact.
+ */
+export type ContactPatch = Partial<
+  Pick<
+    ContactRow,
+    | 'first_name'
+    | 'last_name'
+    | 'title'
+    | 'phone'
+    | 'link'
+    | 'bio'
+    | 'is_bot'
+    | 'kind'
+  >
+>;
+
 function mergeContactRows(
   idRow: ContactRow | undefined,
   unRow: ContactRow,
@@ -711,6 +732,178 @@ export function promoteContactIdent(
     ).run(merged);
     db.prepare('DELETE FROM contacts WHERE ident = ?').run(unIdent);
   })();
+}
+
+/**
+ * Insert or update a contact row keyed by `ident`.
+ *
+ * Identity resolution order: tg_id → username → name (else throw).
+ *
+ * Per-column conflict rules:
+ *   - first_name/last_name/title/phone/link/is_bot/bio/tg_id/username:
+ *       COALESCE(excluded.X, contacts.X) — sticky non-null, never blanks out
+ *   - kind/source/last_seen: overwrite (excluded.X)
+ *   - enriched: MAX(contacts.enriched, excluded.enriched)
+ *   - first_seen: preserved (no update)
+ *   - seen_count: contacts.seen_count + 1
+ *   - notes/tags: NEVER touched here — agent-owned, only annotateContact writes
+ */
+export function upsertContact(
+  scope: string,
+  patch: ContactPatch,
+  opts: {
+    identity: { tg_id?: string; username?: string; name?: string };
+    source:
+      | 'sender'
+      | 'forward'
+      | 'reply'
+      | 'vcard'
+      | 'mention'
+      | 'text_mention'
+      | 'getChat';
+    enriched?: 0 | 1;
+  },
+): void {
+  let ident: string;
+  let usernameLower: string | null = null;
+  if (opts.identity.tg_id != null) {
+    ident = `${scope}|id:${opts.identity.tg_id}`;
+    usernameLower = opts.identity.username
+      ? opts.identity.username.toLowerCase()
+      : null;
+  } else if (opts.identity.username != null) {
+    usernameLower = opts.identity.username.toLowerCase();
+    ident = `${scope}|un:${usernameLower}`;
+  } else if (opts.identity.name != null) {
+    ident = `${scope}|name:${opts.identity.name.toLowerCase()}`;
+  } else {
+    throw new Error('upsertContact: no identity provided');
+  }
+
+  const now = new Date().toISOString();
+  const binds = {
+    ident,
+    scope,
+    tg_id: opts.identity.tg_id ?? null,
+    username: usernameLower,
+    kind: patch.kind ?? 'user',
+    is_bot: patch.is_bot ?? 0,
+    first_name: patch.first_name ?? null,
+    last_name: patch.last_name ?? null,
+    title: patch.title ?? null,
+    phone: patch.phone ?? null,
+    link: patch.link ?? null,
+    bio: patch.bio ?? null,
+    first_seen: now,
+    last_seen: now,
+    source: opts.source,
+    enriched: opts.enriched ?? 0,
+  };
+
+  // ON CONFLICT(ident) DO UPDATE: per-column rules in the spec. notes/tags are
+  // deliberately omitted from UPDATE SET — they belong to the agent, not host.
+  db.prepare(
+    `
+    INSERT INTO contacts
+      (ident, scope, tg_id, username, kind, is_bot,
+       first_name, last_name, title, phone, link, bio,
+       first_seen, last_seen, seen_count, source, enriched)
+    VALUES
+      (@ident, @scope, @tg_id, @username, @kind, @is_bot,
+       @first_name, @last_name, @title, @phone, @link, @bio,
+       @first_seen, @last_seen, 1, @source, @enriched)
+    ON CONFLICT(ident) DO UPDATE SET
+      tg_id      = COALESCE(excluded.tg_id, contacts.tg_id),
+      username   = COALESCE(excluded.username, contacts.username),
+      kind       = excluded.kind,
+      is_bot     = COALESCE(excluded.is_bot, contacts.is_bot),
+      first_name = COALESCE(excluded.first_name, contacts.first_name),
+      last_name  = COALESCE(excluded.last_name, contacts.last_name),
+      title      = COALESCE(excluded.title, contacts.title),
+      phone      = COALESCE(excluded.phone, contacts.phone),
+      link       = COALESCE(excluded.link, contacts.link),
+      bio        = COALESCE(excluded.bio, contacts.bio),
+      last_seen  = excluded.last_seen,
+      seen_count = contacts.seen_count + 1,
+      source     = excluded.source,
+      enriched   = MAX(contacts.enriched, excluded.enriched)
+    `,
+  ).run(binds);
+}
+
+/**
+ * Return contact rows for a scope, newest activity first.
+ *
+ * When `scope === 'main' && includeUnion`, returns ALL rows across every scope
+ * (main has visibility across the workspace). Otherwise filters by scope.
+ */
+export function getContactsForGroup(opts: {
+  scope: string;
+  includeUnion?: boolean;
+}): ContactRow[] {
+  if (opts.scope === 'main' && opts.includeUnion) {
+    return db
+      .prepare(`SELECT * FROM contacts ORDER BY last_seen DESC`)
+      .all() as ContactRow[];
+  }
+  return db
+    .prepare(`SELECT * FROM contacts WHERE scope = ? ORDER BY last_seen DESC`)
+    .all(opts.scope) as ContactRow[];
+}
+
+/**
+ * Agent-only writer for the two agent-owned columns. notes REPLACE; tags
+ * APPEND-UNIQUE (union with existing comma-separated values, deduped).
+ *
+ * Identifier resolution: ident → tg_id → username (scope-agnostic; the agent
+ * may only know the tg_id). Throws if no identifier or no matching row.
+ */
+export function annotateContact(
+  identifier: { ident?: string; username?: string; tg_id?: string },
+  patch: { notes?: string; tags?: string },
+): void {
+  let ident: string | undefined;
+  if (identifier.ident) {
+    ident = identifier.ident;
+  } else if (identifier.tg_id != null) {
+    const row = db
+      .prepare('SELECT ident FROM contacts WHERE tg_id = ? LIMIT 1')
+      .get(identifier.tg_id) as { ident: string } | undefined;
+    ident = row?.ident;
+  } else if (identifier.username != null) {
+    const row = db
+      .prepare('SELECT ident FROM contacts WHERE username = ? LIMIT 1')
+      .get(identifier.username.toLowerCase()) as { ident: string } | undefined;
+    ident = row?.ident;
+  } else {
+    throw new Error('annotateContact: no identifier');
+  }
+
+  if (!ident) throw new Error('annotateContact: contact not found');
+
+  if (patch.notes !== undefined) {
+    db.prepare('UPDATE contacts SET notes = ? WHERE ident = ?').run(
+      patch.notes,
+      ident,
+    );
+  }
+
+  if (patch.tags !== undefined) {
+    const existing = db
+      .prepare('SELECT tags FROM contacts WHERE ident = ?')
+      .get(ident) as { tags: string | null } | undefined;
+    const set = new Set(
+      [
+        ...(existing?.tags ?? '').split(','),
+        ...patch.tags.split(','),
+      ].filter(Boolean),
+    );
+    const merged = set.size ? [...set].join(',') : null;
+    db.prepare('UPDATE contacts SET tags = ? WHERE ident = ?').run(
+      merged,
+      ident,
+    );
+  }
 }
 
 // --- Router state accessors ---

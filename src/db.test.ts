@@ -2,11 +2,13 @@ import { describe, it, expect, beforeEach } from 'vitest';
 
 import {
   _initTestDatabase,
+  annotateContact,
   createTask,
   db,
   deleteTask,
   getAllChats,
   getAllRegisteredGroups,
+  getContactsForGroup,
   getMessagesSince,
   getNewMessages,
   getTaskById,
@@ -15,6 +17,7 @@ import {
   storeChatMetadata,
   storeMessage,
   updateTask,
+  upsertContact,
 } from './db.js';
 
 beforeEach(() => {
@@ -576,5 +579,68 @@ describe('promoteContactIdent', () => {
 
   it('does NOT crash when un-row absent (no-op early return)', () => {
     expect(() => promoteContactIdent('g', 'nobody', '999')).not.toThrow();
+  });
+});
+
+describe('upsertContact', () => {
+  it('INSERTs on first call', () => {
+    upsertContact(
+      'g',
+      { kind: 'user', first_name: 'Вася' },
+      { identity: { tg_id: '42', username: 'vasya' }, source: 'sender' },
+    );
+    const row = db
+      .prepare(`SELECT * FROM contacts WHERE ident = ?`)
+      .get('g|id:42') as { first_name: string; username: string };
+    expect(row.first_name).toBe('Вася');
+    expect(row.username).toBe('vasya');
+  });
+
+  it('UPDATEs with COALESCE rules on second call (does not overwrite non-null with null)', () => {
+    upsertContact(
+      'g',
+      { kind: 'user', first_name: 'Вася', last_name: 'Иванов' },
+      { identity: { tg_id: '42' }, source: 'sender' },
+    );
+    upsertContact(
+      'g',
+      { kind: 'user' },
+      { identity: { tg_id: '42' }, source: 'sender' },
+    );
+    const row = db
+      .prepare(`SELECT first_name, last_name, seen_count FROM contacts WHERE ident = ?`)
+      .get('g|id:42') as {
+      first_name: string;
+      last_name: string;
+      seen_count: number;
+    };
+    expect(row.first_name).toBe('Вася');
+    expect(row.last_name).toBe('Иванов');
+    expect(row.seen_count).toBe(2);
+  });
+
+  it('main scope sees UNION via getContactsForGroup({scope: "main", includeUnion: true})', () => {
+    upsertContact(
+      'g_dev',
+      { kind: 'user', first_name: 'Петя' },
+      { identity: { tg_id: '99' }, source: 'sender' },
+    );
+    const rows = getContactsForGroup({ scope: 'main', includeUnion: true });
+    expect(rows.find((r) => r.tg_id === '99')).toBeDefined();
+  });
+
+  it('annotateContact REPLACES notes and APPENDS-UNIQUE tags', () => {
+    upsertContact(
+      'g',
+      { kind: 'user' },
+      { identity: { tg_id: '42' }, source: 'sender' },
+    );
+    annotateContact({ tg_id: '42' }, { notes: 'first', tags: 'a,b' });
+    annotateContact({ tg_id: '42' }, { notes: 'second', tags: 'b,c' });
+    const row = db
+      .prepare(`SELECT notes, tags FROM contacts WHERE ident = ?`)
+      .get('g|id:42') as { notes: string; tags: string };
+    expect(row.notes).toBe('second');
+    expect(row.tags.split(',').sort()).toEqual(['a', 'b', 'c']);
   });
 });
