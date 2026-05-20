@@ -3,7 +3,13 @@
 Design spec for letting the NanoClaw agent operate on the full data of every Telegram message it receives — including forward origin, mentioned/forwarded people, reply targets, and media — with a passive long-term contacts memory and on-demand media access.
 
 > **Revision history**
-> - **v8 (2026-05-20, after round 7 critical review)** — addresses 25 v7 defects across 5 parallel reviewers. Round 7 found ZERO CRITICAL issues (down from round-6's 3 CRITICAL design-level findings); all 25 verified-true findings are spec-polish: doc-coherence gaps (lessons claims vs body wording lag), missing Files-touched entries, undefined helpers, under-specified algorithms in new sections. Headline fixes:
+> - **v9 (2026-05-20, after round 8 landability check)** — addresses 4 blocking issues all introduced by v7/v8 fixes themselves. Round 8 was a single focused reviewer with binary verdict mandate (READY/NEEDS-ONE-MORE-ROUND); verdict was NEEDS-ONE-MORE-ROUND with 4 specific blockers + 5 verified-OK convergence items.
+>   - **BLOCKING** — `ctx.update.message` is undefined for 3 of 4 wired update kinds (`edited_message`, `channel_post`, `edited_channel_post`); only populated for `message`. v9 changes `processContactsFromContext` to use `ctx.msg` (grammy's omnibus accessor at `grammy/out/context.d.ts:222-227`).
+>   - **BLOCKING** — `channel.botSenderId?.()` referenced in `routeOutbound` but `botSenderId` not declared on `Channel` interface (TypeScript compile error). v9 adds `botSenderId?(): string | undefined` to `Channel` interface in Files-touched / `src/types.ts`, plus implementation bullets for Telegram (`bot.botInfo?.id`) and Gmail (undefined or `'me'`-resolved profile).
+>   - **BLOCKING** — `CROSS_GROUP_REJECTED` SELECT used `WHERE id = ? LIMIT 1` against composite PK `(id, chat_jid)`; Telegram message_ids are per-chat, NOT globally unique. v9 algorithm: first try `WHERE id = ? AND chat_jid IN (<requesting-group's JIDs>) LIMIT 1` (ALLOW if found); else `WHERE id = ? LIMIT 1` (REJECT if found, ALLOW if not found → external_reply pass-through).
+>   - **BLOCKING** — `ContactPatch` type referenced by `telegram-enrich.ts` but never defined. v9 inlines `type ContactPatch = Partial<Pick<ContactRow, 'first_name' | 'last_name' | 'title' | 'phone' | 'link' | 'bio' | 'is_bot' | 'kind'>>` plus the `upsertContact(scope, patch, opts)` signature.
+>   - Quality trajectory: v6→v7 (3 CRIT design issues), v7→v8 (0 CRIT, polish only), v8→v9 (0 CRIT, 4 blockers introduced by v7/v8 fixes themselves). Each "fix" round caps new defects to corrections of prior corrections. v9 should converge.
+> - v8 (2026-05-20, commit `c9d1cd6`) — addressed 25 v7 polish defects. Round 8 found 4 blockers — all from v7/v8 own changes. Round 7 found ZERO CRITICAL issues (down from round-6's 3 CRITICAL design-level findings); all 25 verified-true findings are spec-polish: doc-coherence gaps (lessons claims vs body wording lag), missing Files-touched entries, undefined helpers, under-specified algorithms in new sections. Headline fixes:
 >   - **HIGH** — `db.pragma('foreign_keys = ON')` was missing from the v7 `initDatabase` example code block (preserved in prose but the snippet wouldn't compile-runnable). v8 inlines it.
 >   - **HIGH** — `_initTestDatabase` not directed to register `lower_unicode` UDF and call `addMetaColumnIfMissing(db)`; tests for `lookup_messages` SQL would fail with `no such function: lower_unicode` or `no such column: meta`. v8 adds explicit MOD bullet.
 >   - **HIGH** — `CROSS_GROUP_REJECTED` ownership check had no algorithm (file_id doesn't appear in `messages.id`; lives inside `meta` TEXT). v8 requires `tg_message_id` alongside `file_id` in `view_media` for O(1) ownership lookup; external_reply media without a stored row → allow (already authorized by mount boundary).
@@ -324,8 +330,16 @@ Per-group isolation; main group sees UNION (mirrors `src/container-runner.ts:884
 **Integration site (v8 — round-7 fix)**: the host upsert pipeline lives in `src/channels/telegram.ts` INSIDE each `bot.on('message:*')` / `bot.on('edited_message:*')` / `bot.on('channel_post:*')` / `bot.on('edited_channel_post:*')` handler, after `buildMetaBlock(ctx.update.message)` but BEFORE `this.opts.onMessage(chatJid, newMessage)`. This is the only point where the raw grammy `Context` (carrying `forward_origin`, `external_reply`, `entities`, `sender_chat`, `contact`, etc.) is still in scope. The 9+ `bot.on(...)` handlers each invoke a single shared helper `processContactsFromContext(ctx, scope)` that runs the 7-trigger pipeline in order:
 
 ```ts
+import type { Context } from 'grammy';
+
 function processContactsFromContext(ctx: Context, scope: string): void {
-  const msg = ctx.update.message;
+  // CRITICAL (round-8 fix): use `ctx.msg`, NOT `ctx.update.message`.
+  // `ctx.update.message` is populated ONLY for the `message` update kind;
+  // it's undefined for `edited_message`, `channel_post`, `edited_channel_post`.
+  // grammy provides `ctx.msg` as the omnibus accessor:
+  // `this.message ?? this.editedMessage ?? this.channelPost ?? this.editedChannelPost ?? …`
+  // (grammy/out/context.d.ts:222-227).
+  const msg = ctx.msg;
   if (!msg) return;
   // 1. sender / sender_chat (mutually exclusive)
   if (msg.sender_chat) upsertContactSync({ scope, source: 'sender', /* from sender_chat */ });
@@ -471,7 +485,7 @@ The model only reads `content[0].text`, so the `<CODE>: ...` prefix is the contr
 | `NO_TEXT_LAYER` | exit 0 AND stdout empty AND stderr empty (valid PDF with no extractable text — likely scanned) | false | — |
 | `UNSUPPORTED_TYPE` | mime not in any image/text branch, OR `processImage` failed | false | — |
 | `PAGES_OUT_OF_RANGE` | `pages` invalid or exceeds 10 | false | — |
-| `CROSS_GROUP_REJECTED` | request payload references a `chat_jid` not owned by the source group folder. v8 algorithm: `view_media` MUST carry `tg_message_id` (the Telegram message id whose meta block contained the file_id) alongside `file_id`. Host check: `SELECT chat_jid FROM messages WHERE id = ? LIMIT 1` — O(1) via PRIMARY KEY. If the row exists and `chat_jid` doesn't belong to the requesting group → `CROSS_GROUP_REJECTED`. If the row doesn't exist (file_id came from an `external_reply` whose origin message wasn't stored locally) → allow the request (the host itself emitted the file_id into the meta block the agent saw, so the file_id was already authorized by the mount boundary). The v6 case "request lives in another group's IPC namespace" is structurally unreachable — `src/container-runner.ts:195-203` mounts only the group's IPC dir, and host watcher derives identity from the directory it walks (`src/ipc.ts:46-67`). | false | — |
+| `CROSS_GROUP_REJECTED` | request payload references a `chat_jid` not owned by the source group folder. v9 algorithm (round-8 fix — Telegram `message_id` is per-chat, NOT globally unique; `messages` table PK is composite `(id, chat_jid)` per `src/db.ts:35`, so a bare `WHERE id = ? LIMIT 1` returns whichever group's row happens to win B-tree iteration): `view_media` MUST carry `tg_message_id` (the Telegram message id whose meta block contained the file_id) alongside `file_id`. Host check: first `SELECT 1 FROM messages WHERE id = ? AND chat_jid IN (<requesting-group's JIDs>) LIMIT 1` — if found, ALLOW. Otherwise `SELECT 1 FROM messages WHERE id = ? LIMIT 1` — if found, REJECT (`CROSS_GROUP_REJECTED`); if not found, ALLOW (external_reply pass-through: file_id came from a meta block emitted by the host itself, so it was already authorized by the mount boundary). The v6 case "request lives in another group's IPC namespace" is structurally unreachable — `src/container-runner.ts:195-203` mounts only the group's IPC dir, and host watcher derives identity from the directory it walks (`src/ipc.ts:46-67`). | false | — |
 
 `retry_after_ms` is **informational only** — the SDK does not honor it automatically; the agent (which only sees the text prefix) cannot consume it directly.
 
@@ -815,6 +829,25 @@ Host (`src/`):
 - **NEW** `src/channels/telegram-meta.ts` — `buildMetaBlock(message): string`. Pure function (no I/O); produces the `<m>...</m>` string with all attribute values pre-escaped via `escapeXmlAttr` / `escapeXmlText`.
 - **NEW** `src/channels/telegram-enrich.ts` — bounded-rate `getChat` resolver. Concrete shape:
   ```ts
+  // Round-8 fix: `ContactPatch` is the partial-row shape host-side helpers
+  // accept when applying enrichment patches. It is a subset of `ContactRow`
+  // covering ONLY the columns getChat can populate; identity columns
+  // (`ident`, `scope`, `tg_id`, `username`) and bookkeeping columns
+  // (`first_seen`, `last_seen`, `seen_count`, `source`, `enriched`, `notes`,
+  // `tags`) are NOT part of the patch — they're managed by the upsert
+  // function based on the call's `opts` parameter.
+  type ContactPatch = Partial<Pick<
+    ContactRow,
+    'first_name' | 'last_name' | 'title' | 'phone' | 'link' | 'bio' | 'is_bot' | 'kind'
+  >>;
+  // The upsert call signature, in v9, accepts a patch + options:
+  //   upsertContact(scope: string, patch: ContactPatch, opts: {
+  //     identity: { tg_id?: string; username?: string; name?: string };
+  //     source: 'sender'|'forward'|'reply'|'vcard'|'mention'|'text_mention'|'getChat';
+  //     enriched?: 0 | 1;
+  //   }): void;
+  // Identity is built from `opts.identity` per the rule in §Identity resolution.
+
   // Module-level state, scoped per process (single Bot instance):
   type EnrichRecord = { kind: 'success' | 'failure'; ts: number; data?: ContactPatch };
   const enrichCache = new Map<string, EnrichRecord>();   // key: lowered username
@@ -846,11 +879,12 @@ Host (`src/`):
   ```
   Persistence: the cache is in-memory only (cold-start re-resolves; this is acceptable since enrichment is best-effort). Queue is in-memory too — on process restart unfinished entries are lost (next inbound mention re-queues). No backpressure: queue is unbounded but practically capped by mention rate × cache TTL.
 - **MOD** `src/channels/telegram.ts`:
-  - Wire FOUR update kinds: `bot.on('message:*')`, `bot.on('edited_message:*')`, `bot.on('channel_post:*')`, `bot.on('edited_channel_post:*')`.
+  - Wire FOUR update kinds: `bot.on('message:*')`, `bot.on('edited_message:*')`, `bot.on('channel_post:*')`, `bot.on('edited_channel_post:*')`. Each handler invokes `processContactsFromContext(ctx, scope)` (round-8: helper reads via `ctx.msg`, the grammy omnibus accessor, so a single helper covers all four).
   - Each handler builds meta via `telegram-meta` and passes via `NewMessage.meta`.
   - Remove auto-vision in `message:photo` (no `processImage`, no `images` field on `NewMessage`).
   - **Rewrite `sendTelegramMessage`** as shown in §2 above — returns `Promise<{ messageId: string }>`.
   - **Rewrite `TelegramChannel.sendMessage`** as shown in §3 above — captures the first chunk's id.
+  - **Add `botSenderId(): string | undefined`** method (round-8): returns `this.bot.botInfo?.id ? String(this.bot.botInfo.id) : undefined`. `bot.botInfo` is populated by grammy after `bot.init()` completes; before then it may be undefined — the optional method signature accommodates that.
 - **MOD** `src/db.ts`:
   - **`ALTER TABLE messages ADD COLUMN meta TEXT` made idempotent via PRAGMA-check wrapper** (SQLite raises `duplicate column name: meta` if the column already exists, so a naked `ALTER TABLE` is NOT idempotent across restarts):
     ```ts
@@ -954,12 +988,15 @@ Host (`src/`):
   - **`routeOutbound`** as shown in §5 above — isolation of send vs store.
 - **MOD** `src/types.ts`:
   - `Channel.sendMessage` returns `Promise<{ messageId?: string } | void>`.
+  - **Add `Channel.botSenderId?(): string | undefined`** (round-8 fix — `routeOutbound` calls `channel.botSenderId?.()` to thread per-channel bot identity into `storeOutboundMessage.sender`; without this declaration TypeScript compile fails).
   - Add `NewMessage.meta?: string`.
   - **Remove `NewMessage.images?: ImageAttachment[]`** (auto-vision deprecated; nothing should produce or consume it post-migration). The `ImageAttachment` type itself can be removed if no other consumer exists — confirm with a grep before deletion.
 - **MOD** `src/index.ts`:
   - All seven direct `channel.sendMessage(...)` migrated to `routeOutbound(channels, jid, text, opts)` at lines **304, 647, 667, 676, 682, 769, 777** (the last two are the single call inside each `deps.sendMessage` lambda — lambda bodies span 761-771 and 773-778 respectively).
   - Delete `pendingImages` Map and `hasImages` branch.
-- **MOD** `src/channels/gmail.ts` — `sendMessage` as shown in §4 above; handles `id | null | undefined`.
+- **MOD** `src/channels/gmail.ts`:
+  - `sendMessage` as shown in §4 above; handles `id | null | undefined` and `''` (truthy fallback).
+  - **Add `botSenderId(): string | undefined`** method (round-8): returns the configured `'me'`-resolved email address if available (from `gmail.users.getProfile({userId: 'me'})` cached at connect time), otherwise undefined. If no profile cache is added, return undefined and the synthetic-sender fallback `'bot'` applies — acceptable since Gmail outbound IDs are already opaque, sender-based queries are less likely for Gmail.
 
 Container (`container/agent-runner/src/`):
 - **MOD** `ipc-mcp-stdio.ts`:
