@@ -681,4 +681,51 @@ describe('upsertContact', () => {
     expect(row.kind).toBe('channel');
     expect(row.title).toBe('Durov Updated');
   });
+
+  it('identity: username-only branch builds ident with |un: prefix and lowercased username', () => {
+    upsertContact(
+      'g',
+      { kind: 'user', first_name: 'Вася' },
+      { identity: { username: 'VASYA' }, source: 'mention' },
+    );
+    // Lowered username in both ident and stored username column:
+    const row = db
+      .prepare(`SELECT ident, username FROM contacts WHERE ident = ?`)
+      .get('g|un:vasya') as { ident: string; username: string };
+    expect(row.ident).toBe('g|un:vasya');
+    expect(row.username).toBe('vasya');
+  });
+
+  it('identity: name-only branch builds ident with |name: prefix and lowercased name', () => {
+    upsertContact(
+      'g',
+      { kind: 'user', first_name: 'John' },
+      { identity: { name: 'John Smith' }, source: 'vcard' },
+    );
+    const row = db
+      .prepare(`SELECT ident FROM contacts WHERE ident = ?`)
+      .get('g|name:john smith') as { ident: string } | undefined;
+    expect(row?.ident).toBe('g|name:john smith');
+  });
+
+  it('throws when identity is completely empty', () => {
+    expect(() =>
+      upsertContact('g', { kind: 'user' }, { identity: {}, source: 'sender' }),
+    ).toThrow(/upsertContact:.*identity/i);
+  });
+
+  it('tg_id takes precedence over username when both present', () => {
+    upsertContact(
+      'g',
+      { kind: 'user' },
+      { identity: { tg_id: '42', username: 'vasya' }, source: 'sender' },
+    );
+    // Should land at g|id:42 (NOT g|un:vasya):
+    expect(
+      db.prepare(`SELECT 1 FROM contacts WHERE ident = ?`).get('g|id:42'),
+    ).toBeDefined();
+    expect(
+      db.prepare(`SELECT 1 FROM contacts WHERE ident = ?`).get('g|un:vasya'),
+    ).toBeUndefined();
+  });
 });

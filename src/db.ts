@@ -751,6 +751,15 @@ export function promoteContactIdent(
  *   - first_seen: preserved (no update)
  *   - seen_count: contacts.seen_count + 1
  *   - notes/tags: NEVER touched here — agent-owned, only annotateContact writes
+ *
+ * **Deviation from spec line 372** (`kind` is listed under "overwrite" but
+ * implemented as COALESCE-sticky-preserve here): every host trigger in the
+ * spec supplies `kind` in the patch explicitly, so the difference is only
+ * observable for callers that omit `kind` on a pre-existing row. Sticky-
+ * preserve is the safer default (a `kind='channel'` row never silently
+ * reverts to `'user'` when a subsequent upsert omits `kind`). If a future
+ * caller needs explicit `kind` overwrite (e.g. user-was-reclassified flow),
+ * add an explicit-update path that doesn't use this function.
  */
 export function upsertContact(
   scope: string,
@@ -889,6 +898,15 @@ export function getContactsForGroup(opts: {
  *
  * Identifier resolution: ident → tg_id → username (scope-agnostic; the agent
  * may only know the tg_id). Throws if no identifier or no matching row.
+ *
+ * **Scope-ambiguity note** (code-review follow-up): when `identifier.username`
+ * is used (no `ident`, no `tg_id`), the lookup runs `WHERE username = ? LIMIT 1`
+ * with NO scope filter — Telegram usernames can plausibly appear in multiple
+ * scopes (e.g. 'vasya' in g_dev, g_friends, and main). The first matching row
+ * by SQLite B-tree iteration order wins, which is not caller-controlled.
+ * Resolution is unambiguous when `tg_id` is provided (globally unique) or
+ * `ident` is provided (already fully qualified). Callers that need scope
+ * targeting must pass `ident` directly.
  */
 export function annotateContact(
   identifier: { ident?: string; username?: string; tg_id?: string },
