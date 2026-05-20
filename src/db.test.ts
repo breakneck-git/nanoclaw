@@ -518,3 +518,23 @@ describe('contacts table', () => {
     expect(row.username).toBe('vasya');
   });
 });
+
+describe('database init idempotency + UDF', () => {
+  it('_initTestDatabase is idempotent across consecutive calls', () => {
+    _initTestDatabase();
+    _initTestDatabase();
+    // If addMetaColumnIfMissing fails on the second call, this throws "duplicate column: meta"
+    const cols = db.prepare('PRAGMA table_info(messages)').all() as Array<{
+      name: string;
+    }>;
+    expect(cols.some((c) => c.name === 'meta')).toBe(true);
+  });
+
+  it('lower_unicode UDF lowercases Cyrillic', () => {
+    _initTestDatabase();
+    const result = db.prepare(`SELECT lower_unicode('Привет') AS r`).get() as {
+      r: string;
+    };
+    expect(result.r).toBe('привет');
+  });
+});

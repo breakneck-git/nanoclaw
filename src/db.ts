@@ -14,6 +14,22 @@ import {
 
 export let db: Database.Database;
 
+function wireDatabaseFeatures(database: Database.Database): void {
+  database.pragma('foreign_keys = ON');
+  database.function('lower_unicode', { deterministic: true }, (s: unknown) =>
+    s === null ? null : (s as string).toLowerCase(),
+  );
+}
+
+function addMetaColumnIfMissing(database: Database.Database): void {
+  const cols = database.prepare('PRAGMA table_info(messages)').all() as {
+    name: string;
+  }[];
+  if (!cols.some((c) => c.name === 'meta')) {
+    database.exec('ALTER TABLE messages ADD COLUMN meta TEXT');
+  }
+}
+
 function createSchema(database: Database.Database): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS chats (
@@ -176,12 +192,14 @@ export function initDatabase(): void {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   db = new Database(dbPath);
-  // better-sqlite3 defaults to foreign_keys=OFF, so the declared FK on
-  // task_run_logs(task_id) is otherwise just decoration. Turning it on means
-  // deleteTask's manual child-cascade now matters; it's wrapped in a
-  // transaction below for atomicity.
-  db.pragma('foreign_keys = ON');
+  // wireDatabaseFeatures turns on foreign_keys (better-sqlite3 defaults to
+  // OFF, which would leave the declared FK on task_run_logs(task_id) as just
+  // decoration; deleteTask's manual child-cascade depends on it and is wrapped
+  // in a transaction below for atomicity) and registers the lower_unicode UDF
+  // for Cyrillic-safe case-insensitive search.
+  wireDatabaseFeatures(db);
   createSchema(db);
+  addMetaColumnIfMissing(db);
 
   // Migrate from JSON files if they exist
   migrateJsonState();
@@ -190,8 +208,9 @@ export function initDatabase(): void {
 /** @internal - for tests only. Creates a fresh in-memory database. */
 export function _initTestDatabase(): void {
   db = new Database(':memory:');
-  db.pragma('foreign_keys = ON');
+  wireDatabaseFeatures(db);
   createSchema(db);
+  addMetaColumnIfMissing(db);
 }
 
 /**
