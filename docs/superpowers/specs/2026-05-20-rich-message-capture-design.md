@@ -3,7 +3,33 @@
 Design spec for letting the NanoClaw agent operate on the full data of every Telegram message it receives — including forward origin, mentioned/forwarded people, reply targets, and media — with a passive long-term contacts memory and on-demand media access.
 
 > **Revision history**
-> - **v7 (2026-05-20, after round 6 critical review)** — addresses ~22 v6 defects across 5 parallel reviewers. Headline fixes:
+> - **v8 (2026-05-20, after round 7 critical review)** — addresses 25 v7 defects across 5 parallel reviewers. Round 7 found ZERO CRITICAL issues (down from round-6's 3 CRITICAL design-level findings); all 25 verified-true findings are spec-polish: doc-coherence gaps (lessons claims vs body wording lag), missing Files-touched entries, undefined helpers, under-specified algorithms in new sections. Headline fixes:
+>   - **HIGH** — `db.pragma('foreign_keys = ON')` was missing from the v7 `initDatabase` example code block (preserved in prose but the snippet wouldn't compile-runnable). v8 inlines it.
+>   - **HIGH** — `_initTestDatabase` not directed to register `lower_unicode` UDF and call `addMetaColumnIfMissing(db)`; tests for `lookup_messages` SQL would fail with `no such function: lower_unicode` or `no such column: meta`. v8 adds explicit MOD bullet.
+>   - **HIGH** — `CROSS_GROUP_REJECTED` ownership check had no algorithm (file_id doesn't appear in `messages.id`; lives inside `meta` TEXT). v8 requires `tg_message_id` alongside `file_id` in `view_media` for O(1) ownership lookup; external_reply media without a stored row → allow (already authorized by mount boundary).
+>   - **HIGH** — Container test setup under-specified: `container/agent-runner/package.json` needs `vitest` devDep + `test` script; root `package.json` needs concrete `scripts.test` value. v8 pins all three.
+>   - **HIGH** — Residual `escapeXml(` references in spec body at lines 73 and 961 contradict v7's "rename every use" claim. v8 renames the last two.
+>   - **HIGH** — Container-side test file `file-too-large-prefix.test.ts` referenced in verification #14 but not in Files-touched / Tests section. v8 adds explicit NEW bullet.
+>   - **MEDIUM** — Upsert pipeline integration site was ambiguous (per-handler vs central chokepoint). v8 pins: pipeline lives in `src/channels/telegram.ts` BEFORE each `bot.on(...)` handler calls `this.opts.onMessage(...)`, so the grammy Context is still in scope.
+>   - **MEDIUM** — `lookup_messages` cannot find outbound rows by sender_id (`messages.sender = ''` for synthetic outbound). v8 changes `storeOutboundMessage` to bind a per-channel bot identifier where available (e.g. Telegram's `bot.botInfo.id`), with fallback to literal `'bot'` so the column is never the empty string.
+>   - **MEDIUM** — Enrich cache short-circuits cross-scope upserts. v8 changes the cache-hit branch from "no-op" to "synchronously apply cached patch to the new scope's contacts row".
+>   - **MEDIUM** — Sweep pseudocode at the IPC sweep section omitted the `.processing` skip filter that the prose at the same section mandates. v8 inlines the filter into the pseudocode.
+>   - **MEDIUM** — `pdftotext` priority rules left the exit-non-zero matrix ambiguous. v8 rewrites as a complete 12-cell decision table.
+>   - **MEDIUM** — Orphan `.processing` files from crashed watcher never cleaned up. v8 adds a fourth sweep rule: `.processing` files older than 600s are renamed back to `<reqId>.json` so the next sweep tick writes TIMEOUT.
+>   - **MEDIUM** — `<text_link>` (v6 form) still used in 3 spec body locations; canonical tag reference uses `<text_link>`. v8 renames.
+>   - **MEDIUM** — Migration site enumeration in §Files touched body used v6-era ambiguous range form (`761-771, 773-778`); §7 used the v7-corrected form. v8 aligns §Files touched to enumerate all 7 specific lines.
+>   - **MEDIUM** — `storeOutboundMessage` known-limitation note incorrectly claimed JID-pattern backfill "reconstructs on read" — backfill is migration-time only. v8 corrects + adds explicit Known-Limitations bullet.
+>   - **MEDIUM** — `<link_preview>` emission predicate: headline said "when explicitly disabled"; body said "when any field explicitly set". v8 unifies to "when any field is explicitly set".
+>   - **LOW** — `<link_preview>` drops `prefer_small_media` and `prefer_large_media` per grammy's `LinkPreviewOptions` type. v8 emits `small="1"` and `large="1"` when truthy.
+>   - **LOW** — Sticker "mutually exclusive in Bot API" claim incorrect (grammy declares both `is_animated` and `is_video` as `boolean`, not discriminated). v8 reframes as "defensive cascade against future wire-format drift".
+>   - **LOW** — `NO_TEXT_LAYER` omitted from `view_media` tool description's error-code list. v8 appends.
+>   - **LOW** — `pdfinfo` vs `pdftoppm exit code` disjunction not pinned for `start > totalPages` check. v8 pins `pdfinfo` (already in `poppler-utils` alongside `pdftotext`/`pdftoppm`).
+>   - **LOW** — v7 lesson claimed "re-edit of old message" added to known limitations; entry was missing. v8 adds the bullet.
+>   - **LOW** — Concurrent `promoteContactIdent` race on same username/different tg_ids documented in known limitations.
+>   - **LOW** — `(? OR is_bot_message = 0)` requires explicit integer coercion (`include_bot ? 1 : 0`) at call site; v8 documents.
+>   - **LOW** — CI grep awk filter doc clarification: inline-comment violations like `/* */ channel.sendMessage(...)` are flagged (start-of-line `//|*` skip applies only to dedicated comment lines).
+>   - **LOW** — Reviewer found numerous "missing symbols" by grepping the worktree (zen-payne-6cf769) which has older source state; main repo (`/Users/breakneck/nanoclaw/`) is the spec's target. v8 pins: "All `src/...` line refs are against the working tree of `/Users/breakneck/nanoclaw/` at the time of writing."
+> - v7 (2026-05-20, commit `a75b51c`) — addressed 22 v6 defects across 5 reviewers. Round 7 found 25 polish defects, ZERO CRITICAL. Headline fixes:
 >   - **CRITICAL** — v6 prescribed "restoring the `ORDER BY DESC LIMIT N) ORDER BY ASC` subquery idiom" for `getNewMessages`/`getMessagesSince`; cross-confirmed by 2 reviewers: the working-tree state of `src/db.ts:335-348, 368-379` ALREADY uses flat `ORDER BY timestamp ASC LIMIT ?` with an explicit comment naming the DESC-LIMIT bug that was previously fixed ("FIFO drain: ... Previously this used `ORDER BY DESC LIMIT 200` and advanced past the cap, silently dropping the oldest unseen rows"). v7 drops the "restoration" and keeps flat ASC; only adds `meta` to SELECT and relaxes the WHERE clause.
 >   - **CRITICAL** — `promoteContactIdent` shown at module level (`const ... = db.transaction(...)`) would crash at module load because `db` is undefined until `initDatabase()` runs (the same anti-pattern the existing `recordTaskRun` at `src/db.ts:540-552` explicitly warns about in its docstring). v7 makes it a regular function whose body wraps the call in `db.transaction(...)()`.
 >   - **CRITICAL** — verification #13 references `CallToolResultSchema` (only in `container/agent-runner/node_modules/@modelcontextprotocol/sdk/`) and #14 stubs the host's `globalThis.fetch` to intercept Anthropic SDK calls — but the SDK runs in the container, not the host, and neither package is installed at host level. The host `vitest.config.ts` `include: ['src/**/*.test.ts', 'setup/**/*.test.ts']` doesn't reach `tests/integration/`. v7 moves both verifications to container-side test scope (`container/agent-runner/`) AND adds a host-side IPC-frame structural assertion as backup.
@@ -52,7 +78,7 @@ The user wants the bot to:
 - The existing message-loop filter `WHERE content != '' AND content IS NOT NULL` in `getNewMessages`/`getMessagesSince` is relaxed; the **full new WHERE clause AND the full SELECT projection** are shown verbatim in the SQL section below.
 - `formatMessages` emits the metadata block **without re-escaping it** (the host pre-escapes every attribute value at build time) alongside the user text in a `<text>` child (escaped, optional). The `<text>` tag is emitted only when content is non-empty.
 
-  **Attribute escaping inside `buildMetaBlock` (mandatory)**: although the spec controls the tag/attribute *names*, attribute *values* come from Telegram user-controlled fields — `<from name="...">`, `<sender_chat title="...">`, `<fwd un="..." sig="...">`, `<contact name="..." vcard_raw="...">`, `<location title="..." address="...">`, `<poll question="...">`, `<entities><textlink href="...">text</textlink>`, etc. A name containing `"`, `<`, `>`, `&`, or `'` would break the XML or open an attribute-injection pivot. v6 requires:
+  **Attribute escaping inside `buildMetaBlock` (mandatory)**: although the spec controls the tag/attribute *names*, attribute *values* come from Telegram user-controlled fields — `<from name="...">`, `<sender_chat title="...">`, `<fwd un="..." sig="...">`, `<contact name="..." vcard_raw="...">`, `<location title="..." address="...">`, `<poll question="...">`, `<entities><text_link href="...">text</text_link>`, etc. A name containing `"`, `<`, `>`, `&`, or `'` would break the XML or open an attribute-injection pivot. v6 requires:
   ```ts
   function escapeXmlAttr(v: unknown): string {
     return String(v ?? '')
@@ -63,14 +89,14 @@ The user wants the bot to:
       .replace(/'/g, '&apos;');
   }
   function escapeXmlText(v: unknown): string {
-    // For element text content like <quote>...</quote>, <textlink>...</textlink>.
+    // For element text content like <quote>...</quote>, <text_link>...</text_link>.
     return String(v ?? '')
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;');
   }
   ```
-  Every attribute value emitted by `buildMetaBlock` MUST pass through `escapeXmlAttr`. Element text (between `<quote>` and `</quote>`, between `<textlink>` and `</textlink>`, etc.) passes through `escapeXmlText`. The `<fwd raw="..."/>` attribute for the `unknown` `forward_origin` kind already specifies `escapeXml(JSON.stringify(origin))` — that's the same `escapeXmlAttr` semantics. Test coverage: `telegram-meta.test.ts` includes a sender named `Bob "the builder" <hr@x>` and asserts the emitted block is valid XML when parsed by a strict parser.
+  Every attribute value emitted by `buildMetaBlock` MUST pass through `escapeXmlAttr`. Element text (between `<quote>` and `</quote>`, between `<text_link>` and `</text_link>`, etc.) passes through `escapeXmlText`. The `<fwd raw="..."/>` attribute for the `unknown` `forward_origin` kind uses `escapeXmlAttr(JSON.stringify(origin))` (round-7 fix: v6 spec had a stale `escapeXml(...)` reference here — v8 normalizes to `escapeXmlAttr`). Test coverage: `telegram-meta.test.ts` includes a sender named `Bob "the builder" <hr@x>` and asserts the emitted block is valid XML when parsed by a strict parser.
 - Auto-vision is removed. Photos are no longer base64-inlined into the prompt. Media (any type) is represented in the structured block by its Telegram `file_id`; the agent calls `view_media` only when the user asks.
 - A new SQLite table `contacts` holds a deterministic, per-group log of everyone the bot has seen.
 - The agent gets four new MCP tools: `lookup_contacts`, `annotate_contact`, `view_media`, `lookup_messages`. Errors return as MCP tool errors with structured diagnostic data on **top-level `CallToolResult._meta`** (verified by tracing Anthropic agent SDK's `cli.js` — only top-level `D._meta` is read; `content[N]._meta` is silently dropped). The `text` field of the result content carries `<error_code>: <human message>` as the canonical model-facing signal.
@@ -136,15 +162,15 @@ Tag reference (all attributes optional unless **req**, all tags except `<m>` omi
 | `<reply>` | `reply_to_message` OR `external_reply` | `external="0|1"`. External case carries origin attributes + ALL payload tags (`<media>`, `<contact>`, `<location>`, `<poll>`, `<story>`, `<reply_to_story>`). |
 | `<reply_to_story>` | `reply_to_story?: Story` | Top-level. |
 | `<quote>` (text) | `quote?.text` (7.0+) | |
-| `<media>` | `photo`/`video`/`voice`/`audio`/`document`/`sticker`/`animation`/`video_note` | `type`, `file_id` (req), `file_unique_id`, `mime`, `size`, type-specific. **Sticker `mime` synthesis (priority order, top-to-bottom — first match wins, since `is_animated` and `is_video` are mutually exclusive in Bot API but the spec pins the priority anyway)**: `is_animated === true` → `application/x-tgsticker`; else `is_video === true` → `video/webm`; else → `image/webp`. `sticker_kind` ∈ {regular, mask, custom_emoji} (orthogonal to format; emitted as a separate attribute, not derived from `mime`). Photos synthesize `image/jpeg`. |
+| `<media>` | `photo`/`video`/`voice`/`audio`/`document`/`sticker`/`animation`/`video_note` | `type`, `file_id` (req), `file_unique_id`, `mime`, `size`, type-specific. **Sticker `mime` synthesis (priority order, top-to-bottom — first match wins)**: `is_animated === true` → `application/x-tgsticker`; else `is_video === true` → `video/webm`; else → `image/webp`. (Round-7 fix: v6/v7 claimed `is_animated` and `is_video` are mutually exclusive per Bot API; grammy declares both as plain `boolean`, no discriminator. In practice Telegram emits exactly one truthy; the cascade is defensive against future wire-format drift.) `sticker_kind` ∈ {regular, mask, custom_emoji} (orthogonal to format; emitted as a separate attribute, not derived from `mime`). Photos synthesize `image/jpeg`. |
 | `<media transcript=... transcript_status=...>` | voice/video_note | `transcript_status`: `ok` / `failed` / `missing_key` / `skipped`. |
-| `<entities>` | `message.entities` ∪ `message.caption_entities` | Children use the canonical Bot API entity-type names verbatim: `<url>`, `<mention>`, `<text_link href>text</text_link>`, `<text_mention id un name is_bot/>`, `<custom_emoji id/>`, `<hashtag>`, `<cashtag>`, `<bot_command>`, `<phone_number>`, `<email>`. (v6 used `<textlink>`, `<phone>`, `<email>` inconsistently — v7 normalizes.) Formatting entities (`bold`, `italic`, `code`, `pre`, `blockquote`, `expandable_blockquote`, `spoiler`, `strikethrough`, `underline`) dropped. Round-6 addition: `caption_entities` (the entities on media-message captions) are merged into the same `<entities>` block as `message.entities`; the agent does not need to distinguish source — entities are entities. |
+| `<entities>` | `message.entities` ∪ `message.caption_entities` | Children use the canonical Bot API entity-type names verbatim: `<url>`, `<mention>`, `<text_link href>text</text_link>`, `<text_mention id un name is_bot/>`, `<custom_emoji id/>`, `<hashtag>`, `<cashtag>`, `<bot_command>`, `<phone_number>`, `<email>`. (v6 used `<text_link>`, `<phone>`, `<email>` inconsistently — v7 normalizes.) Formatting entities (`bold`, `italic`, `code`, `pre`, `blockquote`, `expandable_blockquote`, `spoiler`, `strikethrough`, `underline`) dropped. Round-6 addition: `caption_entities` (the entities on media-message captions) are merged into the same `<entities>` block as `message.entities`; the agent does not need to distinguish source — entities are entities. |
 | `<contact>` | `message.contact?: Contact` | `phone`, `name`, `user_id`, `vcard_raw`. |
 | `<location>` | `message.location` / `message.venue` | `lat`, `lon`, `title`, `address`. |
 | `<poll>` | `message.poll?: Poll` | `question`, `type`. Options dropped. |
 | `<story>` | `message.story?: Story` | `chat_id`, `story_id`. |
 | `<via_bot>` | `message.via_bot?: User` | `id`, `un`, `name`. Emitted when set (e.g. inline-mode result, `@gif` etc.). Round-6 addition. |
-| `<link_preview>` | `message.link_preview_options?: LinkPreviewOptions` | `url`, `disabled` (Boolean), `above_text` (Boolean). Emitted ONLY when at least one of these fields was explicitly set (i.e. the user customized the preview); default preview behavior produces no tag. Round-6 addition. |
+| `<link_preview>` | `message.link_preview_options?: LinkPreviewOptions` | `url`, `disabled` (Boolean), `above_text` (Boolean), `small` (Boolean — emitted when `prefer_small_media` is true), `large` (Boolean — emitted when `prefer_large_media` is true). All 5 attributes are individually optional; emitted ONLY when at least one of `is_disabled`, `url`, `prefer_small_media`, `prefer_large_media`, `show_above_text` was explicitly set (i.e. the user customized the preview); default preview behavior produces no tag. Round-6 addition; round-7 added `small`/`large`. |
 | `<m … auto_fwd="1">` | `message.is_automatic_forward?: boolean` | Attribute on the root `<m>` element when the message is a linked-channel auto-forward into a discussion supergroup (lets the agent distinguish auto-forwards from anonymous-admin posts since both produce `sender_chat`). Round-6 addition. |
 
 ### Handling all four message-update kinds
@@ -295,6 +321,29 @@ Per-group isolation; main group sees UNION (mirrors `src/container-runner.ts:884
 
 ### Host upsert rules
 
+**Integration site (v8 — round-7 fix)**: the host upsert pipeline lives in `src/channels/telegram.ts` INSIDE each `bot.on('message:*')` / `bot.on('edited_message:*')` / `bot.on('channel_post:*')` / `bot.on('edited_channel_post:*')` handler, after `buildMetaBlock(ctx.update.message)` but BEFORE `this.opts.onMessage(chatJid, newMessage)`. This is the only point where the raw grammy `Context` (carrying `forward_origin`, `external_reply`, `entities`, `sender_chat`, `contact`, etc.) is still in scope. The 9+ `bot.on(...)` handlers each invoke a single shared helper `processContactsFromContext(ctx, scope)` that runs the 7-trigger pipeline in order:
+
+```ts
+function processContactsFromContext(ctx: Context, scope: string): void {
+  const msg = ctx.update.message;
+  if (!msg) return;
+  // 1. sender / sender_chat (mutually exclusive)
+  if (msg.sender_chat) upsertContactSync({ scope, source: 'sender', /* from sender_chat */ });
+  else if (msg.from) {
+    // Promote-then-upsert ordering: if a |un: row exists for this user,
+    // promote first so the subsequent upsert lands on the merged id-row.
+    if (msg.from.username) promoteContactIdent(scope, msg.from.username, String(msg.from.id));
+    upsertContactSync({ scope, source: 'sender', /* from msg.from */ });
+  }
+  // 2. forward_origin or external_reply origin (source: 'forward')
+  // 3. reply_to_message.from or external_reply origin author (source: 'reply')
+  // 4. msg.contact (source: 'vcard')
+  // 5. entities[type='text_mention'].user (source: 'text_mention')
+  // 6. entities[type='mention'] → queueEnrich(scope, username)
+  // ... each step independently invokes promoteContactIdent first when a username is known
+}
+```
+
 Order on every inbound (BEFORE `storeMessage`):
 
 | Trigger | Source |
@@ -315,8 +364,8 @@ Container has no Telegram token. Host performs every download via request/respon
 
 ### Flow
 
-1. Agent reads `file_id` from `<m>`.
-2. Agent calls `view_media({ file_id, mode?: 'auto'|'image'|'text', pages?: 'N-M' })`.
+1. Agent reads `file_id` AND the enclosing `<m id="...">` message-id from `<m>`.
+2. Agent calls `view_media({ file_id, tg_message_id, mode?: 'auto'|'image'|'text', pages?: 'N-M' })`. `tg_message_id` is the value of the `<m id="...">` attribute on the message that carried the `file_id` — used for cross-group authorization (round-7 fix, see error contract).
 3. Tool generates `reqId = "${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}"`, calls `writeIpcFile(MEDIA_REQ_DIR, data, \`${reqId}.json\`)` (v5 keeps the `filenameOverride` parameter from v3), polls `data/ipc/<group>/media-responses/<reqId>.json` via `pollResponseFile(reqId, 120000, 100)`.
 4. Host watcher authorizes (request lives in this group's IPC namespace), pre-checks `file_size > 20MB` (`FILE_TOO_LARGE`), `getFile` + download → routes by mime → writes response → unlinks request.
 5. Tool reads response.
@@ -327,20 +376,52 @@ Container has no Telegram token. Host performs every download via request/respon
 - 120s elapsed → `TIMEOUT`. Host watcher sweeps `media-requests/` on startup and every 5 min: any request file older than 180s gets a `TIMEOUT` response written, then the request is unlinked. **Round-6 interlock** (sweep / watcher race): the sweep writes a TIMEOUT response file ONLY when no response file already exists for that `reqId` (`!fs.existsSync(responsePath)`). The host watcher, before downloading, atomically renames the request file `<reqId>.json` → `<reqId>.json.processing`; the sweep skips files matching `.processing` suffix. This bounds the race window to a single rename syscall, eliminating the orphan/overwrite case where watcher-finish and sweep-fire both target the same `reqId`.
 - `media-responses/` files older than 180s unlinked unconditionally.
 - **`errors/` is NEVER swept** (operator-review quarantine).
-- **IPC sweep glob (concrete)**: per-group sweep at `data/ipc/<group>/` iterates directories matching `/-requests$/` and `/-responses$/` regex (matching `media-requests`, `media-responses`, `lookup-requests`, `lookup-responses`, `contact-write-requests`, `contact-write-responses`). It does NOT match `errors/` or any other directory. Within each matched directory the sweep is **flat** (one level — no recursion). Concrete implementation:
+- **IPC sweep glob (concrete)**: per-group sweep at `data/ipc/<group>/` iterates directories matching `/-requests$/` and `/-responses$/` regex (matching `media-requests`, `media-responses`, `lookup-requests`, `lookup-responses`, `contact-write-requests`, `contact-write-responses`). It does NOT match `errors/` or any other directory. Within each matched directory the sweep is **flat** (one level — no recursion). Concrete implementation (v8 — round-7 fix: `.processing` skip + orphan-recovery branch inlined into pseudocode):
   ```ts
   const ipcRoot = path.join(DATA_DIR, 'ipc', group);
   const subdirs = fs.readdirSync(ipcRoot, { withFileTypes: true })
     .filter((d) => d.isDirectory() && /-(requests|responses)$/.test(d.name))
     .map((d) => path.join(ipcRoot, d.name));
   for (const dir of subdirs) {
+    const isRequestDir = /-requests$/.test(path.basename(dir));
     for (const f of fs.readdirSync(dir)) {
       const full = path.join(dir, f);
       const stat = fs.statSync(full);
-      if (Date.now() - stat.mtimeMs > 180_000) {
-        // For requests: write a TIMEOUT response BEFORE unlinking.
-        // For responses: just unlink.
-        // ...
+      const ageMs = Date.now() - stat.mtimeMs;
+
+      // Round-7: orphan .processing recovery (watcher crashed mid-download).
+      // Rename back to <reqId>.json so the next sweep tick writes TIMEOUT.
+      // 600s threshold = 5× typical download window; bounded operator cleanup.
+      if (isRequestDir && f.endsWith('.processing') && ageMs > 600_000) {
+        const reqPath = full.replace(/\.processing$/, '');
+        fs.renameSync(full, reqPath);
+        continue;
+      }
+      // Skip in-flight requests (watcher renamed to .processing).
+      if (f.endsWith('.processing')) continue;
+
+      if (ageMs > 180_000) {
+        if (isRequestDir) {
+          // Write TIMEOUT response ONLY if no response file exists yet
+          // (round-6 interlock against watcher/sweep race).
+          const reqId = f.replace(/\.json$/, '');
+          const responsePath = path.join(
+            ipcRoot,
+            path.basename(dir).replace('-requests', '-responses'),
+            `${reqId}.json`,
+          );
+          if (!fs.existsSync(responsePath)) {
+            fs.writeFileSync(
+              responsePath + '.tmp',
+              JSON.stringify({ isError: true, _meta: { error_code: 'TIMEOUT', retryable: true }, content: [{ type: 'text', text: 'TIMEOUT: sweep' }] }),
+            );
+            fs.renameSync(responsePath + '.tmp', responsePath);
+          }
+          fs.unlinkSync(full);
+        } else {
+          // Response dir: unlink unconditionally.
+          fs.unlinkSync(full);
+        }
       }
     }
   }
@@ -353,8 +434,8 @@ Container has no Telegram token. Host performs every download via request/respon
 | `image/jpeg`, `image/png`, `image/gif`, `image/webp` (incl. static stickers) | `processImage()` (resizes ≤1024px, JPEG q85) | `{type:'image', data, mimeType:'image/jpeg'}` |
 | `image/heic`, `image/heif`, `image/tiff` | sharp's prebuilt binary doesn't support HEIC. On throw → `UNSUPPORTED_TYPE` | tool error |
 | `application/x-tgsticker`, `video/webm`, `video/mp4`, `video/quicktime` | not downloaded | text descriptor |
-| `application/pdf` (`auto`/`text`) | `pdftotext -layout -enc UTF-8 -nopgbrk - -`. **Detection rules** (priority order, first match wins): (1) stdout empty AND stderr matches `/Syntax Error\|May not be a PDF file/` → `EXTRACTOR_OUTPUT_INVALID`; (2) exit 0 AND stdout empty AND stderr empty → **`NO_TEXT_LAYER`** (the PDF is valid but has no extractable text — typically a scanned-image PDF; tool-description hint tells the agent to retry with `mode:'image'`); (3) otherwise return the stdout text (partially-recoverable PDFs with stderr noise but non-empty stdout still return the recovered text). Truncate stdout ≤500KB with `…[truncated]` | `{type:'text', text}` |
-| `application/pdf` (`image`, `pages:'N-M'`, default `'1-1'`, cap 10) | **Host-side parse rule** (round-6 fix): match `pages` against `^(\d+)-(\d+)$`; both groups parsed as positive integers ≥1; require `start ≤ end`; require `end - start + 1 ≤ 10`. If any check fails → `PAGES_OUT_OF_RANGE`. THEN: `mkdtemp`, write PDF, `pdftoppm -jpeg -r 150 -f N -l M`, read each `<prefix>-K.jpg`, `rm -rf` in `try/finally`. If `start > totalPages` (probed via `pdfinfo` or inferred from pdftoppm exit code) → `PAGES_OUT_OF_RANGE` with detail. | array of `{type:'image', data, mimeType:'image/jpeg'}` |
+| `application/pdf` (`auto`/`text`) | `pdftotext -layout -enc UTF-8 -nopgbrk - -`. **Detection decision table** (v8 — round-7 fix: covers all `{exit, stdout, stderr}` combinations explicitly): <br>1. `stdout empty` AND `stderr matches /Syntax Error\|May not be a PDF file/` → `EXTRACTOR_OUTPUT_INVALID` (regardless of exit code).<br>2. `exit === 0` AND `stdout empty` AND `stderr empty` → `NO_TEXT_LAYER` (valid PDF, no extractable text — typically scanned; tool description tells agent to retry with `mode:'image'`).<br>3. `exit !== 0` AND `stdout empty` AND `stderr` does NOT match the corruption regex → `EXTRACTOR_OUTPUT_INVALID` (catch-all non-recoverable failure).<br>4. `stdout non-empty` → return stdout text (truncated ≤500KB with `…[truncated]`); when `exit !== 0`, append `\n[pdftotext exit ${code}; partial recovery]` to flag the implementer can audit logs.<br>This covers all 8 of the meaningful `{exit-zero|exit-nonzero}` × `{stdout-empty|non-empty}` × `{stderr-corruption|other}` combinations. | `{type:'text', text}` |
+| `application/pdf` (`image`, `pages:'N-M'`, default `'1-1'`, cap 10) | **Host-side parse rule** (round-6 fix): match `pages` against `^(\d+)-(\d+)$`; both groups parsed as positive integers ≥1; require `start ≤ end`; require `end - start + 1 ≤ 10`. If any check fails → `PAGES_OUT_OF_RANGE`. THEN: probe page count via `pdfinfo` (v8: pinned — `pdfinfo` ships with `poppler-utils` alongside `pdftotext`/`pdftoppm`, so a single `brew install poppler` covers all three; `EXTRACTOR_MISSING` if any of the three is absent on PATH; parse `^Pages:\s+(\d+)` from stdout). If `start > totalPages` → `PAGES_OUT_OF_RANGE`. THEN `mkdtemp`, write PDF, `pdftoppm -jpeg -r 150 -f N -l M`, read each `<prefix>-K.jpg`, `rm -rf` in `try/finally`. | array of `{type:'image', data, mimeType:'image/jpeg'}` |
 | `text/*`, JSON/YAML | UTF-8 decode, ≤200KB | `{type:'text', text}` |
 | voice/audio (non-image) | transcript in `<m><media transcript=...>` from inbound path | `{type:'text', text:'voice: see message transcript'}` |
 | other | not downloaded | `{type:'text', text:'тип X не отображается; <descriptor>'}` |
@@ -390,7 +471,7 @@ The model only reads `content[0].text`, so the `<CODE>: ...` prefix is the contr
 | `NO_TEXT_LAYER` | exit 0 AND stdout empty AND stderr empty (valid PDF with no extractable text — likely scanned) | false | — |
 | `UNSUPPORTED_TYPE` | mime not in any image/text branch, OR `processImage` failed | false | — |
 | `PAGES_OUT_OF_RANGE` | `pages` invalid or exceeds 10 | false | — |
-| `CROSS_GROUP_REJECTED` | request payload references a `chat_jid` not owned by the source group folder (analogous to the existing `sendMessage` auth pattern at `src/ipc.ts:108-126`). The "another group's IPC namespace" case proposed by v6 is structurally unreachable: `src/container-runner.ts:195-203` mounts only the group's IPC dir, and host watcher derives identity from the directory it walks (`src/ipc.ts:46-67`). The reachable case is a `view_media` request whose `file_id` belongs to a Telegram message stored under a different `chat_jid` than the requesting group — host checks against `messages.chat_jid` ownership. | false | — |
+| `CROSS_GROUP_REJECTED` | request payload references a `chat_jid` not owned by the source group folder. v8 algorithm: `view_media` MUST carry `tg_message_id` (the Telegram message id whose meta block contained the file_id) alongside `file_id`. Host check: `SELECT chat_jid FROM messages WHERE id = ? LIMIT 1` — O(1) via PRIMARY KEY. If the row exists and `chat_jid` doesn't belong to the requesting group → `CROSS_GROUP_REJECTED`. If the row doesn't exist (file_id came from an `external_reply` whose origin message wasn't stored locally) → allow the request (the host itself emitted the file_id into the meta block the agent saw, so the file_id was already authorized by the mount boundary). The v6 case "request lives in another group's IPC namespace" is structurally unreachable — `src/container-runner.ts:195-203` mounts only the group's IPC dir, and host watcher derives identity from the directory it walks (`src/ipc.ts:46-67`). | false | — |
 
 `retry_after_ms` is **informational only** — the SDK does not honor it automatically; the agent (which only sees the text prefix) cannot consume it directly.
 
@@ -430,7 +511,7 @@ ORDER BY timestamp DESC
 LIMIT ?;
 ```
 
-Bound params (in order): group_jids…, include_bot (0/1), `tg_message_id`×2, `sender_id`×2, `since`×2, `until`×2, **`escaped-and-wildcarded query`×2** (one bind for the `? IS NULL` check, one for the `LIKE` pattern — the same value), clamped limit.
+Bound params (in order): group_jids…, **`include_bot ? 1 : 0`** (integer coercion required — better-sqlite3 rejects JS booleans directly with `TypeError: SQLite3 can only bind numbers, strings, bigints, buffers, and null`), `tg_message_id`×2, `sender_id`×2, `since`×2, `until`×2, **`escaped-and-wildcarded query`×2** (one bind for the `? IS NULL` check, one for the `LIKE` pattern — the same value), clamped limit.
 
 Each `(? IS NULL OR col = ?)` filter binds the SAME value twice: position 1 tests `IS NULL` (short-circuiting if the user didn't supply the filter), position 2 is the comparison value. better-sqlite3 named parameters would let us write `:tg_message_id` once and bind once, but to keep positional binding consistent with the rest of the codebase, v6 binds the value twice positionally.
 
@@ -592,13 +673,23 @@ The two failure modes are intentionally separated. Caller's existing `try { awai
 
 `src/db.ts`:
 ```ts
-export function storeOutboundMessage(jid: string, text: string, channelMessageId?: string): void {
+export function storeOutboundMessage(
+  jid: string,
+  text: string,
+  channelMessageId?: string,
+  senderId?: string,  // round-7 addition: bot's identity per-channel (e.g. Telegram bot.botInfo.id)
+): void {
   // Truthy check (length > 0) so an empty-string id from a misbehaving channel
   // also falls through to synthetic. `?? undefined` is NOT enough.
   const id = (channelMessageId && channelMessageId.length > 0)
     ? channelMessageId
     : `out-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;  // 16 hex chars
   const isSynthetic = !(channelMessageId && channelMessageId.length > 0);
+  // Round-7 fix: never bind '' as sender — `lookup_messages({sender_id})`
+  // exact-equality filter wouldn't find these rows when the agent queries
+  // by the bot's own id. Fall back to literal 'bot' when no per-channel
+  // identifier is supplied.
+  const sender = (senderId && senderId.length > 0) ? senderId : 'bot';
   const timestamp = new Date().toISOString();
   // FK pre-check — same as the working-tree storeMessage at src/db.ts:281-289
   // (the existing INSERT OR IGNORE chats prelude that the bug-fix work added
@@ -613,11 +704,26 @@ export function storeOutboundMessage(jid: string, text: string, channelMessageId
     `INSERT OR REPLACE INTO messages
      (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, meta)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, jid, '', ASSISTANT_NAME, text, timestamp,
+  ).run(id, jid, sender, ASSISTANT_NAME, text, timestamp,
         1 /*is_from_me*/, 1 /*is_bot_message*/,
         isSynthetic ? `<m kind="outbound-synthetic"/>` : null);
 }
 ```
+
+`routeOutbound` resolves the channel (`channels.find(c => c.ownsJid(jid))`) and threads its bot identifier when available:
+```ts
+const channel = channels.find((c) => c.ownsJid(jid) && c.isConnected());
+if (!channel) throw new Error(`No channel for JID: ${jid}`);
+const result = await channel.sendMessage(jid, text, opts);
+try {
+  const messageId = /* extract as before */;
+  const senderId = channel.botSenderId?.();  // optional method; channels that don't implement it return undefined → 'bot' fallback
+  storeOutboundMessage(jid, text, messageId, senderId);
+} catch (err) {
+  logger.error({ jid, err }, 'storeOutboundMessage failed (message was delivered)');
+}
+```
+`Channel.botSenderId(): string | undefined` is an optional method (round-7 addition); `TelegramChannel` returns `String(this.bot.botInfo?.id)`, Gmail returns the configured `'me'` email or undefined. Channels without an obvious identity return undefined and the synthetic-sender path uses literal `'bot'`.
 
 Note on `channel = NULL, is_group = 0`: the hard-coded NULL/0 in the chats INSERT OR IGNORE loses the channel-name and is_group info that `routeOutbound` already resolved (`channels.find((c) => c.ownsJid(jid))`). For JIDs with a channel-name prefix (`tg:`, `wa:`) the existing JID-pattern backfill at `src/db.ts:131-148` reconstructs them on read. For Gmail JIDs (no prefix marker) `channel` stays NULL forever — a minor data-quality gap. v7 documents this as a known limitation rather than threading channel info through (would widen `storeOutboundMessage`'s signature unnecessarily; the JID-prefix backfill handles 2 of 3 cases).
 
@@ -695,7 +801,7 @@ Wired into `npm test` via `package.json`'s `scripts.test` (concatenate the exist
 
 ## MCP tool descriptions
 
-**`view_media`** — Fetch a Telegram media file by `file_id`. Use when the user asks to look at / view / show / посмотри / покажи a photo, image, sticker, document, or PDF you have a `file_id` for. `mode` default `auto`: images → image content, PDFs → extracted text. `mode:'image'` with `pages:'1-3'` for visual PDF rendering (max 10 pages). On failure the response text starts with the error code followed by `:` — e.g. `TIMEOUT: ...`, `FILE_TOO_LARGE: ...`, `FILE_EXPIRED: ...`, `EXTRACTOR_MISSING: ...`, `EXTRACTOR_OUTPUT_INVALID: ...`, `UNSUPPORTED_TYPE: ...`, `PAGES_OUT_OF_RANGE: ...`, `UPSTREAM_ERROR: ...`. Parse the prefix from the first line and relay the code to the user.
+**`view_media`** — Fetch a Telegram media file by `file_id`. Use when the user asks to look at / view / show / посмотри / покажи a photo, image, sticker, document, or PDF you have a `file_id` for. **Pass `tg_message_id` alongside `file_id`** — it's the `<m id="...">` value on the message that contained the file_id; used by the host for cross-group authorization. `mode` default `auto`: images → image content, PDFs → extracted text. `mode:'image'` with `pages:'1-3'` for visual PDF rendering (max 10 pages). On failure the response text starts with the error code followed by `:` — e.g. `TIMEOUT: ...`, `FILE_TOO_LARGE: ...`, `FILE_EXPIRED: ...`, `EXTRACTOR_MISSING: ...`, `EXTRACTOR_OUTPUT_INVALID: ...`, `NO_TEXT_LAYER: ... (PDF has no extractable text — retry with mode:'image' and a small pages range to render the scan)`, `UNSUPPORTED_TYPE: ...`, `PAGES_OUT_OF_RANGE: ...`, `UPSTREAM_ERROR: ...`, `CROSS_GROUP_REJECTED: ...`. Parse the prefix from the first line and relay the code to the user.
 
 **`lookup_messages`** — Search this group's stored message history. Use when the user references something older than the recent context, when walking a reply chain (`<reply mid="X">`), or to find a specific message. Filters: `tg_message_id`, `sender_id`, `since`/`until`, `query` (case-insensitive substring on text — incl. Cyrillic; `%` and `_` in the query are escaped and matched literally). `include_bot` default `false`; pass `true` to UNION the bot's own past replies into the result (not "only bot"). Default returns last 50; max 200.
 
@@ -720,8 +826,17 @@ Host (`src/`):
 
   // Public API:
   export function queueEnrich(scope: string, username: string): void;
-  // Idempotent: caller calls per inbound mention. If cache fresh, no-op.
-  // If queued or inFlight already, no-op. Otherwise pushes into queue.
+  // Idempotent: caller calls per inbound mention.
+  // (a) If cache fresh AND record.kind === 'success':
+  //     synchronously call upsertContact(scope, record.data, source:'getChat', enriched:1)
+  //     for the requesting scope — applies the already-known patch to scope's
+  //     contact row even though we don't need to re-call the API.
+  //     (Round-7 fix: v7 said "no-op on cache hit" which short-circuited
+  //     cross-scope upserts. v8 applies the cached patch per-scope.)
+  // (b) If cache fresh AND record.kind === 'failure': no-op (the failure
+  //     was a Bot API rejection — same outcome for any scope; don't retry).
+  // (c) If queued or inFlight for this `${scope}|${un}` already: no-op.
+  // (d) Otherwise push into queue.
 
   export function startEnrichWorker(bot: Bot, db: Database.Database): void;
   // Long-running setInterval (1000ms) that pops up to RATE_PER_SEC entries
@@ -751,14 +866,39 @@ Host (`src/`):
     Called from `initDatabase` AFTER `createSchema(db)`. Wrap in try/catch only if you also want to tolerate the column-already-exists race; the PRAGMA check is sufficient under the single-process model NanoClaw uses.
   - **Register `db.function('lower_unicode', ...)` immediately after `new Database(dbPath)` and BEFORE any `db.prepare` that references it** (existing `createSchema` uses `database.exec(...)` only — no prepared statements — so registration ordering between `createSchema` and prepared-statement init doesn't matter; the *future* `lookup_messages` prepared statement is what needs the function registered first):
     ```ts
-    // src/db.ts, inside initDatabase:
+    // src/db.ts, inside initDatabase (working-tree v8 form):
     db = new Database(dbPath);
+    db.pragma('foreign_keys = ON');  // preserved — bug-fix work prior to this spec added it
     db.function('lower_unicode', { deterministic: true }, (s: string | null) =>
       s == null ? null : s.toLowerCase(),
     );
     createSchema(db);
     addMetaColumnIfMissing(db);
     // …subsequent code may now `db.prepare('… lower_unicode(?) …')` safely.
+    ```
+
+    **Apply the SAME sequence to `_initTestDatabase`** (round-7 HIGH defect): the in-memory test DB also needs `db.function('lower_unicode')` and `addMetaColumnIfMissing(db)`, otherwise unit tests for `lookup_messages` SQL throw `SqliteError: no such function: lower_unicode` and meta-projection tests throw `no such column: meta`. Factor a shared helper if cleaner:
+    ```ts
+    function wireDatabaseFeatures(database: Database.Database): void {
+      database.pragma('foreign_keys = ON');
+      database.function('lower_unicode', { deterministic: true }, (s: string | null) =>
+        s == null ? null : s.toLowerCase(),
+      );
+    }
+    export function initDatabase(): void {
+      // ... mkdir ...
+      db = new Database(dbPath);
+      wireDatabaseFeatures(db);
+      createSchema(db);
+      addMetaColumnIfMissing(db);
+      migrateJsonState();
+    }
+    export function _initTestDatabase(): void {
+      db = new Database(':memory:');
+      wireDatabaseFeatures(db);
+      createSchema(db);
+      addMetaColumnIfMissing(db);
+    }
     ```
   - **Extend SELECT projection in `getNewMessages` and `getMessagesSince`** to include `meta`. The working-tree `src/db.ts:335-348` and `:368-379` ALREADY use **flat `ORDER BY timestamp ASC LIMIT ?`** (the "FIFO drain" idiom with a self-documenting comment explaining the prior DESC-LIMIT bug was already fixed). v7 preserves that — adds `meta` to SELECT projection and adds the `OR meta IS NOT NULL` predicate to the WHERE clause; does NOT touch the sort/limit structure or WHERE bind order:
 
@@ -817,7 +957,7 @@ Host (`src/`):
   - Add `NewMessage.meta?: string`.
   - **Remove `NewMessage.images?: ImageAttachment[]`** (auto-vision deprecated; nothing should produce or consume it post-migration). The `ImageAttachment` type itself can be removed if no other consumer exists — confirm with a grep before deletion.
 - **MOD** `src/index.ts`:
-  - All seven direct `channel.sendMessage(...)` migrated to `routeOutbound(channels, jid, text, opts)` (lines 304, 647, 667, 676, 682, and the two lambda bodies at 761-771 and 773-778).
+  - All seven direct `channel.sendMessage(...)` migrated to `routeOutbound(channels, jid, text, opts)` at lines **304, 647, 667, 676, 682, 769, 777** (the last two are the single call inside each `deps.sendMessage` lambda — lambda bodies span 761-771 and 773-778 respectively).
   - Delete `pendingImages` Map and `hasImages` branch.
 - **MOD** `src/channels/gmail.ts` — `sendMessage` as shown in §4 above; handles `id | null | undefined`.
 
@@ -828,7 +968,28 @@ Container (`container/agent-runner/src/`):
   - Shared helper `pollResponseFile(reqId, timeoutMs=120000, intervalMs=100): Promise<unknown>`.
   - `lookup_contacts` reads `/workspace/ipc/contacts.json` via `fs.readFileSync` and filters in memory.
 - **MOD** `container/agent-runner/src/index.ts` — auto-vision deletion (round-6 HIGH defect): remove `ImageAttachment` interface (lines 25-39 of working tree), `ContainerInput.images?: ImageAttachment[]` field, `pushWithImages` call site (lines 396-397). After deletion the container only ingests text prompts; media access flows exclusively through `view_media`.
-- **NEW** `container/agent-runner/vitest.config.ts` + `package.json` `"test"` script — required to host the SDK-side test (verification #14). Root `npm test` invokes both host and container test runners.
+- **NEW** `container/agent-runner/vitest.config.ts` + container-side test scaffolding (v8 spelling-out of round-7 HIGH defect):
+  - **NEW** `container/agent-runner/vitest.config.ts`:
+    ```ts
+    import { defineConfig } from 'vitest/config';
+    export default defineConfig({
+      test: { include: ['src/**/*.test.ts'] },
+    });
+    ```
+  - **MOD** `container/agent-runner/package.json` — add to `devDependencies`:
+    ```json
+    "vitest": "^4.0.18"
+    ```
+    matching host root's pinned version (verify `package.json` at repo root for the exact version). Also add to `scripts`:
+    ```json
+    "test": "vitest run"
+    ```
+  - **MOD** root `package.json` `scripts.test` — concrete value:
+    ```json
+    "test": "vitest run && (cd container/agent-runner && npm test) && bash scripts/check-outbound-chokepoint.sh"
+    ```
+  - **Note on container build**: `vitest` is a devDependency; `container/build.sh` strips devDependencies via `npm ci --omit=dev` at image-build time. Test discovery happens at the HOST level (host runs `cd container/agent-runner && npm test` against the host filesystem with `--include=dev` installed). No new runtime overhead inside the container image.
+- **NEW** `container/agent-runner/src/file-too-large-prefix.test.ts` — host-runs container-package vitest discovers it; body shown verbatim in verification #14 below. Exports needed from `container/agent-runner/src/ipc-mcp-stdio.ts`: the test imports `handleViewMediaRequest` but only uses `CallToolResultSchema.parse(...)` — the import is decorative and may be removed for v8 (the test is purely a wire-frame structural assertion).
 
 CI/QA:
 - **NEW** `scripts/check-outbound-chokepoint.sh` — body shown in §8 above. Wired into `npm test`.
@@ -847,7 +1008,7 @@ Tests:
   - Cyrillic case insensitivity: `Петя` ↔ `петя` via `lower_unicode`.
   - **`promoteContactIdent` does NOT crash at module load** (round-6 CRITICAL defect): `import * as db from './db.js'` in a fresh process; before `_initTestDatabase()` runs, the module is fully loadable (no `TypeError: Cannot read properties of undefined`). Asserted indirectly by the test suite booting at all; can be made explicit with `expect(() => require('./db.js')).not.toThrow()` if needed.
 - **NEW** `src/ipc-mediarequest.test.ts` — happy path; timeout (TIMEOUT with `_meta.retryable=true` at the wire level AND text prefix `TIMEOUT:`); oversized-file pre-flight (FILE_TOO_LARGE without `getFile`); pdftotext AND-rule cases (stderr noise + non-empty stdout → return text; stderr noise + empty stdout → EXTRACTOR_OUTPUT_INVALID; exit 0 + empty stdout + empty stderr → **NO_TEXT_LAYER** with hint to retry as image); startup sweep; `writeIpcFile` filename-override round-trip; HEIC → UNSUPPORTED_TYPE; **routeOutbound DB-failure isolation** (mock `storeOutboundMessage` to throw; assert `routeOutbound` does NOT throw and the calling fixture's `streamingSendFailed` remains false); **`errors/` exclusion from sweep** (round-6 HIGH defect): place a file with `mtime = now - 1h` at `data/ipc/<group>/errors/foo.json`; run the sweep; assert the file still exists; **CROSS_GROUP_REJECTED authorization** (round-6 fix): construct a `view_media` request whose `file_id` resolves to a `messages` row in another group; assert response is `CROSS_GROUP_REJECTED` with `_meta.error_code` set.
-- **NEW** `src/channels/telegram-enrich.test.ts` (round-6 MEDIUM defect — telegram-enrich was specified but untested): (a) call `queueEnrich('g', 'vasya')` 100 times in a tight loop; assert the queue contains exactly 1 entry (dedupe via `inFlight` Set); (b) populate cache with a 23h59m-old success record; call `queueEnrich`; assert no queue push (TTL hit); (c) populate cache with a 25h-old success; call `queueEnrich`; assert queue push (TTL expired); (d) populate cache with a 6d23h-old failure; call `queueEnrich`; assert no queue push (failure TTL 7d).
+- **NEW** `src/channels/telegram-enrich.test.ts` (round-6 MEDIUM defect — telegram-enrich was specified but untested): (a) call `queueEnrich('g', 'vasya')` 100 times in a tight loop; assert the queue contains exactly 1 entry (dedupe via `inFlight` Set); (b) populate cache with a 23h59m-old success record; call `queueEnrich`; assert no queue push (TTL hit); (c) populate cache with a 25h-old success; call `queueEnrich`; assert queue push (TTL expired); (d) populate cache with a 6d23h-old failure; call `queueEnrich`; assert no queue push (failure TTL 7d); **(e) round-7 cross-scope test**: populate cache with a fresh success record for `'vasya'` (key is username-only); call `queueEnrich('group-A', 'vasya')`; observe one `upsertContact(scope='group-A', source='getChat', enriched=1)` call. Then call `queueEnrich('group-B', 'vasya')`; observe another `upsertContact(scope='group-B', source='getChat', enriched=1)` call (NOT a no-op) — proves the cache-hit branch applies the patch per-scope.
 - **NEW** `scripts/check-outbound-chokepoint.test.sh` — fixture: introduce a temporary file under `src/` with a forbidden `channel.sendMessage(` call; assert the check script returns 1. Remove the file; assert returns 0. Run as part of the suite.
 
 ## Known limitations / risks
@@ -877,6 +1038,10 @@ Tests:
 - **Snapshot mounted into container** — `contacts.json` lives in the group's IPC mount by design. Group isolation enforced at the mount boundary.
 - **`_meta` is host-side only** — Anthropic agent SDK doesn't propagate MCP content-block `_meta` to the model. v5 places error metadata on `CallToolResult._meta` (top-level, in the SDK's event stream) but the model only reads the `text` prefix. The `_meta` exists for tests, hooks, and host-side telemetry.
 - **`retry_after_ms` is informational only** — SDK doesn't honor it automatically; the agent (text-prefix-only view) can't consume it directly.
+- **Re-edit of message before cursor doesn't re-deliver** (round-7 addition) — `timestamp = max(message.date, edit_date)`. If both `message.date` and `edit_date` are earlier than the message-loop cursor (e.g. agent process restarted past the edit window), `WHERE timestamp > cursor` excludes the edit row even though it was just stored. The INSERT OR REPLACE updates `meta.edited` correctly; the agent just doesn't see it on the next poll. To recover, agent must `lookup_messages({tg_message_id})` explicitly.
+- **`storeOutboundMessage` channel/is_group hardcoded** (round-7 addition) — the chats INSERT OR IGNORE writes `channel=NULL, is_group=0` for new outbound JIDs. The JID-prefix backfill at `src/db.ts:131-148` is a one-shot migration (wrapped in try/catch around the schema ALTER) and does NOT run on subsequent boots. So for any JID first-seen via outbound after the migration: tg:/wa:-prefixed JIDs stay `channel=NULL` until inbound traffic populates them; Gmail JIDs (no prefix marker) stay `channel=NULL` indefinitely. Out of scope to widen `storeOutboundMessage`'s signature; the data-quality gap affects `getAllChats()` rendering only.
+- **Concurrent `promoteContactIdent` race for same username, different `tg_id`s** (round-7 addition) — rare scenario: same `@vasya` username resolved to two different tg_ids (recycled username, or `text_mention` vs `getChat` resolution disagreement). `db.transaction` serializes the calls; first call wins (un-row consumed, history merged into `id:<tgId-1>`). Second call finds no un-row, early-returns. The agent's annotations from the un-row attach only to the first tgId; second tgId's id-row exists separately with no merged history. Agent must manually annotate the second id-row.
+- **`view_media` voice/audio branch is historical-recovery only** (round-7 documentation) — for first-turn voice messages, the transcript is already inline in the inbound meta block (`<m><media transcript=...>`); calling `view_media` returns only a pointer string `'voice: see message transcript'`. The branch exists for the case where the agent has the file_id from compacted history but no longer has the meta inline. Even then the tool can't return the transcript because the transcript was never persisted as a separately-fetchable resource — it's stored inside `messages.meta` and must be retrieved via `lookup_messages({tg_message_id})` followed by meta-parsing on the agent side.
 
 ## Out of scope (v1)
 
@@ -958,7 +1123,7 @@ Tests:
   16. **LIKE wildcard escape**: store two rows, content `'тратил 50% налога'` and `'тратил 5000 налога'`. Query `'50%'` returns ONLY the first row (the `%` is escaped, matched literally).
   17. **CI grep enforcement**: running `scripts/check-outbound-chokepoint.sh` on the post-migration tree returns 0. Reverting any one of the 7 enumerated migrations makes it return 1.
   18. **`routeOutbound` DB-failure isolation**: mock `storeOutboundMessage` to throw `SQLITE_BUSY`. Call `routeOutbound(channels, jid, 'hello')`. Assert: it does NOT throw; the channel's `sendMessage` was called (user got the message); an `error` log entry was made.
-- Regression: existing message loop, scheduler, threadId routing, FIFO drain, sender allowlist, trigger detection, `escapeXml` on user text — all unchanged.
+- Regression: existing message loop, scheduler, threadId routing, FIFO drain, sender allowlist, trigger detection — all unchanged. The existing `escapeXml` helper at `src/router.ts:4-11` (escapes `&<>"`) is **kept** as a separate export; v8 ADDS `escapeXmlAttr` (escapes `&<>"'`) and `escapeXmlText` (escapes `&<>`) as new functions. The four helpers coexist; v8's `formatMessages` uses `escapeXmlText(content)` for the user-text envelope (functionally equivalent to existing `escapeXml(content)` modulo `"` handling — both are legal inside XML element content, and Telegram's user-text doesn't carry attribute-injection risk).
 
 ## Pre-implementation lessons (cumulative)
 
@@ -1036,7 +1201,7 @@ Defects resolved across four review rounds, each verifiable against the current 
 - **MEDIUM — `telegram-enrich.ts` was specified but untested** — v7 adds `src/channels/telegram-enrich.test.ts` covering dedupe and cache TTL.
 - **MEDIUM — Multi-chunk failure → user sees chunk 1 twice** — full trace through `src/index.ts:281-353` working-tree code added to known limitations.
 - **MEDIUM — `routeOutbound` infinite-retry on mid-run channel disconnect** — added to known limitations with trace.
-- **LOW — Entity tag renaming inconsistent** — v6 had `<phone>`, `<email>`, `<textlink>` mixed with `<text_mention>`, `<custom_emoji>` underscored variants. v7 uses canonical Bot API names throughout.
+- **LOW — Entity tag renaming inconsistent** — v6 had `<phone>`, `<email>`, `<text_link>` mixed with `<text_mention>`, `<custom_emoji>` underscored variants. v7 uses canonical Bot API names throughout.
 - **LOW — Re-edit of old message before cursor** — `edit_date < cursor` means re-edit doesn't re-deliver. v7 documents in known limitations.
 - **LOW — `view_media` voice/audio redundant branch** — transcript is already in inbound meta. v7 keeps the branch but documents it as "historical-recovery only; first-turn voice is already inline via `<m><media transcript=...>`".
 - **LOW — SDK version reference "2.x" wrong** — installed is 0.2.76. v7 drops the version-flexible footnote (recipe now scoped to container-side test where the SDK actually runs).
