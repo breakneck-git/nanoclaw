@@ -18,6 +18,7 @@ import {
   setRegisteredGroup,
   storeChatMetadata,
   storeMessage,
+  storeOutboundMessage,
   updateTask,
   upsertContact,
 } from './db.js';
@@ -977,5 +978,115 @@ describe('buildQueryParam', () => {
     expect(buildQueryParam('50%')).toBe('%50\\%%');
     expect(buildQueryParam('foo_bar')).toBe('%foo\\_bar%');
     expect(buildQueryParam('back\\slash')).toBe('%back\\\\slash%');
+  });
+});
+
+describe('messages.meta projection', () => {
+  it('storeMessage with meta + getNewMessages preserves meta column', () => {
+    storeMessage({
+      id: '1',
+      chat_jid: 'tg:1',
+      sender: 'u1',
+      sender_name: 'U',
+      content: 'hi',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+      meta: '<m id="1"/>',
+    });
+    const { messages: rows } = getNewMessages(
+      ['tg:1'],
+      '2026-05-20T09:00:00Z',
+      'Andy',
+      50,
+    );
+    expect(rows[0].meta).toBe('<m id="1"/>');
+  });
+
+  it('photo-no-caption admitted via relaxed WHERE (content="" AND meta != NULL)', () => {
+    storeMessage({
+      id: '2',
+      chat_jid: 'tg:1',
+      sender: 'u1',
+      sender_name: 'U',
+      content: '',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+      meta: '<m id="2"><media file_id="X"/></m>',
+    });
+    const { messages: rows } = getNewMessages(
+      ['tg:1'],
+      '2026-05-20T09:00:00Z',
+      'Andy',
+      50,
+    );
+    expect(rows.find((r) => r.id === '2')).toBeDefined();
+  });
+
+  it('getMessagesSince also includes meta column', () => {
+    storeMessage({
+      id: '3',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'x',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+      meta: '<m id="3"/>',
+    });
+    const rows = getMessagesSince(
+      'tg:1',
+      '2026-05-20T09:00:00Z',
+      'Andy',
+      50,
+    );
+    expect(rows[0].meta).toBe('<m id="3"/>');
+  });
+});
+
+describe('storeOutboundMessage', () => {
+  it('synthetic-id path: undefined messageId + undefined senderId', () => {
+    storeOutboundMessage('tg:1', 'hello');
+    const row = db
+      .prepare(`SELECT * FROM messages WHERE chat_jid = ?`)
+      .get('tg:1') as {
+      id: string;
+      sender: string;
+      meta: string | null;
+      is_bot_message: number;
+    };
+    expect(row.id).toMatch(/^out-/);
+    expect(row.sender).toBe('bot');
+    expect(row.meta).toBe('<m kind="outbound-synthetic"/>');
+    expect(row.is_bot_message).toBe(1);
+  });
+
+  it('channel-id path: real messageId + senderId', () => {
+    storeOutboundMessage('tg:1', 'hello', 'TG_MID_123', '987654');
+    const row = db
+      .prepare(`SELECT * FROM messages WHERE chat_jid = ?`)
+      .get('tg:1') as { id: string; sender: string; meta: string | null };
+    expect(row.id).toBe('TG_MID_123');
+    expect(row.sender).toBe('987654');
+    expect(row.meta).toBeNull();
+  });
+
+  it("empty-string messageId '' treated as missing (truthy fallback)", () => {
+    storeOutboundMessage('tg:1', 'hello', '');
+    const row = db
+      .prepare(`SELECT * FROM messages WHERE chat_jid = ?`)
+      .get('tg:1') as { id: string; sender: string };
+    expect(row.id).toMatch(/^out-/);
+    expect(row.sender).toBe('bot');
+  });
+
+  it('auto-seeds chats row on first send to new jid via INSERT OR IGNORE', () => {
+    storeOutboundMessage('tg:never_seen', 'hello');
+    const chat = db
+      .prepare(`SELECT * FROM chats WHERE jid = ?`)
+      .get('tg:never_seen');
+    expect(chat).toBeDefined();
   });
 });

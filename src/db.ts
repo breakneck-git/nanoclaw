@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
+import { randomBytes } from 'node:crypto';
 import path from 'path';
 
 import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
@@ -425,7 +426,7 @@ export function storeMessage(msg: NewMessage): void {
     `INSERT OR IGNORE INTO chats (jid, name, last_message_time, channel, is_group) VALUES (?, NULL, ?, NULL, 0)`,
   ).run(msg.chat_jid, msg.timestamp);
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -435,6 +436,64 @@ export function storeMessage(msg: NewMessage): void {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.meta ?? null,
+  );
+}
+
+/**
+ * Persist an outbound (bot-sent) message to the messages log so the agent's
+ * own replies show up in `lookupMessages` / context-rebuilds. Auto-seeds the
+ * parent `chats` row via INSERT OR IGNORE — Gmail / Telegram / Slack channels
+ * may send to a jid before any inbound message has populated it.
+ *
+ * `channelMessageId`: when the underlying transport returns a real message id
+ * (Telegram `message_id`, Slack `ts`, etc.), bind it so subsequent lookups can
+ * correlate. When the channel doesn't surface one (or surfaces `''` from a
+ * misbehaving wrapper — truthy check guards against zero-length), synthesize
+ * `out-<epoch-ms>-<16 hex chars>` and tag the row with
+ * `meta='<m kind="outbound-synthetic"/>'` so callers can distinguish a real
+ * id from a placeholder.
+ *
+ * `senderId`: typically the bot's channel user id (e.g. tg bot user id) for
+ * cross-referencing in lookupMessages({sender_id: ...}). When omitted/empty,
+ * the literal `'bot'` is bound — never the empty string, because exact-
+ * equality lookups (`sender = ?`) would silently miss empty senders.
+ */
+export function storeOutboundMessage(
+  jid: string,
+  text: string,
+  channelMessageId?: string,
+  senderId?: string,
+): void {
+  // Truthy check: empty-string id from a misbehaving channel also synthetic.
+  const id =
+    channelMessageId && channelMessageId.length > 0
+      ? channelMessageId
+      : `out-${Date.now()}-${randomBytes(8).toString('hex')}`; // 16 hex chars
+  const isSynthetic = !(channelMessageId && channelMessageId.length > 0);
+  // Round-7: never bind '' as sender — lookup_messages({sender_id}) exact-equality
+  // wouldn't find these rows. Fall back to literal 'bot' when senderId missing.
+  const sender = senderId && senderId.length > 0 ? senderId : 'bot';
+  const timestamp = new Date().toISOString();
+  // FK pre-check (same pattern as storeMessage's existing INSERT OR IGNORE prelude).
+  db.prepare(
+    `INSERT OR IGNORE INTO chats (jid, name, last_message_time, channel, is_group)
+     VALUES (?, NULL, ?, NULL, 0)`,
+  ).run(jid, timestamp);
+  db.prepare(
+    `INSERT OR REPLACE INTO messages
+     (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, meta)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    jid,
+    sender,
+    ASSISTANT_NAME,
+    text,
+    timestamp,
+    1,
+    1,
+    isSynthetic ? `<m kind="outbound-synthetic"/>` : null,
   );
 }
 
@@ -479,12 +538,17 @@ export function getNewMessages(
   // newest of returned (= the oldest unseen + limit-1) so the next poll
   // picks up the remainder. Previously this used `ORDER BY DESC LIMIT 200`
   // and advanced past the cap, silently dropping the oldest unseen rows.
+  // Content-OR-meta relaxation: rich messages (photo-no-caption, sticker,
+  // location) carry their payload in `meta` while `content` is empty — we
+  // must admit them even though the existing content-non-empty guard would
+  // skip them. Keep that guard for plain text rows so an inbound channel
+  // can't leak placeholder/zero-byte rows into the agent stream.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, meta
     FROM messages
     WHERE timestamp > ? AND chat_jid IN (${placeholders})
       AND is_bot_message = 0 AND content NOT LIKE ?
-      AND content != '' AND content IS NOT NULL
+      AND ((content != '' AND content IS NOT NULL) OR meta IS NOT NULL)
     ORDER BY timestamp ASC
     LIMIT ?
   `;
@@ -510,12 +574,16 @@ export function getMessagesSince(
   // FIFO drain (see getNewMessages): oldest unseen first, no inner DESC sort.
   // Limit prevents memory blow-up; if more remain, the cursor advance happens
   // upstream and the next call picks up where this batch ended.
+  //
+  // Content-OR-meta relaxation: mirror getNewMessages — rich messages with
+  // empty `content` but populated `meta` (photo, sticker, location) are
+  // admitted via the OR branch. See getNewMessages for the full rationale.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, meta
     FROM messages
     WHERE chat_jid = ? AND timestamp > ?
       AND is_bot_message = 0 AND content NOT LIKE ?
-      AND content != '' AND content IS NOT NULL
+      AND ((content != '' AND content IS NOT NULL) OR meta IS NOT NULL)
     ORDER BY timestamp ASC
     LIMIT ?
   `;
