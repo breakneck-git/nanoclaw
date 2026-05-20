@@ -304,6 +304,56 @@ export interface ContactRow {
   tags: string | null; // comma-separated; agent-owned
 }
 
+function mergeContactRows(
+  idRow: ContactRow | undefined,
+  unRow: ContactRow,
+): ContactRow {
+  // id-row authoritative going forward; preserve all agent-authored data;
+  // one NULL → take the other; both non-NULL → id-row wins for notes
+  // (idempotent for the common case where promotion happens before any
+  // annotation on either row), tags → union of comma-separated values.
+  //
+  // NOTE: `tg_id` is intentionally NOT computed here because the merged row's
+  // identity is the *new* tg_id (the caller knows it; pre-existing rows may
+  // both have null tg_id since the un-row was created without it). The caller
+  // overrides `tg_id: tgId` after merging. See promoteContactIdent below.
+  const coalesce = <T>(a: T | null | undefined, b: T | null | undefined) =>
+    a == null ? b : a;
+  const unionTags = (a: string | null, b: string | null) => {
+    const set = new Set(
+      [...(a || '').split(','), ...(b || '').split(',')].filter(Boolean),
+    );
+    return set.size ? [...set].join(',') : null;
+  };
+  return {
+    ident: unRow.ident, // placeholder; caller overrides
+    scope: unRow.scope,
+    tg_id: coalesce(idRow?.tg_id, unRow.tg_id) ?? null, // placeholder; caller overrides
+    username: coalesce(idRow?.username, unRow.username) ?? null,
+    kind: idRow?.kind ?? unRow.kind,
+    is_bot: idRow?.is_bot ?? unRow.is_bot,
+    first_name: coalesce(idRow?.first_name, unRow.first_name) ?? null,
+    last_name: coalesce(idRow?.last_name, unRow.last_name) ?? null,
+    title: coalesce(idRow?.title, unRow.title) ?? null,
+    phone: coalesce(idRow?.phone, unRow.phone) ?? null,
+    link: coalesce(idRow?.link, unRow.link) ?? null,
+    bio: coalesce(idRow?.bio, unRow.bio) ?? null,
+    first_seen:
+      idRow && idRow.first_seen < unRow.first_seen
+        ? idRow.first_seen
+        : unRow.first_seen,
+    last_seen:
+      idRow && idRow.last_seen > unRow.last_seen
+        ? idRow.last_seen
+        : unRow.last_seen,
+    seen_count: (idRow?.seen_count ?? 0) + unRow.seen_count,
+    source: 'forward', // promotion source
+    enriched: Math.max(idRow?.enriched ?? 0, unRow.enriched),
+    notes: coalesce(idRow?.notes, unRow.notes) ?? null, // id-row wins when both non-null
+    tags: unionTags(idRow?.tags ?? null, unRow.tags),
+  };
+}
+
 /**
  * Get all known chats, ordered by most recent activity.
  */
@@ -619,6 +669,47 @@ export function recordTaskRun(
   db.transaction(() => {
     logTaskRun(log);
     updateTaskAfterRun(log.task_id, nextRun, lastResult);
+  })();
+}
+
+// CRITICAL: `db.transaction(...)` must NOT be bound at module load — `db` is
+// undefined until `initDatabase()` runs. This mirrors `recordTaskRun` which has
+// an explicit docstring warning about this exact anti-pattern. The transaction
+// is constructed lazily on each call.
+export function promoteContactIdent(
+  scope: string,
+  un: string,
+  tgId: string,
+): void {
+  db.transaction(() => {
+    const idIdent = `${scope}|id:${tgId}`;
+    const unIdent = `${scope}|un:${un.toLowerCase()}`;
+    const idRow = db
+      .prepare('SELECT * FROM contacts WHERE ident = ?')
+      .get(idIdent) as ContactRow | undefined;
+    const unRow = db
+      .prepare('SELECT * FROM contacts WHERE ident = ?')
+      .get(unIdent) as ContactRow | undefined;
+    if (!unRow) return;
+    // Override ident + tg_id so the upsert always lands the new schema-valid identity.
+    const merged: ContactRow = {
+      ...mergeContactRows(idRow, unRow),
+      ident: idIdent,
+      tg_id: tgId,
+    };
+    db.prepare(
+      `
+      INSERT OR REPLACE INTO contacts
+        (ident, scope, tg_id, username, kind, is_bot,
+         first_name, last_name, title, phone, link, bio,
+         first_seen, last_seen, seen_count, source, enriched, notes, tags)
+      VALUES
+        (@ident, @scope, @tg_id, @username, @kind, @is_bot,
+         @first_name, @last_name, @title, @phone, @link, @bio,
+         @first_seen, @last_seen, @seen_count, @source, @enriched, @notes, @tags)
+    `,
+    ).run(merged);
+    db.prepare('DELETE FROM contacts WHERE ident = ?').run(unIdent);
   })();
 }
 

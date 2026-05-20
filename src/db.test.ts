@@ -10,6 +10,7 @@ import {
   getMessagesSince,
   getNewMessages,
   getTaskById,
+  promoteContactIdent,
   setRegisteredGroup,
   storeChatMetadata,
   storeMessage,
@@ -536,5 +537,44 @@ describe('database init idempotency + UDF', () => {
       r: string;
     };
     expect(result.r).toBe('привет');
+  });
+});
+
+describe('promoteContactIdent', () => {
+  // Note: top-level beforeEach already calls _initTestDatabase, no inner beforeEach needed.
+
+  it('tg_id non-NULL after promotion when un-row had NULL tg_id (round-7 invariant)', () => {
+    db.prepare(
+      `INSERT INTO contacts (ident, scope, tg_id, username, kind, is_bot, first_seen, last_seen, seen_count, source, enriched)
+                VALUES ('g|un:vasya', 'g', NULL, 'vasya', 'user', 0, '2026-05-20T10:00:00Z', '2026-05-20T10:00:00Z', 1, 'mention', 0)`,
+    ).run();
+    promoteContactIdent('g', 'vasya', '42');
+    const row = db
+      .prepare(`SELECT tg_id FROM contacts WHERE ident = ?`)
+      .get('g|id:42') as { tg_id: string };
+    expect(row.tg_id).toBe('42');
+    expect(
+      db.prepare(`SELECT 1 FROM contacts WHERE ident = ?`).get('g|un:vasya'),
+    ).toBeUndefined();
+  });
+
+  it('preserves id-row notes when both rows have non-null notes (notes-loss known limitation)', () => {
+    db.prepare(
+      `INSERT INTO contacts (ident, scope, tg_id, username, kind, is_bot, first_seen, last_seen, seen_count, source, enriched, notes)
+                VALUES ('g|id:42', 'g', '42', NULL, 'user', 0, '2026-05-20T10:00:00Z', '2026-05-20T10:00:00Z', 1, 'sender', 0, 'id-notes')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO contacts (ident, scope, tg_id, username, kind, is_bot, first_seen, last_seen, seen_count, source, enriched, notes)
+                VALUES ('g|un:vasya', 'g', NULL, 'vasya', 'user', 0, '2026-05-20T10:00:00Z', '2026-05-20T10:00:00Z', 1, 'mention', 0, 'un-notes')`,
+    ).run();
+    promoteContactIdent('g', 'vasya', '42');
+    const row = db
+      .prepare(`SELECT notes FROM contacts WHERE ident = ?`)
+      .get('g|id:42') as { notes: string };
+    expect(row.notes).toBe('id-notes');
+  });
+
+  it('does NOT crash when un-row absent (no-op early return)', () => {
+    expect(() => promoteContactIdent('g', 'nobody', '999')).not.toThrow();
   });
 });
