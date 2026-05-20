@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   _initTestDatabase,
   annotateContact,
+  buildQueryParam,
   createTask,
   db,
   deleteTask,
@@ -12,6 +13,7 @@ import {
   getMessagesSince,
   getNewMessages,
   getTaskById,
+  lookupMessages,
   promoteContactIdent,
   setRegisteredGroup,
   storeChatMetadata,
@@ -727,5 +729,129 @@ describe('upsertContact', () => {
     expect(
       db.prepare(`SELECT 1 FROM contacts WHERE ident = ?`).get('g|un:vasya'),
     ).toBeUndefined();
+  });
+});
+
+describe('lookupMessages', () => {
+  it('Cyrillic case-insensitive search via lower_unicode', () => {
+    storeMessage({
+      id: '1',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'Петя пришёл',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    const rows = lookupMessages({
+      groupJids: ['tg:1'],
+      query: 'петя',
+      includeBot: false,
+      limit: 50,
+    });
+    expect(rows.length).toBe(1);
+    expect(rows[0].content).toBe('Петя пришёл');
+  });
+
+  it('LIKE wildcard % is escaped (literal match)', () => {
+    storeMessage({
+      id: '1',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'тратил 50% налога',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    storeMessage({
+      id: '2',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'тратил 5000 рублей',
+      timestamp: '2026-05-20T10:01:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    const rows = lookupMessages({
+      groupJids: ['tg:1'],
+      query: '50%',
+      includeBot: false,
+      limit: 50,
+    });
+    expect(rows.length).toBe(1);
+    expect(rows[0].id).toBe('1');
+  });
+
+  it('include_bot=true UNIONs bot rows with user rows', () => {
+    storeMessage({
+      id: 'u1',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'hi',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    storeMessage({
+      id: 'b1',
+      chat_jid: 'tg:1',
+      sender: 'bot',
+      sender_name: 'Andy',
+      content: 'hello',
+      timestamp: '2026-05-20T10:01:00Z',
+      is_from_me: true,
+      is_bot_message: true,
+    });
+    const without = lookupMessages({
+      groupJids: ['tg:1'],
+      includeBot: false,
+      limit: 50,
+    });
+    const withBot = lookupMessages({
+      groupJids: ['tg:1'],
+      includeBot: true,
+      limit: 50,
+    });
+    expect(without.length).toBe(1);
+    expect(withBot.length).toBe(2);
+  });
+
+  it('empty filters return rows clamped to limit (max 200)', () => {
+    for (let i = 0; i < 250; i++) {
+      storeMessage({
+        id: `m${i}`,
+        chat_jid: 'tg:1',
+        sender: 'u',
+        sender_name: 'U',
+        content: `msg${i}`,
+        timestamp: `2026-05-20T10:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}Z`,
+        is_from_me: false,
+        is_bot_message: false,
+      });
+    }
+    const rows = lookupMessages({
+      groupJids: ['tg:1'],
+      includeBot: false,
+      limit: 500,
+    });
+    expect(rows.length).toBe(200); // server clamps to 200
+  });
+});
+
+describe('buildQueryParam', () => {
+  it('returns null for empty/undefined', () => {
+    expect(buildQueryParam(undefined)).toBe(null);
+    expect(buildQueryParam('')).toBe(null);
+  });
+
+  it('escapes %, _, \\ and wraps in %...%', () => {
+    expect(buildQueryParam('abc')).toBe('%abc%');
+    expect(buildQueryParam('50%')).toBe('%50\\%%');
+    expect(buildQueryParam('foo_bar')).toBe('%foo\\_bar%');
+    expect(buildQueryParam('back\\slash')).toBe('%back\\\\slash%');
   });
 });

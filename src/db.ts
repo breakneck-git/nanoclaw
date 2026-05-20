@@ -524,6 +524,108 @@ export function getMessagesSince(
     .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
 }
 
+/**
+ * Escape SQL LIKE metacharacters (`\`, `%`, `_`) with a backslash and wrap
+ * with `%...%` so the result is a "contains" parameter for a LIKE clause that
+ * uses ESCAPE '\'. Returns null for null/undefined/empty input — callers bind
+ * this directly to the `?` slots in `(? IS NULL OR ... LIKE ?)` predicate
+ * pairs and let SQLite short-circuit.
+ *
+ * Cyrillic-safe: works in concert with the `lower_unicode` UDF registered in
+ * `wireDatabaseFeatures`, which lowercases the full BMP (default SQLite LOWER
+ * only handles ASCII).
+ */
+export function buildQueryParam(q: string | undefined): string | null {
+  if (q == null || q === '') return null;
+  const escaped = q.replace(/[\\%_]/g, '\\$&');
+  return `%${escaped}%`;
+}
+
+/**
+ * Returned row shape — matches the 9-column projection used by the SELECT
+ * below. Distinct from `NewMessage` because lookups always materialize
+ * `is_bot_message` and `meta`, whereas `NewMessage` treats them as optional.
+ */
+export interface LookupRow {
+  id: string;
+  chat_jid: string;
+  sender: string;
+  sender_name: string;
+  content: string;
+  timestamp: string;
+  is_from_me: number; // 0|1 (raw from SQLite)
+  is_bot_message: number; // 0|1
+  meta: string | null;
+}
+
+/**
+ * Generic message lookup across one or more group JIDs with optional
+ * tg_message_id / sender / since / until / query filters. The query goes
+ * through `lower_unicode(content) LIKE lower_unicode(?) ESCAPE '\'` for
+ * Cyrillic-safe case-insensitive matching; metacharacters are escaped via
+ * `buildQueryParam` so a user typing `50%` matches only literal `50%`.
+ *
+ * Optional filters use `(? IS NULL OR <pred>)` pairs to keep the SQL static
+ * regardless of which filters the caller provides — the same binding is
+ * passed twice so SQLite can short-circuit the predicate when null.
+ *
+ * `includeBot` is bound as 0|1 (better-sqlite3 rejects JS booleans). `limit`
+ * is clamped to `[1, 200]` per the spec — callers may pass any value, the
+ * server enforces the upper bound to keep result sets bounded.
+ */
+export function lookupMessages(opts: {
+  groupJids: string[];
+  tgMessageId?: string;
+  senderId?: string;
+  since?: string;
+  until?: string;
+  query?: string;
+  includeBot: boolean;
+  limit: number;
+}): LookupRow[] {
+  if (opts.groupJids.length === 0) return [];
+
+  const placeholders = opts.groupJids.map(() => '?').join(', ');
+  const sql = `
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, meta
+    FROM messages
+    WHERE chat_jid IN (${placeholders})
+      AND (? OR is_bot_message = 0)
+      AND (? IS NULL OR id = ?)
+      AND (? IS NULL OR sender = ?)
+      AND (? IS NULL OR timestamp >= ?)
+      AND (? IS NULL OR timestamp <= ?)
+      AND (? IS NULL OR lower_unicode(content) LIKE lower_unicode(?) ESCAPE '\\')
+    ORDER BY timestamp DESC
+    LIMIT ?
+  `;
+
+  const tgMessageId = opts.tgMessageId ?? null;
+  const senderId = opts.senderId ?? null;
+  const since = opts.since ?? null;
+  const until = opts.until ?? null;
+  const queryParam = buildQueryParam(opts.query);
+  const clampedLimit = Math.min(Math.max(opts.limit, 1), 200);
+
+  return db
+    .prepare(sql)
+    .all(
+      ...opts.groupJids,
+      opts.includeBot ? 1 : 0,
+      tgMessageId,
+      tgMessageId,
+      senderId,
+      senderId,
+      since,
+      since,
+      until,
+      until,
+      queryParam,
+      queryParam,
+      clampedLimit,
+    ) as LookupRow[];
+}
+
 export function createTask(
   task: Omit<ScheduledTask, 'last_run' | 'last_result'>,
 ): void {
