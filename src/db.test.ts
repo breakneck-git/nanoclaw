@@ -608,7 +608,9 @@ describe('upsertContact', () => {
       { identity: { tg_id: '42' }, source: 'sender' },
     );
     const row = db
-      .prepare(`SELECT first_name, last_name, seen_count FROM contacts WHERE ident = ?`)
+      .prepare(
+        `SELECT first_name, last_name, seen_count FROM contacts WHERE ident = ?`,
+      )
       .get('g|id:42') as {
       first_name: string;
       last_name: string;

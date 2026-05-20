@@ -893,10 +893,9 @@ export function annotateContact(
       .prepare('SELECT tags FROM contacts WHERE ident = ?')
       .get(ident) as { tags: string | null } | undefined;
     const set = new Set(
-      [
-        ...(existing?.tags ?? '').split(','),
-        ...patch.tags.split(','),
-      ].filter(Boolean),
+      [...(existing?.tags ?? '').split(','), ...patch.tags.split(',')].filter(
+        Boolean,
+      ),
     );
     const merged = set.size ? [...set].join(',') : null;
     db.prepare('UPDATE contacts SET tags = ? WHERE ident = ?').run(
