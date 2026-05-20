@@ -27,6 +27,12 @@ export interface IpcDeps {
 
 let ipcWatcherRunning = false;
 
+// Per-file retry counter for transient send failures. Cleared on success or
+// permanent quarantine. Caps unbounded retry of a file targeted at a chat
+// that's permanently unreachable.
+const ipcRetryCounts = new Map<string, number>();
+const IPC_MAX_RETRIES = 5;
+
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
     logger.debug('IPC watcher already running, skipping duplicate start');
@@ -72,8 +78,34 @@ export function startIpcWatcher(deps: IpcDeps): void {
             .filter((f) => f.endsWith('.json'));
           for (const file of messageFiles) {
             const filePath = path.join(messagesDir, file);
+            // Parse stage: malformed JSON / missing fields → permanent
+            // quarantine. The file isn't recoverable on retry, so move it
+            // out of the way so the watcher doesn't loop on it.
+            let data: { type?: string; chatJid?: string; text?: string };
             try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'IPC message parse failed — quarantining',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              try {
+                fs.mkdirSync(errorDir, { recursive: true });
+                fs.renameSync(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              } catch {
+                /* best effort */
+              }
+              continue;
+            }
+            // Send stage: transient channel failure (network, rate limit,
+            // bot kicked) must NOT quarantine — leave the file in place so
+            // the next poll retries. After IPC_MAX_RETRIES the file is
+            // moved aside so a single dead chat doesn't wedge the queue.
+            try {
               if (data.type === 'message' && data.chatJid && data.text) {
                 // Authorization: verify this group can send to this chatJid
                 const targetGroup = registeredGroups[data.chatJid];
@@ -94,17 +126,32 @@ export function startIpcWatcher(deps: IpcDeps): void {
                 }
               }
               fs.unlinkSync(filePath);
+              ipcRetryCounts.delete(filePath);
             } catch (err) {
-              logger.error(
-                { file, sourceGroup, err },
-                'Error processing IPC message',
-              );
-              const errorDir = path.join(ipcBaseDir, 'errors');
-              fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
+              const attempts = (ipcRetryCounts.get(filePath) || 0) + 1;
+              ipcRetryCounts.set(filePath, attempts);
+              if (attempts >= IPC_MAX_RETRIES) {
+                logger.error(
+                  { file, sourceGroup, err, attempts },
+                  'IPC send failed too many times — quarantining',
+                );
+                const errorDir = path.join(ipcBaseDir, 'errors');
+                try {
+                  fs.mkdirSync(errorDir, { recursive: true });
+                  fs.renameSync(
+                    filePath,
+                    path.join(errorDir, `${sourceGroup}-${file}`),
+                  );
+                } catch {
+                  /* best effort */
+                }
+                ipcRetryCounts.delete(filePath);
+              } else {
+                logger.warn(
+                  { file, sourceGroup, err, attempts },
+                  'IPC send failed — will retry on next poll',
+                );
+              }
             }
           }
         }

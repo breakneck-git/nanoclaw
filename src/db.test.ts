@@ -409,7 +409,7 @@ describe('message query LIMIT', () => {
     }
   });
 
-  it('getNewMessages caps to limit and returns most recent in chronological order', () => {
+  it('getNewMessages caps to limit and drains oldest unseen first (FIFO)', () => {
     const { messages, newTimestamp } = getNewMessages(
       ['group@g.us'],
       '2024-01-01T00:00:00.000Z',
@@ -417,15 +417,18 @@ describe('message query LIMIT', () => {
       3,
     );
     expect(messages).toHaveLength(3);
-    expect(messages[0].content).toBe('message 8');
-    expect(messages[2].content).toBe('message 10');
-    // Chronological order preserved
+    // FIFO drain: oldest unseen first, so subsequent polls pick up the
+    // remainder. Previously this returned newest-N and advanced the cursor
+    // past the truncated tail, silently dropping the oldest entries.
+    expect(messages[0].content).toBe('message 1');
+    expect(messages[2].content).toBe('message 3');
     expect(messages[1].timestamp > messages[0].timestamp).toBe(true);
-    // newTimestamp reflects latest returned row
-    expect(newTimestamp).toBe('2024-01-01T00:00:10.000Z');
+    // newTimestamp is the newest of the returned batch (the (limit)-th
+    // oldest unseen), so the next poll continues from there.
+    expect(newTimestamp).toBe('2024-01-01T00:00:03.000Z');
   });
 
-  it('getMessagesSince caps to limit and returns most recent in chronological order', () => {
+  it('getMessagesSince caps to limit and drains oldest unseen first (FIFO)', () => {
     const messages = getMessagesSince(
       'group@g.us',
       '2024-01-01T00:00:00.000Z',
@@ -433,8 +436,8 @@ describe('message query LIMIT', () => {
       3,
     );
     expect(messages).toHaveLength(3);
-    expect(messages[0].content).toBe('message 8');
-    expect(messages[2].content).toBe('message 10');
+    expect(messages[0].content).toBe('message 1');
+    expect(messages[2].content).toBe('message 3');
     expect(messages[1].timestamp > messages[0].timestamp).toBe(true);
   });
 

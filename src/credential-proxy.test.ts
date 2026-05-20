@@ -97,7 +97,60 @@ describe('credential-proxy', () => {
     expect(lastUpstreamHeaders['x-api-key']).toBe('sk-ant-real-key');
   });
 
-  it('OAuth mode replaces Authorization when container sends one', async () => {
+  it('OAuth mode mocks /create_api_key with sentinel and never hits upstream', async () => {
+    proxyPort = await startProxy({
+      CLAUDE_CODE_OAUTH_TOKEN: 'real-oauth-token',
+    });
+
+    const res = await makeRequest(
+      proxyPort,
+      {
+        method: 'POST',
+        path: '/api/oauth/claude_cli/create_api_key',
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer placeholder',
+        },
+      },
+      '{}',
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ api_key: 'nanoclaw-oauth-direct' });
+    // Upstream must not have been called — the proxy synthesizes the response
+    // so OAuth tokens that lack org:create_api_key scope still work.
+    expect(lastUpstreamHeaders['authorization']).toBeUndefined();
+    expect(lastUpstreamHeaders['x-api-key']).toBeUndefined();
+  });
+
+  it('OAuth mode translates sentinel x-api-key into Bearer authorization upstream', async () => {
+    proxyPort = await startProxy({
+      CLAUDE_CODE_OAUTH_TOKEN: 'real-oauth-token',
+    });
+
+    // After /create_api_key returns the sentinel, the container calls Anthropic
+    // API with x-api-key: nanoclaw-oauth-direct. Proxy must drop that key and
+    // attach the real OAuth Bearer.
+    await makeRequest(
+      proxyPort,
+      {
+        method: 'POST',
+        path: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': 'nanoclaw-oauth-direct',
+        },
+      },
+      '{}',
+    );
+
+    expect(lastUpstreamHeaders['authorization']).toBe(
+      'Bearer real-oauth-token',
+    );
+    expect(lastUpstreamHeaders['x-api-key']).toBeUndefined();
+  });
+
+  it('OAuth mode replaces Authorization when container sends one on a non-mocked path', async () => {
     proxyPort = await startProxy({
       CLAUDE_CODE_OAUTH_TOKEN: 'real-oauth-token',
     });
@@ -106,7 +159,7 @@ describe('credential-proxy', () => {
       proxyPort,
       {
         method: 'POST',
-        path: '/api/oauth/claude_cli/create_api_key',
+        path: '/v1/oauth/probe',
         headers: {
           'content-type': 'application/json',
           authorization: 'Bearer placeholder',
@@ -189,4 +242,76 @@ describe('credential-proxy', () => {
     expect(res.statusCode).toBe(502);
     expect(res.body).toBe('Bad Gateway');
   });
+
+  it('retries transient 529 then succeeds, transparently to the client', async () => {
+    let upstreamCalls = 0;
+    upstreamServer.removeAllListeners('request');
+    upstreamServer.on('request', (req, res) => {
+      upstreamCalls++;
+      if (upstreamCalls < 3) {
+        res.writeHead(529, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            type: 'error',
+            error: { type: 'overloaded_error' },
+          }),
+        );
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    Object.assign(mockEnv, {
+      ANTHROPIC_API_KEY: 'sk-ant-real-key',
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
+    });
+    proxyServer = await startCredentialProxy(0);
+    proxyPort = (proxyServer.address() as AddressInfo).port;
+
+    const res = await makeRequest(
+      proxyPort,
+      {
+        method: 'POST',
+        path: '/v1/messages',
+        headers: { 'content-type': 'application/json' },
+      },
+      '{}',
+    );
+
+    expect(upstreamCalls).toBe(3); // 2 × 529, then 200
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ok: true });
+  }, 15000);
+
+  it('gives up after max retries and forwards the final 529', async () => {
+    let upstreamCalls = 0;
+    upstreamServer.removeAllListeners('request');
+    upstreamServer.on('request', (req, res) => {
+      upstreamCalls++;
+      res.writeHead(529, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({ type: 'error', error: { type: 'overloaded_error' } }),
+      );
+    });
+    Object.assign(mockEnv, {
+      ANTHROPIC_API_KEY: 'sk-ant-real-key',
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
+    });
+    proxyServer = await startCredentialProxy(0);
+    proxyPort = (proxyServer.address() as AddressInfo).port;
+
+    const res = await makeRequest(
+      proxyPort,
+      {
+        method: 'POST',
+        path: '/v1/messages',
+        headers: { 'content-type': 'application/json' },
+      },
+      '{}',
+    );
+
+    // Initial attempt + PROXY_MAX_RETRIES (3) = 4 upstream calls.
+    expect(upstreamCalls).toBe(4);
+    expect(res.statusCode).toBe(529);
+  }, 20000);
 });

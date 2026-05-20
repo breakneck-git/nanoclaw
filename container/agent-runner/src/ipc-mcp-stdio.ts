@@ -10,6 +10,7 @@ import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
+import { safeTruncate } from './safe-truncate.js';
 
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
@@ -19,6 +20,35 @@ const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
 const groupFolder = process.env.NANOCLAW_GROUP_FOLDER!;
 const isMain = process.env.NANOCLAW_IS_MAIN === '1';
+
+/**
+ * Validate that a "YYYY-MM-DDTHH:MM[:SS]" string is a real calendar date.
+ * Plain `new Date("2026-02-30T15:30:00")` rolls forward to Mar 2 and
+ * isNaN returns false — silently scheduling the task on the wrong day.
+ * We parse, then round-trip back to the same components and compare.
+ */
+function isValidLocalTimestamp(s: string): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(s);
+  if (!m) return false;
+  const [, y, mo, d, h, mi, sec] = m;
+  const date = new Date(
+    Number(y),
+    Number(mo) - 1,
+    Number(d),
+    Number(h),
+    Number(mi),
+    sec ? Number(sec) : 0,
+  );
+  if (isNaN(date.getTime())) return false;
+  return (
+    date.getFullYear() === Number(y) &&
+    date.getMonth() === Number(mo) - 1 &&
+    date.getDate() === Number(d) &&
+    date.getHours() === Number(h) &&
+    date.getMinutes() === Number(mi) &&
+    date.getSeconds() === (sec ? Number(sec) : 0)
+  );
+}
 
 function writeIpcFile(dir: string, data: object): string {
   fs.mkdirSync(dir, { recursive: true });
@@ -105,10 +135,11 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
         };
       }
     } else if (args.schedule_type === 'interval') {
-      const ms = parseInt(args.schedule_value, 10);
-      if (isNaN(ms) || ms <= 0) {
+      // Strict decimal-integer regex: rejects "1e10" (1e10 ms ≈ 115 days,
+      // probably not intended), "0xff", "300000abc", " 300000", etc.
+      if (!/^[1-9]\d*$/.test(args.schedule_value)) {
         return {
-          content: [{ type: 'text' as const, text: `Invalid interval: "${args.schedule_value}". Must be positive milliseconds (e.g., "300000" for 5 min).` }],
+          content: [{ type: 'text' as const, text: `Invalid interval: "${args.schedule_value}". Must be a positive decimal integer of milliseconds (e.g., "300000" for 5 min).` }],
           isError: true,
         };
       }
@@ -119,10 +150,18 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           isError: true,
         };
       }
-      const date = new Date(args.schedule_value);
-      if (isNaN(date.getTime())) {
+      // Strict shape — JS Date.parse accepts every ISO prefix (e.g. "2026-02"
+      // → 2026-02-01T00:00:00Z), so require an explicit full local timestamp
+      // before falling through to Date parsing.
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(args.schedule_value)) {
         return {
-          content: [{ type: 'text' as const, text: `Invalid timestamp: "${args.schedule_value}". Use local time format like "2026-02-01T15:30:00".` }],
+          content: [{ type: 'text' as const, text: `Invalid timestamp: "${args.schedule_value}". Use local time format like "2026-02-01T15:30:00" — full YYYY-MM-DDTHH:MM[:SS] required.` }],
+          isError: true,
+        };
+      }
+      if (!isValidLocalTimestamp(args.schedule_value)) {
+        return {
+          content: [{ type: 'text' as const, text: `Invalid timestamp: "${args.schedule_value}" — that calendar date does not exist (e.g. Feb 30 rolls forward to Mar 2).` }],
           isError: true,
         };
       }
@@ -179,7 +218,7 @@ server.tool(
       const formatted = tasks
         .map(
           (t: { id: string; prompt: string; schedule_type: string; schedule_value: string; status: string; next_run: string }) =>
-            `- [${t.id}] ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, next: ${t.next_run || 'N/A'}`,
+            `- [${t.id}] ${safeTruncate(t.prompt, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, next: ${t.next_run || 'N/A'}`,
         )
         .join('\n');
 
@@ -260,26 +299,57 @@ server.tool(
     script: z.string().optional().describe('New script for the task. Set to empty string to remove the script.'),
   },
   async (args) => {
-    // Validate schedule_value if provided
-    if (args.schedule_type === 'cron' || (!args.schedule_type && args.schedule_value)) {
-      if (args.schedule_value) {
+    // Validate per schedule_type. Require schedule_type when schedule_value
+    // is updated, otherwise we can't pick the right validator and either
+    // (a) misvalidate good input or (b) let garbage through unchecked.
+    if (args.schedule_value !== undefined && args.schedule_type === undefined) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'When updating schedule_value, schedule_type must also be provided so the value can be validated.',
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    if (args.schedule_value !== undefined && args.schedule_type !== undefined) {
+      if (args.schedule_type === 'cron') {
         try {
           CronExpressionParser.parse(args.schedule_value);
         } catch {
           return {
-            content: [{ type: 'text' as const, text: `Invalid cron: "${args.schedule_value}".` }],
+            content: [{ type: 'text' as const, text: `Invalid cron: "${args.schedule_value}". Use format like "0 9 * * *" (daily 9am) or "*/5 * * * *" (every 5 min).` }],
             isError: true,
           };
         }
-      }
-    }
-    if (args.schedule_type === 'interval' && args.schedule_value) {
-      const ms = parseInt(args.schedule_value, 10);
-      if (isNaN(ms) || ms <= 0) {
-        return {
-          content: [{ type: 'text' as const, text: `Invalid interval: "${args.schedule_value}".` }],
-          isError: true,
-        };
+      } else if (args.schedule_type === 'interval') {
+        if (!/^[1-9]\d*$/.test(args.schedule_value)) {
+          return {
+            content: [{ type: 'text' as const, text: `Invalid interval: "${args.schedule_value}". Must be a positive decimal integer of milliseconds (e.g., "300000" for 5 min).` }],
+            isError: true,
+          };
+        }
+      } else if (args.schedule_type === 'once') {
+        if (/[Zz]$/.test(args.schedule_value) || /[+-]\d{2}:\d{2}$/.test(args.schedule_value)) {
+          return {
+            content: [{ type: 'text' as const, text: `Timestamp must be local time without timezone suffix. Got "${args.schedule_value}" — use format like "2026-02-01T15:30:00".` }],
+            isError: true,
+          };
+        }
+        if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(args.schedule_value)) {
+          return {
+            content: [{ type: 'text' as const, text: `Invalid timestamp: "${args.schedule_value}". Use local time format like "2026-02-01T15:30:00" — full YYYY-MM-DDTHH:MM[:SS] required.` }],
+            isError: true,
+          };
+        }
+        if (!isValidLocalTimestamp(args.schedule_value)) {
+          return {
+            content: [{ type: 'text' as const, text: `Invalid timestamp: "${args.schedule_value}" — that calendar date does not exist (e.g. Feb 30 rolls forward to Mar 2).` }],
+            isError: true,
+          };
+        }
       }
     }
 

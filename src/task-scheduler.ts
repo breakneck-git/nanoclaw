@@ -13,12 +13,13 @@ import {
   getDueTasks,
   getTaskById,
   logTaskRun,
+  recordTaskRun,
   updateTask,
-  updateTaskAfterRun,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
+import { safeTruncate } from './safe-truncate.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 
 /**
@@ -80,6 +81,21 @@ async function runTask(
   deps: SchedulerDependencies,
 ): Promise<void> {
   const startTime = Date.now();
+  // Helper: with FK pragma ON, logging a run for a task that was
+  // concurrently deleted (e.g. via IPC `cancel_task` between enqueue and
+  // run) raises SQLITE_CONSTRAINT_FOREIGNKEY. Swallow that specific failure
+  // — the run has nothing to attach to anymore.
+  const safeLogTaskRun = (run: Parameters<typeof logTaskRun>[0]) => {
+    try {
+      logTaskRun(run);
+    } catch (err) {
+      logger.warn(
+        { taskId: run.task_id, err },
+        'logTaskRun skipped — task likely deleted concurrently',
+      );
+    }
+  };
+
   let groupDir: string;
   try {
     groupDir = resolveGroupFolderPath(task.group_folder);
@@ -91,7 +107,7 @@ async function runTask(
       { taskId: task.id, groupFolder: task.group_folder, error },
       'Task has invalid group folder',
     );
-    logTaskRun({
+    safeLogTaskRun({
       task_id: task.id,
       run_at: new Date().toISOString(),
       duration_ms: Date.now() - startTime,
@@ -118,7 +134,10 @@ async function runTask(
       { taskId: task.id, groupFolder: task.group_folder },
       'Group not found for task',
     );
-    logTaskRun({
+    // Pause so the scheduler stops polling this task every tick. Otherwise
+    // next_run remains <= now and getDueTasks returns it forever.
+    updateTask(task.id, { status: 'paused' });
+    safeLogTaskRun({
       task_id: task.id,
       run_at: new Date().toISOString(),
       duration_ms: Date.now() - startTime,
@@ -187,8 +206,21 @@ async function runTask(
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
-          // Forward result to user (sendMessage handles formatting)
-          await deps.sendMessage(task.chat_jid, streamedOutput.result);
+          // Forward result to user. Wrap in local try/catch so a send failure
+          // (telegram throws per M7) doesn't (a) skip scheduleClose() below
+          // and leave the container hanging until the 30-min hard timeout,
+          // nor (b) get swallowed by outputChain.catch and let recordTaskRun
+          // log status: 'success' for a task whose result the user never got.
+          try {
+            await deps.sendMessage(task.chat_jid, streamedOutput.result);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.error(
+              { taskId: task.id, err },
+              'Failed to deliver task result to user',
+            );
+            error = error || `Result delivery failed: ${msg}`;
+          }
           scheduleClose();
         }
         if (streamedOutput.status === 'success') {
@@ -222,22 +254,61 @@ async function runTask(
 
   const durationMs = Date.now() - startTime;
 
-  logTaskRun({
-    task_id: task.id,
-    run_at: new Date().toISOString(),
-    duration_ms: durationMs,
-    status: error ? 'error' : 'success',
-    result,
-    error,
-  });
+  // computeNextRun can throw on malformed cron (e.g. data corrupted via a
+  // bad update_task). Catch so we still record the run and advance the task,
+  // otherwise the task is replayed every poll forever.
+  let nextRun: string | null;
+  try {
+    nextRun = computeNextRun(task);
+  } catch (err) {
+    nextRun = null;
+    error =
+      error ||
+      `computeNextRun failed: ${err instanceof Error ? err.message : String(err)}`;
+    logger.error(
+      { taskId: task.id, err },
+      'computeNextRun failed; marking task completed',
+    );
+  }
 
-  const nextRun = computeNextRun(task);
   const resultSummary = error
     ? `Error: ${error}`
     : result
-      ? result.slice(0, 200)
+      ? safeTruncate(result, 200)
       : 'Completed';
-  updateTaskAfterRun(task.id, nextRun, resultSummary);
+
+  // Atomic: both the run log and the cursor advance go in one SQLite
+  // transaction so a crash can't leave next_run stale while a run is logged.
+  // FK violation (task concurrently deleted, e.g. via IPC cancel_task) or
+  // any other DB exception inside the txn rolls back BOTH writes — including
+  // next_run advance. Without the catch the throw would propagate to the
+  // queue's runTask.catch and getDueTasks would re-fire the task forever
+  // if the exception is deterministic. Best effort: log loudly, pause the
+  // task so it stops cycling, and continue.
+  try {
+    recordTaskRun(
+      {
+        task_id: task.id,
+        run_at: new Date().toISOString(),
+        duration_ms: durationMs,
+        status: error ? 'error' : 'success',
+        result,
+        error,
+      },
+      nextRun,
+      resultSummary,
+    );
+  } catch (err) {
+    logger.error(
+      { taskId: task.id, err },
+      'recordTaskRun failed — pausing task to prevent infinite replay',
+    );
+    try {
+      updateTask(task.id, { status: 'paused' });
+    } catch {
+      // Task probably gone. Stop here either way.
+    }
+  }
 }
 
 let schedulerRunning = false;

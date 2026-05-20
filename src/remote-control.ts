@@ -1,5 +1,6 @@
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
@@ -11,9 +12,47 @@ interface RemoteControlSession {
   startedBy: string;
   startedInChat: string;
   startedAt: string;
+  /**
+   * Process start time captured at spawn. Used to detect PID reuse after a
+   * reboot or unexpected process death — without it, isProcessAlive only
+   * proves *some* process owns this PID, not that it's still our `claude`
+   * session. Missing on sessions written before this field existed.
+   */
+  startTimeMarker?: string;
 }
 
 let activeSession: RemoteControlSession | null = null;
+
+/**
+ * Capture a stable per-process marker so we can detect PID reuse later.
+ * On Linux this is `starttime` from /proc/<pid>/stat (clock ticks since
+ * boot — unique per PID lifetime). On macOS we use `lstart` from ps. If
+ * either is unavailable, returns undefined and we fall back to PID-only
+ * checks (still better than today's behavior).
+ */
+function readProcessStartTime(pid: number): string | undefined {
+  try {
+    if (os.platform() === 'linux') {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8');
+      // Field 22 is starttime per `man proc(5)`. The comm field (2) can
+      // contain spaces in parens — find the closing ')'.
+      const close = stat.lastIndexOf(')');
+      const fields = stat.slice(close + 2).split(' ');
+      return fields[19]; // 22 - 2 (skipped pid, comm) - 1 (zero-indexed) = 19
+    }
+    if (os.platform() === 'darwin') {
+      const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      return out.trim() || undefined;
+    }
+  } catch {
+    // Process gone, permissions denied, or platform unsupported. Caller
+    // treats undefined as "no marker captured".
+  }
+  return undefined;
+}
 
 const URL_REGEX = /https:\/\/claude\.ai\/code\S+/;
 const URL_TIMEOUT_MS = 30_000;
@@ -45,6 +84,19 @@ function isProcessAlive(pid: number): boolean {
 }
 
 /**
+ * Stronger liveness check: PID exists AND its start-time marker still
+ * matches what we captured at spawn. Defeats the PID-reuse adoption bug
+ * where `claude` died, OS reassigned the PID to an unrelated process, and
+ * we silently treated that as a live session.
+ */
+function isSameProcess(session: RemoteControlSession): boolean {
+  if (!isProcessAlive(session.pid)) return false;
+  if (!session.startTimeMarker) return true; // legacy session, no marker
+  const current = readProcessStartTime(session.pid);
+  return current !== undefined && current === session.startTimeMarker;
+}
+
+/**
  * Restore session from disk on startup.
  * If the process is still alive, adopt it. Otherwise, clean up.
  */
@@ -58,7 +110,7 @@ export function restoreRemoteControl(): void {
 
   try {
     const session: RemoteControlSession = JSON.parse(data);
-    if (session.pid && isProcessAlive(session.pid)) {
+    if (session.pid && isSameProcess(session)) {
       activeSession = session;
       logger.info(
         { pid: session.pid, url: session.url },
@@ -92,11 +144,12 @@ export async function startRemoteControl(
   cwd: string,
 ): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
   if (activeSession) {
-    // Verify the process is still alive
-    if (isProcessAlive(activeSession.pid)) {
+    // Verify the process is still alive AND it's actually our process
+    // (PID reuse defeats a bare `process.kill(pid, 0)` existence check).
+    if (isSameProcess(activeSession)) {
       return { ok: true, url: activeSession.url };
     }
-    // Process died — clean up and start a new one
+    // Process died or PID was reused — clean up and start a new one
     activeSession = null;
     clearState();
   }
@@ -165,6 +218,7 @@ export async function startRemoteControl(
           startedBy: sender,
           startedInChat: chatJid,
           startedAt: new Date().toISOString(),
+          startTimeMarker: readProcessStartTime(pid),
         };
         activeSession = session;
         saveState(session);

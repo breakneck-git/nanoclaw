@@ -2,7 +2,7 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, execSync, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -27,12 +27,23 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
+import { refreshGoogleTokens } from './google-token-refresh.js';
 import { validateAdditionalMounts } from './mount-security.js';
+
+const secretsEnv = readEnvFile(['NOTION_API_KEY', 'GOOGLE_MAPS_API_KEY']);
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+export interface ImageAttachment {
+  /** Base64-encoded image data */
+  data: string;
+  /** MIME type, e.g. 'image/jpeg' */
+  mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+}
 
 export interface ContainerInput {
   prompt: string;
@@ -43,6 +54,8 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
+  /** Image attachments to pass to the agent as multimodal content */
+  images?: ImageAttachment[];
 }
 
 export interface ContainerOutput {
@@ -168,6 +181,15 @@ function buildVolumeMounts(
     });
   }
 
+  // Google Calendar MCP stores OAuth tokens in ~/.config/google-calendar-mcp/tokens.json
+  const calendarTokenDir = path.join(homeDir, '.config', 'google-calendar-mcp');
+  fs.mkdirSync(calendarTokenDir, { recursive: true });
+  mounts.push({
+    hostPath: calendarTokenDir,
+    containerPath: '/home/node/.config/google-calendar-mcp',
+    readonly: false,
+  });
+
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
@@ -181,13 +203,20 @@ function buildVolumeMounts(
   });
 
   // Copy agent-runner source into a per-group writable location so agents
-  // can customize it (add tools, change behavior) without affecting other
-  // groups. Recompiled on container startup via entrypoint.sh.
+  // can customize it (add tools, change behavior) without affecting other groups.
+  // Then pre-compile TypeScript on the host so the container can skip compilation
+  // at startup (~30s saved per cold start).
   const agentRunnerSrc = path.join(
     projectRoot,
     'container',
     'agent-runner',
     'src',
+  );
+  const agentRunnerTsconfig = path.join(
+    projectRoot,
+    'container',
+    'agent-runner',
+    'tsconfig.json',
   );
   const groupAgentRunnerDir = path.join(
     DATA_DIR,
@@ -195,23 +224,98 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
+  const groupAgentDistDir = path.join(
+    DATA_DIR,
+    'sessions',
+    group.folder,
+    'agent-runner-dist',
+  );
+
   if (fs.existsSync(agentRunnerSrc)) {
     const srcIndex = path.join(agentRunnerSrc, 'index.ts');
     const cachedIndex = path.join(groupAgentRunnerDir, 'index.ts');
+    const distIndex = path.join(groupAgentDistDir, 'index.js');
+
     const needsCopy =
       !fs.existsSync(groupAgentRunnerDir) ||
       !fs.existsSync(cachedIndex) ||
       (fs.existsSync(srcIndex) &&
         fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
+
     if (needsCopy) {
       fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
     }
+
+    // Pre-compile on host if source changed or dist missing
+    const needsCompile =
+      needsCopy ||
+      !fs.existsSync(distIndex) ||
+      (fs.existsSync(cachedIndex) &&
+        fs.statSync(cachedIndex).mtimeMs > fs.statSync(distIndex).mtimeMs);
+
+    if (needsCompile && fs.existsSync(agentRunnerTsconfig)) {
+      try {
+        fs.mkdirSync(groupAgentDistDir, { recursive: true });
+        // Write a per-group tsconfig that compiles the flattened source
+        // layout in groupAgentRunnerDir. Using the shared tsconfig via
+        // --project would resolve `include` relative to its own directory
+        // and compile the original shared source instead of the per-group
+        // copy — defeating the whole point.
+        const perGroupTsconfig = path.join(
+          groupAgentRunnerDir,
+          'tsconfig.json',
+        );
+        fs.writeFileSync(
+          perGroupTsconfig,
+          JSON.stringify(
+            {
+              compilerOptions: {
+                target: 'ES2022',
+                module: 'NodeNext',
+                moduleResolution: 'NodeNext',
+                rootDir: '.',
+                outDir: groupAgentDistDir,
+                strict: true,
+                esModuleInterop: true,
+                skipLibCheck: true,
+                declaration: true,
+              },
+              include: ['**/*.ts'],
+              exclude: ['node_modules'],
+            },
+            null,
+            2,
+          ),
+        );
+        execSync(`npx tsc --project "${perGroupTsconfig}"`, {
+          stdio: 'pipe',
+          timeout: 60_000,
+        });
+        logger.info({ group: group.name }, 'Agent-runner pre-compiled on host');
+      } catch (err) {
+        logger.warn(
+          { group: group.name, err },
+          'Host pre-compilation failed, container will compile at startup',
+        );
+        // Non-fatal: container falls back to runtime compilation
+      }
+    }
   }
+
   mounts.push({
     hostPath: groupAgentRunnerDir,
     containerPath: '/app/src',
     readonly: false,
   });
+
+  // Mount pre-compiled JS so container skips runtime TypeScript compilation
+  if (fs.existsSync(path.join(groupAgentDistDir, 'index.js'))) {
+    mounts.push({
+      hostPath: groupAgentDistDir,
+      containerPath: '/tmp/agent-dist',
+      readonly: false,
+    });
+  }
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
@@ -230,7 +334,7 @@ function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   isMain: boolean,
-): string[] {
+): { args: string[]; envFilePath: string | null } {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
@@ -251,6 +355,24 @@ function buildContainerArgs(
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // Third-party MCP secrets go into an --env-file so they don't leak via `ps aux`.
+  // Caller is responsible for unlinking the file after the container exits.
+  const notionKey = process.env.NOTION_API_KEY || secretsEnv.NOTION_API_KEY;
+  const googleMapsKey =
+    process.env.GOOGLE_MAPS_API_KEY || secretsEnv.GOOGLE_MAPS_API_KEY;
+  let envFilePath: string | null = null;
+  const envFileLines: string[] = [];
+  if (notionKey) envFileLines.push(`NOTION_API_KEY=${notionKey}`);
+  if (googleMapsKey) envFileLines.push(`GOOGLE_MAPS_API_KEY=${googleMapsKey}`);
+  if (envFileLines.length > 0) {
+    const envDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-env-'));
+    envFilePath = path.join(envDir, 'secrets.env');
+    fs.writeFileSync(envFilePath, envFileLines.join('\n') + '\n', {
+      mode: 0o600,
+    });
+    args.push('--env-file', envFilePath);
   }
 
   // Runtime-specific args for host gateway resolution
@@ -283,7 +405,7 @@ function buildContainerArgs(
 
   args.push(CONTAINER_IMAGE);
 
-  return args;
+  return { args, envFilePath };
 }
 
 export async function runContainerAgent(
@@ -294,13 +416,35 @@ export async function runContainerAgent(
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
+  // Refresh expired Google tokens before starting the container
+  await refreshGoogleTokens();
+
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName, input.isMain);
+  const { args: containerArgs, envFilePath } = buildContainerArgs(
+    mounts,
+    containerName,
+    input.isMain,
+  );
+
+  let envFileCleaned = false;
+  const cleanupEnvFile = () => {
+    if (envFileCleaned || !envFilePath) return;
+    envFileCleaned = true;
+    try {
+      fs.unlinkSync(envFilePath);
+      fs.rmdirSync(path.dirname(envFilePath));
+    } catch (err) {
+      logger.warn(
+        { envFilePath, err: err instanceof Error ? err.message : String(err) },
+        'Failed to remove container env-file',
+      );
+    }
+  };
 
   logger.debug(
     {
@@ -389,7 +533,19 @@ export async function runContainerAgent(
             resetTimeout();
             // Call onOutput for all markers (including null results)
             // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
+            // Capture failures in the streaming callback (e.g. channel send
+            // errors) so a single bad onOutput call doesn't permanently
+            // reject outputChain and wedge runContainerAgent — its on-close
+            // resolver awaits this chain via .then() without onRejected, so
+            // a rejection would leave the outer Promise pending forever.
+            outputChain = outputChain
+              .then(() => onOutput(parsed))
+              .catch((err) => {
+                logger.error(
+                  { group: group.name, err },
+                  'Streaming onOutput callback failed; continuing chain',
+                );
+              });
           } catch (err) {
             logger.warn(
               { group: group.name, error: err },
@@ -456,6 +612,7 @@ export async function runContainerAgent(
 
     container.on('close', (code) => {
       clearTimeout(timeout);
+      cleanupEnvFile();
       const duration = Date.now() - startTime;
 
       if (timedOut) {
@@ -661,6 +818,7 @@ export async function runContainerAgent(
 
     container.on('error', (err) => {
       clearTimeout(timeout);
+      cleanupEnvFile();
       logger.error(
         { group: group.name, containerName, error: err },
         'Container spawn error',

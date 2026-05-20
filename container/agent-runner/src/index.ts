@@ -15,10 +15,17 @@
  */
 
 import fs from 'fs';
+import readline from 'readline';
 import path from 'path';
 import { execFile } from 'child_process';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import { safeTruncate } from './safe-truncate.js';
+
+interface ImageAttachment {
+  data: string;
+  mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+}
 
 interface ContainerInput {
   prompt: string;
@@ -29,6 +36,7 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
+  images?: ImageAttachment[];
 }
 
 interface ContainerOutput {
@@ -49,9 +57,13 @@ interface SessionsIndex {
   entries: SessionEntry[];
 }
 
+type SDKContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+
 interface SDKUserMessage {
   type: 'user';
-  message: { role: 'user'; content: string };
+  message: { role: 'user'; content: string | SDKContentBlock[] };
   parent_tool_use_id: null;
   session_id: string;
 }
@@ -73,6 +85,23 @@ class MessageStream {
     this.queue.push({
       type: 'user',
       message: { role: 'user', content: text },
+      parent_tool_use_id: null,
+      session_id: '',
+    });
+    this.waiting?.();
+  }
+
+  pushWithImages(text: string, images: ImageAttachment[]): void {
+    const content: SDKContentBlock[] = [
+      ...images.map((img) => ({
+        type: 'image' as const,
+        source: { type: 'base64' as const, media_type: img.mediaType, data: img.data },
+      })),
+      { type: 'text' as const, text },
+    ];
+    this.queue.push({
+      type: 'user',
+      message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: '',
     });
@@ -156,8 +185,10 @@ function createPreCompactHook(assistantName?: string): HookCallback {
     }
 
     try {
-      const content = fs.readFileSync(transcriptPath, 'utf-8');
-      const messages = parseTranscript(content);
+      // Stream the JSONL line by line — by the time pre-compact fires, the
+      // transcript can be hundreds of MB (base64 images, large tool results)
+      // and readFileSync would triple-allocate or OOM the container.
+      const messages = await parseTranscriptStream(transcriptPath);
 
       if (messages.length === 0) {
         log('No messages to archive');
@@ -165,7 +196,11 @@ function createPreCompactHook(assistantName?: string): HookCallback {
       }
 
       const summary = getSessionSummary(sessionId, transcriptPath);
-      const name = summary ? sanitizeFilename(summary) : generateFallbackName();
+      // sanitizeFilename can return '' for purely non-ASCII summaries (e.g.
+      // Cyrillic/CJK) — fall back to a timestamped name instead of writing
+      // every conversation that day to the same "<date>-.md" file.
+      const sanitized = summary ? sanitizeFilename(summary) : '';
+      const name = sanitized || generateFallbackName();
 
       const conversationsDir = '/workspace/group/conversations';
       fs.mkdirSync(conversationsDir, { recursive: true });
@@ -195,8 +230,16 @@ function sanitizeFilename(summary: string): string {
 }
 
 function generateFallbackName(): string {
+  // Include seconds + 4 random hex chars so multiple pre-compacts within
+  // the same minute (multi-agent swarm, or scheduled task + user message
+  // colliding) don't clobber each other's archives. writeFileSync has no
+  // 'wx' flag, so name collisions silently overwrite.
   const time = new Date();
-  return `conversation-${time.getHours().toString().padStart(2, '0')}${time.getMinutes().toString().padStart(2, '0')}`;
+  const hh = time.getHours().toString().padStart(2, '0');
+  const mm = time.getMinutes().toString().padStart(2, '0');
+  const ss = time.getSeconds().toString().padStart(2, '0');
+  const rand = Math.floor(Math.random() * 0x10000).toString(16).padStart(4, '0');
+  return `conversation-${hh}${mm}${ss}-${rand}`;
 }
 
 interface ParsedMessage {
@@ -204,29 +247,35 @@ interface ParsedMessage {
   content: string;
 }
 
-function parseTranscript(content: string): ParsedMessage[] {
-  const messages: ParsedMessage[] = [];
-
-  for (const line of content.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === 'user' && entry.message?.content) {
-        const text = typeof entry.message.content === 'string'
-          ? entry.message.content
-          : entry.message.content.map((c: { text?: string }) => c.text || '').join('');
-        if (text) messages.push({ role: 'user', content: text });
-      } else if (entry.type === 'assistant' && entry.message?.content) {
-        const textParts = entry.message.content
-          .filter((c: { type: string }) => c.type === 'text')
-          .map((c: { text: string }) => c.text);
-        const text = textParts.join('');
-        if (text) messages.push({ role: 'assistant', content: text });
-      }
-    } catch {
+function parseEntryLine(line: string, messages: ParsedMessage[]): void {
+  if (!line.trim()) return;
+  try {
+    const entry = JSON.parse(line);
+    if (entry.type === 'user' && entry.message?.content) {
+      const text = typeof entry.message.content === 'string'
+        ? entry.message.content
+        : entry.message.content.map((c: { text?: string }) => c.text || '').join('');
+      if (text) messages.push({ role: 'user', content: text });
+    } else if (entry.type === 'assistant' && entry.message?.content) {
+      const textParts = entry.message.content
+        .filter((c: { type: string }) => c.type === 'text')
+        .map((c: { text: string }) => c.text);
+      const text = textParts.join('');
+      if (text) messages.push({ role: 'assistant', content: text });
     }
+  } catch {
   }
+}
 
+async function parseTranscriptStream(transcriptPath: string): Promise<ParsedMessage[]> {
+  const messages: ParsedMessage[] = [];
+  const rl = readline.createInterface({
+    input: fs.createReadStream(transcriptPath, { encoding: 'utf-8' }),
+    crlfDelay: Infinity,
+  });
+  for await (const line of rl) {
+    parseEntryLine(line, messages);
+  }
   return messages;
 }
 
@@ -251,7 +300,7 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
   for (const msg of messages) {
     const sender = msg.role === 'user' ? 'User' : (assistantName || 'Assistant');
     const content = msg.content.length > 2000
-      ? msg.content.slice(0, 2000) + '...'
+      ? safeTruncate(msg.content, 2000) + '...'
       : msg.content;
     lines.push(`**${sender}**: ${content}`);
     lines.push('');
@@ -310,13 +359,17 @@ function drainIpcInput(): string[] {
 function waitForIpcMessage(): Promise<string | null> {
   return new Promise((resolve) => {
     const poll = () => {
-      if (shouldClose()) {
-        resolve(null);
-        return;
-      }
+      // Drain BEFORE checking close — if the host wrote both a message file
+      // and _close inside the same poll window (scheduler + message-loop
+      // racing), checking close first silently strands the message file in
+      // input/ where the next container picks it up out of context.
       const messages = drainIpcInput();
       if (messages.length > 0) {
         resolve(messages.join('\n'));
+        return;
+      }
+      if (shouldClose()) {
+        resolve(null);
         return;
       }
       setTimeout(poll, IPC_POLL_MS);
@@ -340,24 +393,32 @@ async function runQuery(
   resumeAt?: string,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
-  stream.push(prompt);
+  if (containerInput.images && containerInput.images.length > 0) {
+    stream.pushWithImages(prompt, containerInput.images);
+  } else {
+    stream.push(prompt);
+  }
 
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
   let closedDuringQuery = false;
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
+    // Drain pending messages BEFORE honoring the close sentinel. Otherwise a
+    // host that wrote both a message file and _close in the same poll window
+    // (60s scheduler tick racing with 2s message-loop) loses the message —
+    // the .json sits in input/ and gets ingested by the next container.
+    const messages = drainIpcInput();
+    for (const text of messages) {
+      log(`Piping IPC message into active query (${text.length} chars)`);
+      stream.push(text);
+    }
     if (shouldClose()) {
       log('Close sentinel detected during query, ending stream');
       closedDuringQuery = true;
       stream.end();
       ipcPolling = false;
       return;
-    }
-    const messages = drainIpcInput();
-    for (const text of messages) {
-      log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
     }
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
   };
@@ -394,6 +455,7 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
+      model: 'claude-opus-4-7',
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
@@ -411,6 +473,10 @@ async function runQuery(
         'NotebookEdit',
         'mcp__nanoclaw__*',
         'mcp__gmail__*',
+        'mcp__notion__*',
+        'mcp__google-calendar__*',
+        'mcp__google-maps__*',
+        'mcp__google-drive__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -427,8 +493,41 @@ async function runQuery(
           },
         },
         gmail: {
-          command: 'npx',
-          args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'],
+          command: 'gmail-mcp',
+          args: [],
+        },
+        notion: {
+          command: 'notion-mcp-server',
+          args: [],
+          env: {
+            OPENAPI_MCP_HEADERS: JSON.stringify({
+              Authorization: `Bearer ${process.env.NOTION_API_KEY || ''}`,
+              'Notion-Version': '2022-06-28',
+            }),
+          },
+        },
+        'google-calendar': {
+          command: 'google-calendar-mcp',
+          args: [],
+          env: {
+            GOOGLE_OAUTH_CREDENTIALS: '/home/node/.gmail-mcp/gcp-oauth.keys.json',
+            GOOGLE_CALENDAR_MCP_TOKEN_PATH: '/home/node/.gmail-mcp/google-calendar-tokens.json',
+          },
+        },
+        'google-maps': {
+          command: 'mcp-server-google-maps',
+          args: [],
+          env: {
+            GOOGLE_MAPS_API_KEY: process.env.GOOGLE_MAPS_API_KEY || '',
+          },
+        },
+        'google-drive': {
+          command: 'google-drive-mcp',
+          args: [],
+          env: {
+            GOOGLE_DRIVE_OAUTH_CREDENTIALS: '/home/node/.gmail-mcp/gcp-oauth.keys.json',
+            GOOGLE_DRIVE_MCP_TOKEN_PATH: '/home/node/.gmail-mcp/google-drive-tokens.json',
+          },
         },
       },
       hooks: {

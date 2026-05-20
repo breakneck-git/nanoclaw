@@ -11,6 +11,7 @@ import {
   TRIGGER_PATTERN,
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
+import { startGoogleTokenRefresh } from './google-token-refresh.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -70,8 +71,22 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
+// Per-chat last thread/topic id observed inbound. Used to route outbound
+// replies back into the same Telegram supergroup-forum topic; without this,
+// replies always land in the General topic regardless of where the user
+// wrote. In-memory only — restored implicitly when the next inbound message
+// arrives. Channels that don't use threads keep the entry undefined.
+const lastThreadId: Record<string, string | undefined> = {};
+
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+// Temporary store for image attachments — keyed by message ID.
+// Images are held until the message batch is processed by the agent, then cleared.
+const pendingImages = new Map<
+  string,
+  import('./container-runner.js').ImageAttachment[]
+>();
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -107,32 +122,50 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     return;
   }
 
-  registeredGroups[jid] = group;
-  setRegisteredGroup(jid, group);
+  // Do the filesystem work FIRST. Previously this wrote the DB row before
+  // touching disk, so any fs failure (EACCES / ENOSPC / EROFS) left a
+  // registered_groups row pointing at a folder with no CLAUDE.md (the copy
+  // is gated on `!fs.existsSync(groupMdFile)` and only runs in this
+  // function — once the row exists it is never retried).
+  try {
+    fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
-  // Create group folder
-  fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
-
-  // Copy CLAUDE.md template into the new group folder so agents have
-  // identity and instructions from the first run.  (Fixes #1391)
-  const groupMdFile = path.join(groupDir, 'CLAUDE.md');
-  if (!fs.existsSync(groupMdFile)) {
-    const templateFile = path.join(
-      GROUPS_DIR,
-      group.isMain ? 'main' : 'global',
-      'CLAUDE.md',
-    );
-    if (fs.existsSync(templateFile)) {
-      let content = fs.readFileSync(templateFile, 'utf-8');
-      if (ASSISTANT_NAME !== 'Andy') {
-        content = content.replace(/^# Andy$/m, `# ${ASSISTANT_NAME}`);
-        content = content.replace(/You are Andy/g, `You are ${ASSISTANT_NAME}`);
+    // Copy CLAUDE.md template into the new group folder so agents have
+    // identity and instructions from the first run.  (Fixes #1391)
+    const groupMdFile = path.join(groupDir, 'CLAUDE.md');
+    if (!fs.existsSync(groupMdFile)) {
+      const templateFile = path.join(
+        GROUPS_DIR,
+        group.isMain ? 'main' : 'global',
+        'CLAUDE.md',
+      );
+      if (fs.existsSync(templateFile)) {
+        let content = fs.readFileSync(templateFile, 'utf-8');
+        if (ASSISTANT_NAME !== 'Andy') {
+          content = content.replace(/^# Andy$/m, `# ${ASSISTANT_NAME}`);
+          content = content.replace(
+            /You are Andy/g,
+            `You are ${ASSISTANT_NAME}`,
+          );
+        }
+        fs.writeFileSync(groupMdFile, content);
+        logger.info(
+          { folder: group.folder },
+          'Created CLAUDE.md from template',
+        );
       }
-      fs.writeFileSync(groupMdFile, content);
-      logger.info({ folder: group.folder }, 'Created CLAUDE.md from template');
     }
+  } catch (err) {
+    logger.error(
+      { jid, folder: group.folder, err },
+      'Failed to prepare group folder; aborting registration',
+    );
+    throw err;
   }
 
+  // Filesystem is ready — now persist.
+  registeredGroups[jid] = group;
+  setRegisteredGroup(jid, group);
 
   logger.info(
     { jid, name: group.name, folder: group.folder },
@@ -203,6 +236,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
+  // Collect images from pending messages. Keep them in the map until the
+  // agent run succeeds — on error the cursor rolls back and we replay the
+  // same messages, which must still have their images.
+  const batchImages: import('./container-runner.js').ImageAttachment[] = [];
+  const imageKeys: string[] = [];
+  for (const msg of missedMessages) {
+    const key = `${chatJid}:${msg.id}`;
+    const imgs = pendingImages.get(key);
+    if (imgs) {
+      batchImages.push(...imgs);
+      imageKeys.push(key);
+    }
+  }
+
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
@@ -232,38 +279,59 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  // Tracks failed outbound delivery from inside the streaming callback.
+  // Without this, channel.sendMessage throwing (per M7) is swallowed by
+  // outputChain.catch in container-runner and the message-loop cursor
+  // would advance as if the user got the reply — losing it permanently.
+  let streamingSendFailed = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+  const output = await runAgent(
+    group,
+    prompt,
+    chatJid,
+    async (result) => {
+      // Streaming output callback — called for each agent result
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
+        if (text) {
+          try {
+            await channel.sendMessage(chatJid, text, {
+              threadId: lastThreadId[chatJid],
+            });
+            outputSentToUser = true;
+          } catch (err) {
+            logger.error(
+              { chatJid, err },
+              'Failed to deliver streamed agent output',
+            );
+            streamingSendFailed = true;
+          }
+        }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    },
+    batchImages.length > 0 ? batchImages : undefined,
+  );
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
-  if (output === 'error' || hadError) {
+  if (output === 'error' || hadError || streamingSendFailed) {
     // If we already sent output to the user, don't roll back the cursor —
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
@@ -271,9 +339,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         { group: group.name },
         'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
       );
+      for (const key of imageKeys) pendingImages.delete(key);
       return true;
     }
-    // Roll back cursor so retries can re-process these messages
+    // Roll back cursor so retries can re-process these messages.
+    // Leave pendingImages intact so the retry still has the images.
     lastAgentTimestamp[chatJid] = previousCursor;
     saveState();
     logger.warn(
@@ -283,6 +353,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return false;
   }
 
+  for (const key of imageKeys) pendingImages.delete(key);
   return true;
 }
 
@@ -291,6 +362,7 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  images?: import('./container-runner.js').ImageAttachment[],
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
@@ -341,6 +413,7 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
+        images,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -407,6 +480,14 @@ async function startMessageLoop(): Promise<void> {
           const group = registeredGroups[chatJid];
           if (!group) continue;
 
+          // Track the last thread/topic id we saw inbound for this chat so
+          // outbound replies land in the same Telegram forum topic.
+          const newestThread =
+            groupMessages[groupMessages.length - 1]?.thread_id;
+          if (newestThread !== undefined) {
+            lastThreadId[chatJid] = newestThread;
+          }
+
           const channel = findChannel(channels, chatJid);
           if (!channel) {
             logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
@@ -441,7 +522,16 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          // If any pending messages have images, don't pipe via IPC (text-only path).
+          // Close the active container so a fresh one starts with full image data.
+          // Key shape must match the writer at the onMessage handler below
+          // (`${chat_jid}:${id}`) — Telegram and Gmail use channel-scoped IDs
+          // that collide across chats if we only key by msg.id.
+          const hasImages = messagesToSend.some((m) =>
+            pendingImages.has(`${m.chat_jid}:${m.id}`),
+          );
+
+          if (!hasImages && queue.sendMessage(chatJid, formatted)) {
             logger.debug(
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
@@ -456,7 +546,16 @@ async function startMessageLoop(): Promise<void> {
                 logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
               );
           } else {
-            // No active container — enqueue for a new one
+            if (hasImages) {
+              // Signal the running container to exit so a new one can start
+              // with the full ContainerInput including image data.
+              queue.closeStdin(chatJid);
+              logger.debug(
+                { chatJid },
+                'Image message: closing active container for fresh start with images',
+              );
+            }
+            // No active container (or closing for images) — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
           }
         }
@@ -498,6 +597,9 @@ async function main(): Promise<void> {
   loadState();
   restoreRemoteControl();
 
+  // Auto-refresh Google OAuth tokens every 30 minutes
+  startGoogleTokenRefresh();
+
   // Start credential proxy (containers route API calls through this)
   const proxyServer = await startCredentialProxy(
     CREDENTIAL_PROXY_PORT,
@@ -533,6 +635,7 @@ async function main(): Promise<void> {
     const channel = findChannel(channels, chatJid);
     if (!channel) return;
 
+    const threadOpts = { threadId: lastThreadId[chatJid] };
     if (command === '/remote-control') {
       const result = await startRemoteControl(
         msg.sender,
@@ -540,19 +643,43 @@ async function main(): Promise<void> {
         process.cwd(),
       );
       if (result.ok) {
-        await channel.sendMessage(chatJid, result.url);
+        try {
+          await channel.sendMessage(chatJid, result.url, threadOpts);
+        } catch (err) {
+          // URL never reached the user. Tear down the session we just
+          // started so the next /remote-control isn't blocked by an
+          // orphan single-session lock the user can't see.
+          logger.error(
+            { chatJid, err },
+            'Failed to deliver remote-control URL; rolling back session',
+          );
+          try {
+            stopRemoteControl();
+          } catch (stopErr) {
+            logger.error(
+              { chatJid, err: stopErr },
+              'Rollback stopRemoteControl also failed',
+            );
+          }
+          throw err;
+        }
       } else {
         await channel.sendMessage(
           chatJid,
           `Remote Control failed: ${result.error}`,
+          threadOpts,
         );
       }
     } else {
       const result = stopRemoteControl();
       if (result.ok) {
-        await channel.sendMessage(chatJid, 'Remote Control session ended.');
+        await channel.sendMessage(
+          chatJid,
+          'Remote Control session ended.',
+          threadOpts,
+        );
       } else {
-        await channel.sendMessage(chatJid, result.error);
+        await channel.sendMessage(chatJid, result.error, threadOpts);
       }
     }
   }
@@ -586,6 +713,12 @@ async function main(): Promise<void> {
         }
       }
       storeMessage(msg);
+      // Save images in memory until the message batch is processed.
+      // Key by chatJid:msg.id because per-channel message IDs (e.g. Telegram)
+      // are only unique within a chat, not globally.
+      if (msg.images && msg.images.length > 0) {
+        pendingImages.set(`${msg.chat_jid}:${msg.id}`, msg.images);
+      }
     },
     onChatMetadata: (
       chatJid: string,
@@ -632,14 +765,16 @@ async function main(): Promise<void> {
         return;
       }
       const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
+      if (text) {
+        await channel.sendMessage(jid, text, { threadId: lastThreadId[jid] });
+      }
     },
   });
   startIpcWatcher({
     sendMessage: (jid, text) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
+      return channel.sendMessage(jid, text, { threadId: lastThreadId[jid] });
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

@@ -35,4 +35,7 @@ groups/global/*
 # Skills system (local per-installation state)
 .nanoclaw/
 
+# Per-session worktree tooling state
+.claude/worktrees/
+
 agents-sdk-docs

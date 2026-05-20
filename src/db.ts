@@ -153,6 +153,11 @@ export function initDatabase(): void {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   db = new Database(dbPath);
+  // better-sqlite3 defaults to foreign_keys=OFF, so the declared FK on
+  // task_run_logs(task_id) is otherwise just decoration. Turning it on means
+  // deleteTask's manual child-cascade now matters; it's wrapped in a
+  // transaction below for atomicity.
+  db.pragma('foreign_keys = ON');
   createSchema(db);
 
   // Migrate from JSON files if they exist
@@ -162,6 +167,7 @@ export function initDatabase(): void {
 /** @internal - for tests only. Creates a fresh in-memory database. */
 export function _initTestDatabase(): void {
   db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
   createSchema(db);
 }
 
@@ -268,6 +274,14 @@ export function setLastGroupSync(): void {
  * Only call this for registered groups where message history is needed.
  */
 export function storeMessage(msg: NewMessage): void {
+  // Ensure the FK parent row exists. Gmail can deliver a message keyed to a
+  // mainJid that has never sent or received a direct message through its own
+  // channel — pre-foreign_keys=ON this silently inserted an orphan; now it
+  // throws SQLITE_CONSTRAINT_FOREIGNKEY and loses the message. INSERT OR
+  // IGNORE is a no-op if the row already exists.
+  db.prepare(
+    `INSERT OR IGNORE INTO chats (jid, name, last_message_time, channel, is_group) VALUES (?, NULL, ?, NULL, 0)`,
+  ).run(msg.chat_jid, msg.timestamp);
   db.prepare(
     `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
@@ -318,19 +332,19 @@ export function getNewMessages(
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
   const placeholders = jids.map(() => '?').join(',');
-  // Filter bot messages using both the is_bot_message flag AND the content
-  // prefix as a backstop for messages written before the migration ran.
-  // Subquery takes the N most recent, outer query re-sorts chronologically.
+  // FIFO drain: take the OLDEST `limit` unseen messages so a backlog larger
+  // than the limit doesn't lose its tail. `lastTimestamp` advances to the
+  // newest of returned (= the oldest unseen + limit-1) so the next poll
+  // picks up the remainder. Previously this used `ORDER BY DESC LIMIT 200`
+  // and advanced past the cap, silently dropping the oldest unseen rows.
   const sql = `
-    SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
-      FROM messages
-      WHERE timestamp > ? AND chat_jid IN (${placeholders})
-        AND is_bot_message = 0 AND content NOT LIKE ?
-        AND content != '' AND content IS NOT NULL
-      ORDER BY timestamp DESC
-      LIMIT ?
-    ) ORDER BY timestamp
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+    FROM messages
+    WHERE timestamp > ? AND chat_jid IN (${placeholders})
+      AND is_bot_message = 0 AND content NOT LIKE ?
+      AND content != '' AND content IS NOT NULL
+    ORDER BY timestamp ASC
+    LIMIT ?
   `;
 
   const rows = db
@@ -351,19 +365,17 @@ export function getMessagesSince(
   botPrefix: string,
   limit: number = 200,
 ): NewMessage[] {
-  // Filter bot messages using both the is_bot_message flag AND the content
-  // prefix as a backstop for messages written before the migration ran.
-  // Subquery takes the N most recent, outer query re-sorts chronologically.
+  // FIFO drain (see getNewMessages): oldest unseen first, no inner DESC sort.
+  // Limit prevents memory blow-up; if more remain, the cursor advance happens
+  // upstream and the next call picks up where this batch ended.
   const sql = `
-    SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
-      FROM messages
-      WHERE chat_jid = ? AND timestamp > ?
-        AND is_bot_message = 0 AND content NOT LIKE ?
-        AND content != '' AND content IS NOT NULL
-      ORDER BY timestamp DESC
-      LIMIT ?
-    ) ORDER BY timestamp
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+    FROM messages
+    WHERE chat_jid = ? AND timestamp > ?
+      AND is_bot_message = 0 AND content NOT LIKE ?
+      AND content != '' AND content IS NOT NULL
+    ORDER BY timestamp ASC
+    LIMIT ?
   `;
   return db
     .prepare(sql)
@@ -463,10 +475,16 @@ export function updateTask(
   ).run(...values);
 }
 
-export function deleteTask(id: string): void {
-  // Delete child records first (FK constraint)
+const deleteTaskTxn = (id: string) => {
+  // Cascade is manual because schema declares the FK without ON DELETE
+  // CASCADE. Wrap in a transaction so a crash between the two DELETEs can't
+  // leave orphan log rows or (with foreign_keys=ON) a half-deleted parent.
   db.prepare('DELETE FROM task_run_logs WHERE task_id = ?').run(id);
   db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
+};
+
+export function deleteTask(id: string): void {
+  db.transaction(deleteTaskTxn)(id);
 }
 
 export function getDueTasks(): ScheduledTask[] {
@@ -511,6 +529,26 @@ export function logTaskRun(log: TaskRunLog): void {
     log.result,
     log.error,
   );
+}
+
+/**
+ * Atomically log a task run and advance the task's next_run cursor. Without
+ * this, a crash (or thrown computeNextRun) between the two writes leaves
+ * `task_run_logs` updated but `scheduled_tasks.next_run` <= now, causing the
+ * scheduler to re-run the task on its next poll → duplicate executions.
+ *
+ * `db.transaction` is instantiated lazily — db is undefined until
+ * `initDatabase()` runs, so we can't bind the transaction at module load.
+ */
+export function recordTaskRun(
+  log: TaskRunLog,
+  nextRun: string | null,
+  lastResult: string,
+): void {
+  db.transaction(() => {
+    logTaskRun(log);
+    updateTaskAfterRun(log.task_id, nextRun, lastResult);
+  })();
 }
 
 // --- Router state accessors ---

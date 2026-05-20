@@ -52,6 +52,8 @@ export interface NewMessage {
   is_from_me?: boolean;
   is_bot_message?: boolean;
   thread_id?: string;
+  /** Image attachments (base64-encoded) to pass to the agent as multimodal content */
+  images?: import('./container-runner.js').ImageAttachment[];
 }
 
 export interface ScheduledTask {
@@ -81,10 +83,23 @@ export interface TaskRunLog {
 
 // --- Channel abstraction ---
 
+export interface SendMessageOptions {
+  /**
+   * Channel-specific thread/topic identifier. For Telegram supergroup forums
+   * this is `message_thread_id` — required to reply inside the same topic.
+   * Channels that don't support threads ignore it.
+   */
+  threadId?: string;
+}
+
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  sendMessage(
+    jid: string,
+    text: string,
+    opts?: SendMessageOptions,
+  ): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;

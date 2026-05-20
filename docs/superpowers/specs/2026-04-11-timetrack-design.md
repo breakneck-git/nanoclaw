@@ -28,9 +28,9 @@ No connection to NanoClaw. Claude subscription (Max) is used for classification 
 | Время | text | Active duration from AW, written by sync script as `{N}м` (e.g. `23м`). `Часы` formula reads this field. |
 | Note | text | Context for AI classifier: window titles, URLs |
 | Task | relation → Tasks | Set by classification task |
-| Classified | checkbox | **New field.** True = processed by classifier |
+| Sorted | checkbox | **New field.** True = processed by classifier |
 
-The `Classified` field acts as the processing cursor: classifier queries `Classified = false`, processes, then sets `Classified = true` regardless of whether a Task was found.
+The `Sorted` field acts as the processing cursor: classifier queries `Sorted = false`, processes, then sets `Sorted = true` regardless of whether a Task was found.
 
 ### Tasks (`collection://eebbf999-d9f3-461d-99a0-f6916ad6e495`)
 
@@ -151,7 +151,7 @@ Runs every 15 minutes. Label: `com.timetrack.sync`.
 
 ### Purpose
 
-Daily AI classification: read all `Classified = false` Time Log entries, match each to the best-fit Task, write Task relation, set `Classified = true`.
+Daily AI classification: read all `Sorted = false` Time Log entries, match each to the best-fit Task, write Task relation, set `Sorted = true`.
 
 ### Schedule
 
@@ -162,20 +162,20 @@ Daily at 23:00 local time (configurable). Set up via Claude Code `/schedule`.
 ```
 You have access to Notion via MCP.
 
-1. Query Time Log database (35b4cfe8-...) for all entries where Classified = false.
+1. Query Time Log database (35b4cfe8-...) for all entries where Sorted = false.
 2. Query Tasks database (283efefe-...) for all tasks where done = "Not started" or "In progress".
 3. For each Time Log entry, examine Entry + Note fields (app name, window title, URL if present).
    Match it to the most relevant Task based on semantic similarity.
    If no reasonable match exists, leave Task empty.
 4. For each entry:
    - Set Task relation (if matched)
-   - Set Classified = true
+   - Set Sorted = true
 5. Do this for ALL unclassified entries before finishing.
 ```
 
 ### Idempotency
 
-Only processes `Classified = false` entries. Re-running is safe — already classified entries are skipped. Manual corrections to Task relation are preserved (they were already `Classified = true`).
+Only processes `Sorted = false` entries. Re-running is safe — already classified entries are skipped. Manual corrections to Task relation are preserved (they were already `Sorted = true`).
 
 ### Scale
 
@@ -205,7 +205,7 @@ Dependencies: `requests`, `tomli` (Python < 3.11) or stdlib `tomllib`, `notion-c
 
 ## Notion Schema Change Required
 
-Before first sync, add `Classified` checkbox property to Time Log database. Can be done manually in Notion or via API at setup time.
+Before first sync, add `Sorted` checkbox property to Time Log database. Can be done manually in Notion or via API at setup time.
 
 ---
 
@@ -221,11 +221,11 @@ ActivityWatch (localhost:5600)
         │
         │ Notion API
         ▼
-  Time Log (Classified = false)
+  Time Log (Sorted = false)
         │
         │ Claude Code scheduled task, 23:00 daily
         ▼
-  Time Log (Task relation set, Classified = true)
+  Time Log (Task relation set, Sorted = true)
         │
         │ Notion back-relation (automatic)
         ▼

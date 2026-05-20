@@ -9,7 +9,10 @@ import os from 'os';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 
-const envConfig = readEnvFile(['CREDENTIAL_PROXY_HOST', 'CONTAINER_HOST_GATEWAY']);
+const envConfig = readEnvFile([
+  'CREDENTIAL_PROXY_HOST',
+  'CONTAINER_HOST_GATEWAY',
+]);
 
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'container';
@@ -49,7 +52,19 @@ function detectProxyBindHost(): string {
     const ipv4 = docker0.find((a) => a.family === 'IPv4');
     if (ipv4) return ipv4.address;
   }
-  return '0.0.0.0';
+
+  // No safe interface found. Refuse to fall back to 0.0.0.0 — the credential
+  // proxy serves real API keys with no authentication. Binding to all
+  // interfaces would expose them to anyone on the network. The user must opt
+  // in explicitly via CREDENTIAL_PROXY_HOST (e.g. a podman/CNI bridge IP).
+  throw new Error(
+    'Cannot detect a safe credential proxy bind address: no docker0 bridge ' +
+      'and not running on macOS/WSL. Refusing to bind to 0.0.0.0 because the ' +
+      'credential proxy has no authentication and would expose real Anthropic ' +
+      'credentials to the network. Set CREDENTIAL_PROXY_HOST in .env to the ' +
+      'container-runtime bridge IP (or 127.0.0.1 if your runtime routes ' +
+      'host.docker.internal to loopback).',
+  );
 }
 
 /** CLI args needed for the container to resolve the host gateway. */

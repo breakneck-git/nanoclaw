@@ -91,9 +91,13 @@ export class GmailChannel implements Channel {
 
     // Start polling with error backoff
     const schedulePoll = () => {
-      const backoffMs = this.consecutiveErrors > 0
-        ? Math.min(this.pollIntervalMs * Math.pow(2, this.consecutiveErrors), 30 * 60 * 1000)
-        : this.pollIntervalMs;
+      const backoffMs =
+        this.consecutiveErrors > 0
+          ? Math.min(
+              this.pollIntervalMs * Math.pow(2, this.consecutiveErrors),
+              30 * 60 * 1000,
+            )
+          : this.pollIntervalMs;
       this.pollTimer = setTimeout(() => {
         this.pollForMessages()
           .catch((err) => logger.error({ err }, 'Gmail poll error'))
@@ -108,7 +112,11 @@ export class GmailChannel implements Channel {
     schedulePoll();
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(
+    jid: string,
+    text: string,
+    _opts?: { threadId?: string },
+  ): Promise<void> {
     if (!this.gmail) {
       logger.warn('Gmail not initialized');
       return;
@@ -122,16 +130,23 @@ export class GmailChannel implements Channel {
       return;
     }
 
-    const subject = meta.subject.startsWith('Re:')
-      ? meta.subject
-      : `Re: ${meta.subject}`;
+    // Strip CR/LF from any header value derived from the inbound message —
+    // without this, a crafted Subject like "hi\r\nBcc: evil@x" injects
+    // arbitrary RFC 822 headers (Bcc, Reply-To, etc.) into our outbound MIME.
+    const safeHeader = (s: string) => s.replace(/[\r\n]+/g, ' ').trim();
+    const safeSender = safeHeader(meta.sender);
+    const safeSubjectBase = safeHeader(meta.subject);
+    const subject = safeSubjectBase.startsWith('Re:')
+      ? safeSubjectBase
+      : `Re: ${safeSubjectBase}`;
+    const safeMessageId = safeHeader(meta.messageId);
 
     const headers = [
-      `To: ${meta.sender}`,
+      `To: ${safeSender}`,
       `From: ${this.userEmail}`,
       `Subject: ${subject}`,
-      `In-Reply-To: ${meta.messageId}`,
-      `References: ${meta.messageId}`,
+      `In-Reply-To: ${safeMessageId}`,
+      `References: ${safeMessageId}`,
       'Content-Type: text/plain; charset=utf-8',
       '',
       text,
@@ -151,9 +166,10 @@ export class GmailChannel implements Channel {
           threadId,
         },
       });
-      logger.info({ to: meta.sender, threadId }, 'Gmail reply sent');
+      logger.info({ to: safeSender, threadId }, 'Gmail reply sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Gmail reply');
+      throw err;
     }
   }
 
@@ -210,8 +226,18 @@ export class GmailChannel implements Channel {
       this.consecutiveErrors = 0;
     } catch (err) {
       this.consecutiveErrors++;
-      const backoffMs = Math.min(this.pollIntervalMs * Math.pow(2, this.consecutiveErrors), 30 * 60 * 1000);
-      logger.error({ err, consecutiveErrors: this.consecutiveErrors, nextPollMs: backoffMs }, 'Gmail poll failed');
+      const backoffMs = Math.min(
+        this.pollIntervalMs * Math.pow(2, this.consecutiveErrors),
+        30 * 60 * 1000,
+      );
+      logger.error(
+        {
+          err,
+          consecutiveErrors: this.consecutiveErrors,
+          nextPollMs: backoffMs,
+        },
+        'Gmail poll failed',
+      );
     }
   }
 
@@ -268,9 +294,7 @@ export class GmailChannel implements Channel {
 
     // Find the main group to deliver the email notification
     const groups = this.opts.registeredGroups();
-    const mainEntry = Object.entries(groups).find(
-      ([, g]) => g.isMain === true,
-    );
+    const mainEntry = Object.entries(groups).find(([, g]) => g.isMain === true);
 
     if (!mainEntry) {
       logger.debug(

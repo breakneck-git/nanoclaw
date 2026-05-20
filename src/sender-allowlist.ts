@@ -20,6 +20,11 @@ const DEFAULT_CONFIG: SenderAllowlistConfig = {
   logDenied: true,
 };
 
+// Last successfully-parsed config per file path. If the on-disk file goes
+// invalid (typo, partial write), keep using the previous good values
+// instead of silently widening trust to DEFAULT_CONFIG ({ allow: '*' }).
+const lastKnownGood = new Map<string, SenderAllowlistConfig>();
+
 function isValidEntry(entry: unknown): entry is ChatAllowlistEntry {
   if (!entry || typeof entry !== 'object') return false;
   const e = entry as Record<string, unknown>;
@@ -35,34 +40,45 @@ export function loadSenderAllowlist(
 ): SenderAllowlistConfig {
   const filePath = pathOverride ?? SENDER_ALLOWLIST_PATH;
 
+  // Fail-CLOSED on broken config: if we ever loaded a valid restrictive
+  // allowlist for this path, keep enforcing it after a typo / partial
+  // write. Falling back to DEFAULT_CONFIG (`allow: '*'`) silently widens
+  // trust to every sender — the exact opposite of what an allowlist is for.
+  const fallback = (reason: string, err?: unknown): SenderAllowlistConfig => {
+    const lkg = lastKnownGood.get(filePath);
+    if (lkg) {
+      logger.error(
+        { path: filePath, reason, err },
+        'sender-allowlist: keeping last-known-good config (refusing to fall back to permissive default)',
+      );
+      return lkg;
+    }
+    logger.warn(
+      { path: filePath, reason, err },
+      'sender-allowlist: using DEFAULT_CONFIG (no prior good config cached)',
+    );
+    return DEFAULT_CONFIG;
+  };
+
   let raw: string;
   try {
     raw = fs.readFileSync(filePath, 'utf-8');
   } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return DEFAULT_CONFIG;
-    logger.warn(
-      { err, path: filePath },
-      'sender-allowlist: cannot read config',
-    );
-    return DEFAULT_CONFIG;
+    return fallback('cannot read config', err);
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch {
-    logger.warn({ path: filePath }, 'sender-allowlist: invalid JSON');
-    return DEFAULT_CONFIG;
+  } catch (err) {
+    return fallback('invalid JSON', err);
   }
 
   const obj = parsed as Record<string, unknown>;
 
   if (!isValidEntry(obj.default)) {
-    logger.warn(
-      { path: filePath },
-      'sender-allowlist: invalid or missing default entry',
-    );
-    return DEFAULT_CONFIG;
+    return fallback('invalid or missing default entry');
   }
 
   const chats: Record<string, ChatAllowlistEntry> = {};
@@ -81,11 +97,18 @@ export function loadSenderAllowlist(
     }
   }
 
-  return {
+  const cfg: SenderAllowlistConfig = {
     default: obj.default as ChatAllowlistEntry,
     chats,
     logDenied: obj.logDenied !== false,
   };
+  lastKnownGood.set(filePath, cfg);
+  return cfg;
+}
+
+/** @internal — tests only. */
+export function _resetSenderAllowlistCache(): void {
+  lastKnownGood.clear();
 }
 
 function getEntry(
