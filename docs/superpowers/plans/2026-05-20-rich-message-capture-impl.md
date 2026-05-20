@@ -1,11 +1,12 @@
-# Rich Message Capture + Persistent People Memory Implementation Plan (v4)
+# Rich Message Capture + Persistent People Memory Implementation Plan (v5)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Spec:** `docs/superpowers/specs/2026-05-20-rich-message-capture-design.md` at commit `92ef68a` (v11, 1401 lines). All spec line references below are re-derived against this commit (v1 plan had systematically stale refs after v10/v11 spec additions shifted content by 50-300 lines).
 
 **Plan revisions:**
-- **v4 (this version, round-3 fixes)** — closes 5 v3 residuals: Task 10 Step 1 adds 2 missing trigger-3 tests (`type=chat`, `type=hidden_user`) — was 2 of 4 in v3; Task 8b split now produces 3 actual `### Task 8b-1/8b-2/8b-3` sub-headings each with own Files/Steps blocks (was prose-only in v3); Task 19 CROSS_GROUP_REJECTED test body now concrete (was `/* ... */` in v3); Task 19 commit step renumbered Step 4 → Step 6 (off-by-one).
+- **v5 (this version, round-4 fixes)** — closes 2 v4 structural defects in the Task 8b region: deleted orphaned duplicate Steps 2-5 (residue from original Task 8b that wasn't removed when 8b-1/8b-2/8b-3 sub-headings were inserted in v4); replaced parent Task 8b Step 1 with explicit "DO NOT EXECUTE — TEMPLATE ONLY" banner so an executing agent jumps directly to 8b-1/8b-2/8b-3 without first running the parent's test-skeleton + commit.
+- v4 (round-3 fixes) — closes 5 v3 residuals: Task 10 Step 1 adds 2 missing trigger-3 tests (`type=chat`, `type=hidden_user`) — was 2 of 4 in v3; Task 8b split now produces 3 actual `### Task 8b-1/8b-2/8b-3` sub-headings each with own Files/Steps blocks (was prose-only in v3); Task 19 CROSS_GROUP_REJECTED test body now concrete (was `/* ... */` in v3); Task 19 commit step renumbered Step 4 → Step 6 (off-by-one).
 - v3 (commit 605319d, round-2 fixes) — closed 13 v2 defects. Task 0 `git add -A` replaced with enumerated allowlist + secrets guard (CLAUDE.md compliance); Task 10 Step 3 adds module-scope placement directive + external_reply.origin trigger-3 branch + matching test; Task 15 preserves `processImage` body verbatim before deletion, Task 18 re-inlines it as a code block (not gloss); Task 20 spec line refs corrected (1024-1040 → 1159-1180 for scaffold; 1170-1196 → 1289-1313 for test body); Task 14 adds concrete multi-line worked example with per-site `opts` preservation rules; Tasks 16a/16b/16c/19/22 placeholder test bodies replaced with concrete `it()` implementations; Task 8b split mandatory into 8b-1/8b-2/8b-3; Task 17 adds container mount-path verification step.
 - v2 (commit 3d95622) — closed 19 v1 defects including systemic spec-line-ref staleness.
 - v1 (commit b95ba90) — initial plan.
@@ -727,7 +728,9 @@ git commit -m "feat(telegram): telegram-meta.ts skeleton with escape helpers + i
 
 **Spec refs:** tag reference table at **190-208** — every row enumerated.
 
-- [ ] **Step 1: Add concrete tests** (one `it()` per tag — NOT a placeholder enumeration):
+**DO NOT EXECUTE Task 8b directly.** Task 8b is the umbrella scope; execution happens in three sub-tasks below (`### Task 8b-1`, `### Task 8b-2`, `### Task 8b-3`). The umbrella's test-skeleton listing below is a **TEMPLATE** showing the full target test surface — each sub-task's Step 1 takes a slice of this template, fills in the `/* ... */` bodies, and commits independently. Skipping this entire test-skeleton section is safe: it produces no commit on its own.
+
+- [ ] **Step 1 (TEMPLATE ONLY — DO NOT EXECUTE; reproduced under each sub-task with its specific slice)**: full test surface for buildMetaBlock's Bot API 7.0+ coverage (one `it()` per tag):
 
 ```ts
 describe('buildMetaBlock — forward_origin', () => {
@@ -891,19 +894,6 @@ git commit -m "feat(telegram): buildMetaBlock media + sticker mime + transcript 
 ```bash
 git add src/channels/telegram-meta.ts src/channels/telegram-meta.test.ts
 git commit -m "feat(telegram): buildMetaBlock contact/location/poll/story/via_bot/link_preview/auto_fwd/edited coverage"
-```
-
-- [ ] **Step 2: Run, expect FAIL** for new cases.
-
-- [ ] **Step 3: Implement** the remaining tag handlers in `buildMetaBlock`. For `forward_origin`, **switch on `origin.type`** (NOT `origin.kind` — see spec line 195 round-10 disambiguation).
-
-- [ ] **Step 4: Run, expect PASS**
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/channels/telegram-meta.ts src/channels/telegram-meta.test.ts
-git commit -m "feat(telegram): buildMetaBlock full Bot API 7.0+ tag coverage"
 ```
 
 ---
