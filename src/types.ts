@@ -54,6 +54,8 @@ export interface NewMessage {
   thread_id?: string;
   /** Image attachments (base64-encoded) to pass to the agent as multimodal content */
   images?: import('./container-runner.js').ImageAttachment[];
+  /** Channel-specific structured metadata (JSON-serialized) for rich message capture. */
+  meta?: string;
 }
 
 export interface ScheduledTask {
@@ -99,7 +101,7 @@ export interface Channel {
     jid: string,
     text: string,
     opts?: SendMessageOptions,
-  ): Promise<void>;
+  ): Promise<{ messageId?: string } | void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
@@ -107,6 +109,8 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  // Optional: channel-specific identifier for the bot/sender (e.g. bot user ID).
+  botSenderId?(): string | undefined;
 }
 
 // Callback type that channels use to deliver inbound messages
