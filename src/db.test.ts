@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   _initTestDatabase,
   createTask,
+  db,
   deleteTask,
   getAllChats,
   getAllRegisteredGroups,
@@ -483,5 +484,37 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+});
+
+// --- contacts table ---
+
+describe('contacts table', () => {
+  beforeEach(() => _initTestDatabase());
+
+  it('inserts and reads a contacts row with all columns', () => {
+    db.prepare(
+      `
+      INSERT INTO contacts (
+        ident, scope, tg_id, username, kind, is_bot,
+        first_name, last_name, title, phone, link, bio,
+        first_seen, last_seen, seen_count, source, enriched, notes, tags
+      ) VALUES (
+        'g_main|id:42', 'g_main', '42', 'vasya', 'user', 0,
+        'Вася', 'Иванов', NULL, NULL, NULL, NULL,
+        '2026-05-20T10:00:00Z', '2026-05-20T10:00:00Z', 1, 'sender', 0, NULL, NULL
+      )
+    `,
+    ).run();
+    const row = db
+      .prepare(`SELECT * FROM contacts WHERE ident = ?`)
+      .get('g_main|id:42') as {
+      ident: string;
+      tg_id: string;
+      username: string;
+    };
+    expect(row.ident).toBe('g_main|id:42');
+    expect(row.tg_id).toBe('42');
+    expect(row.username).toBe('vasya');
   });
 });

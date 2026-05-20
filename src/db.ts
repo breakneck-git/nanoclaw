@@ -12,7 +12,7 @@ import {
   TaskRunLog,
 } from './types.js';
 
-let db: Database.Database;
+export let db: Database.Database;
 
 function createSchema(database: Database.Database): void {
   database.exec(`
@@ -82,6 +82,29 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS contacts (
+      ident       TEXT PRIMARY KEY,
+      scope       TEXT NOT NULL,
+      tg_id       TEXT,
+      username    TEXT,
+      kind        TEXT NOT NULL,
+      is_bot      INTEGER NOT NULL DEFAULT 0,
+      first_name  TEXT, last_name TEXT,
+      title       TEXT,
+      phone       TEXT,
+      link        TEXT,
+      bio         TEXT,
+      first_seen  TEXT NOT NULL,
+      last_seen   TEXT NOT NULL,
+      seen_count  INTEGER NOT NULL DEFAULT 1,
+      source      TEXT NOT NULL,
+      enriched    INTEGER NOT NULL DEFAULT 0,
+      notes       TEXT,
+      tags        TEXT
+    );
+    CREATE INDEX IF NOT EXISTS contacts_scope_username ON contacts(scope, username);
+    CREATE INDEX IF NOT EXISTS contacts_scope_tg_id    ON contacts(scope, tg_id);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -231,6 +254,35 @@ export interface ChatInfo {
   last_message_time: string;
   channel: string;
   is_group: number;
+}
+
+export interface ContactRow {
+  ident: string;
+  scope: string;
+  tg_id: string | null;
+  username: string | null;
+  kind: 'user' | 'hidden_user' | 'chat' | 'channel';
+  is_bot: number; // 0|1
+  first_name: string | null;
+  last_name: string | null;
+  title: string | null;
+  phone: string | null;
+  link: string | null;
+  bio: string | null;
+  first_seen: string; // ISO 8601
+  last_seen: string; // ISO 8601
+  seen_count: number;
+  source:
+    | 'sender'
+    | 'forward'
+    | 'reply'
+    | 'vcard'
+    | 'mention'
+    | 'text_mention'
+    | 'getChat';
+  enriched: number; // 0|1
+  notes: string | null; // agent-owned, never touched by host upsert
+  tags: string | null; // comma-separated; agent-owned
 }
 
 /**
