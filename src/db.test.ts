@@ -840,6 +840,130 @@ describe('lookupMessages', () => {
     });
     expect(rows.length).toBe(200); // server clamps to 200
   });
+
+  it('descending order by timestamp (empty filters)', () => {
+    for (let i = 0; i < 5; i++) {
+      storeMessage({
+        id: `m${i}`,
+        chat_jid: 'tg:1',
+        sender: 'u',
+        sender_name: 'U',
+        content: `msg${i}`,
+        timestamp: `2026-05-20T10:00:0${i}Z`,
+        is_from_me: false,
+        is_bot_message: false,
+      });
+    }
+    const rows = lookupMessages({
+      groupJids: ['tg:1'],
+      includeBot: false,
+      limit: 50,
+    });
+    expect(rows[0].id).toBe('m4'); // newest first
+    expect(rows[4].id).toBe('m0'); // oldest last
+  });
+
+  it('multi-JID IN-clause merges rows from multiple groups + excludes non-listed', () => {
+    storeMessage({
+      id: 'a',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'from1',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    storeMessage({
+      id: 'b',
+      chat_jid: 'tg:2',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'from2',
+      timestamp: '2026-05-20T10:00:01Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    storeMessage({
+      id: 'c',
+      chat_jid: 'tg:3',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'from3',
+      timestamp: '2026-05-20T10:00:02Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    storeMessage({
+      id: 'd',
+      chat_jid: 'tg:OTHER',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'from4',
+      timestamp: '2026-05-20T10:00:03Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    const rows = lookupMessages({
+      groupJids: ['tg:1', 'tg:2', 'tg:3'],
+      includeBot: false,
+      limit: 50,
+    });
+    expect(rows.map((r) => r.id).sort()).toEqual(['a', 'b', 'c']);
+    expect(rows.find((r) => r.id === 'd')).toBeUndefined();
+  });
+
+  it('non-finite limit (NaN) defaults to 50 instead of crashing', () => {
+    for (let i = 0; i < 100; i++) {
+      storeMessage({
+        id: `n${i}`,
+        chat_jid: 'tg:1',
+        sender: 'u',
+        sender_name: 'U',
+        content: `n${i}`,
+        timestamp: `2026-05-20T10:${String(i).padStart(2, '0')}:00Z`,
+        is_from_me: false,
+        is_bot_message: false,
+      });
+    }
+    const rows = lookupMessages({
+      groupJids: ['tg:1'],
+      includeBot: false,
+      limit: NaN,
+    });
+    expect(rows.length).toBe(50);
+  });
+
+  it('non-boolean includeBot defaults to false (only user rows)', () => {
+    storeMessage({
+      id: 'u1',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'hi',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    storeMessage({
+      id: 'b1',
+      chat_jid: 'tg:1',
+      sender: 'bot',
+      sender_name: 'Andy',
+      content: 'hello',
+      timestamp: '2026-05-20T10:01:00Z',
+      is_from_me: true,
+      is_bot_message: true,
+    });
+    const rows = lookupMessages({
+      groupJids: ['tg:1'],
+      // @ts-expect-error — testing runtime defense against non-boolean truthy values
+      includeBot: 'false',
+      limit: 50,
+    });
+    expect(rows.length).toBe(1); // string 'false' is NOT === true → bot row excluded
+    expect(rows[0].id).toBe('u1');
+  });
 });
 
 describe('buildQueryParam', () => {

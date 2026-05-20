@@ -605,25 +605,28 @@ export function lookupMessages(opts: {
   const since = opts.since ?? null;
   const until = opts.until ?? null;
   const queryParam = buildQueryParam(opts.query);
-  const clampedLimit = Math.min(Math.max(opts.limit, 1), 200);
+  // Defend against non-finite (NaN, Infinity, string from IPC JSON) — default to 50.
+  const clampedLimit = Math.min(
+    Math.max(Number.isFinite(opts.limit) ? opts.limit : 50, 1),
+    200,
+  );
 
-  return db
-    .prepare(sql)
-    .all(
-      ...opts.groupJids,
-      opts.includeBot ? 1 : 0,
-      tgMessageId,
-      tgMessageId,
-      senderId,
-      senderId,
-      since,
-      since,
-      until,
-      until,
-      queryParam,
-      queryParam,
-      clampedLimit,
-    ) as LookupRow[];
+  return db.prepare(sql).all(
+    ...opts.groupJids,
+    // Strict === true so non-boolean truthy values (e.g. string "false" via IPC) → 0.
+    opts.includeBot === true ? 1 : 0,
+    tgMessageId,
+    tgMessageId,
+    senderId,
+    senderId,
+    since,
+    since,
+    until,
+    until,
+    queryParam,
+    queryParam,
+    clampedLimit,
+  ) as LookupRow[];
 }
 
 export function createTask(
