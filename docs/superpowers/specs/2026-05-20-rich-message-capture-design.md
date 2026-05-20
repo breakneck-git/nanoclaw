@@ -3,7 +3,12 @@
 Design spec for letting the NanoClaw agent operate on the full data of every Telegram message it receives — including forward origin, mentioned/forwarded people, reply targets, and media — with a passive long-term contacts memory and on-demand media access.
 
 > **Revision history**
-> - **v10 (2026-05-20, after round 10 critical review)** — addresses 16 verified-true defects across 5 reviewer domains + 1 self-detected. SQL/DB domain returned ZERO findings at 100% confidence (genuinely converged). Round 9's "READY TO IMPLEMENT" verdict was premature — round 10's strict mandate ("истинно то, что невозможно опровергнуть", push back twice on confident claims, lead verifies every claim by reading file:line) surfaced 16 real defects, mostly compile-blocking or runtime-semantic.
+> - **v11 (2026-05-20, after round 11 verification + new-defect scan)** — addresses 4 issues v10 itself introduced (verifier confirmed 15/16 v10 closures landed, found 3 new defects + 1 partial closure):
+>   - **COMPILE-BLOCKING**: trigger row 1 worked example in `processContactsFromContext` put `username` in the patch object literal. `ContactPatch = Partial<Pick<ContactRow, 'first_name'|'last_name'|'title'|'phone'|'link'|'bio'|'is_bot'|'kind'>>` — `username` is NOT in the pick list (it's an identity column managed via `opts.identity`). TS strict-mode excess-property check rejects. v11 moves to `opts.identity.username`.
+>   - **FILES-TOUCHED COHERENCE**: v10 added a new `**MOD** src/index.ts:` bullet for the auto-vision cascade (line 1116) but left the pre-existing `**MOD** src/index.ts:` bullet (line 1132 — for the migration of 7 sendMessage sites) intact, creating two non-adjacent bullets for the same file with overlapping subordinate items. v11 merges into a single bullet covering both migration and auto-vision deletion.
+>   - **BEHAVIORAL REGRESSION**: v10's scheduler-lambda try/catch wrap (`catch (err) { logger.warn(...) }`) swallows ALL routeOutbound throws, not just the missing-channel case. The outer `task-scheduler.ts:214-223` catch — which marks the task as failed when `deps.sendMessage` throws — never fires after v10's wrap, so transient transport failures (429, 5xx, network) silently get recorded as `status: 'success'`. v11 narrows the catch: `if (err.message.startsWith('No channel for JID')) { warn + return; } else { throw err; }`.
+>   - **PARTIAL CLOSURE on round-10 fix #5**: v10 unified the `botSenderId` narrative (line 838) to `this.bot?.botInfo?.id ? String(...) : undefined`, but the Files-touched bullet (line ~1136) still had bare `this.bot.botInfo?.id ? ...` (missing the `this.bot?.` optional chain). Working tree `telegram.ts:223` declares `private bot: Bot | null`, so under TS `strict: true` the bare-access fails compile. v11 unifies both spots to the double-optional-chain form.
+> - v10 (2026-05-20, commit `94dd1ba`) — addressed 16 round-10 defects across 5 reviewer domains + 1 self-detected. Round 11 verified 15/16 closures landed cleanly and found 4 issues v10 itself introduced. SQL/DB domain returned ZERO findings at 100% confidence (genuinely converged). Round 9's "READY TO IMPLEMENT" verdict was premature — round 10's strict mandate ("истинно то, что невозможно опровергнуть", push back twice on confident claims, lead verifies every claim by reading file:line) surfaced 16 real defects, mostly compile-blocking or runtime-semantic.
 >   - **COMPILE-BLOCKING (4)**:
 >     - `ContactRow` type referenced 5+ times, defined nowhere. v10 inlines `interface ContactRow` in the schema section mirroring better-sqlite3's column-return type contract (TEXT → `string | null`, INTEGER NOT NULL → `number`).
 >     - `upsertContactSync({scope, source, ...})` (lines 345, 350) is an undefined symbol AND single-arg-object call shape contradicts the defined `upsertContact(scope, patch, opts)` 3-positional-arg signature. v10 inlines a worked example for trigger row 1 showing the patch-extraction rule.
@@ -399,13 +404,19 @@ function processContactsFromContext(ctx: Context, scope: string): void {
     upsertContact(
       scope,
       {
+        // Round-11 fix: `username` is an IDENTITY column per the ContactPatch
+        // definition's exclusion list — must NOT appear in the patch literal
+        // (TS strict-mode excess-property check would reject it). Pass via
+        // opts.identity.username below instead.
         kind: sc.type === 'channel' ? 'channel' : 'chat',
         title: 'title' in sc ? sc.title : null,
-        username: 'username' in sc ? sc.username ?? null : null,
         is_bot: 0,
       },
       {
-        identity: { tg_id: String(sc.id) },
+        identity: {
+          tg_id: String(sc.id),
+          username: 'username' in sc ? sc.username ?? undefined : undefined,
+        },
         source: 'sender',
       },
     );
@@ -844,7 +855,7 @@ Note on `channel = NULL, is_group = 0`: the hard-coded NULL/0 in the chats INSER
 Every existing site is replaced with `routeOutbound(channels, jid, text, opts)`:
 - `src/index.ts:304` (streaming output callback in `runAgent`)
 - `src/index.ts:647`, `667`, `676`, `682` (remote-control branches in `handleRemoteControl`; the `667` and `676` sites are multi-line calls — the listed line is the call expression's opening `channel.sendMessage(` token)
-- `src/index.ts:769` (one call inside the `deps.sendMessage` lambda passed to `startSchedulerLoop`; the lambda body spans lines 761-771). **Round-10 semantic preservation** (the scheduler lambda currently does `if (!channel) { logger.warn(...); return; }` — `routeOutbound` THROWS on missing channel, which would flip scheduled-task semantics to cursor-rollback-and-infinite-retry). v10 directs explicit try/catch on the migrated call site to preserve warn-and-skip behavior:
+- `src/index.ts:769` (one call inside the `deps.sendMessage` lambda passed to `startSchedulerLoop`; the lambda body spans lines 761-771). **Round-10/11 semantic preservation** (the scheduler lambda currently does `if (!channel) { logger.warn(...); return; }` — `routeOutbound` THROWS on missing channel; we want warn-and-skip ONLY for that case while preserving error propagation for transient send failures so the outer `task-scheduler.ts:214-223` catch can mark the task as failed). v11 narrows the catch to missing-channel only:
   ```ts
   // src/index.ts:761-771 — scheduler lambda after migration:
   sendMessage: async (jid, rawText) => {
@@ -853,12 +864,21 @@ Every existing site is replaced with `routeOutbound(channels, jid, text, opts)`:
     try {
       await routeOutbound(channels, jid, text, { threadId: lastThreadId[jid] });
     } catch (err) {
-      // Preserve v9's warn-and-skip behavior for scheduled tasks; a missing
-      // or disconnected channel must not surface as scheduler-error → retry storm.
-      logger.warn({ jid, err }, 'Scheduled task: failed to send via routeOutbound');
+      // Round-11 narrow catch: only swallow the "no channel" case. Any other
+      // throw (transport 5xx, 429, network, Markdown parse failures escaping
+      // sendTelegramMessage) MUST propagate so the outer task-scheduler.ts
+      // catch records the task as failed via recordTaskRun. A catch-all here
+      // would silently mark every undeliverable scheduled task as success.
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith('No channel for JID')) {
+        logger.warn({ jid }, 'Scheduled task: no channel owns JID, skipping');
+        return;
+      }
+      throw err;
     }
   },
   ```
+  Alternative if a typed exception class is preferred: define `class NoChannelError extends Error {}` in `src/router.ts`, throw that from `routeOutbound` instead of `new Error('No channel ...')`, and `instanceof NoChannelError`-check in the catch. Either approach is fine; the message-prefix check is the minimal-change form.
 - `src/index.ts:777` (one call inside the `deps.sendMessage` lambda passed to `startIpcWatcher`; the lambda body spans lines 773-778). This lambda already throws on missing channel (working-tree behavior) — `routeOutbound` propagates the throw, so semantics are preserved without an additional try/catch.
 
 Verified empirically (round-6 by agent dispatched against the working tree): `git grep -cE 'channel\.sendMessage\(' src/index.ts` returns exactly **7** — matches the seven sites enumerated above. The CI grep script in §8 returns precisely these 7 lines as violations on the pre-migration tree.
@@ -1004,7 +1024,7 @@ Host (`src/`):
   - Remove auto-vision in `message:photo` (no `processImage`, no `images` field on `NewMessage`).
   - **Rewrite `sendTelegramMessage`** as shown in §2 above — returns `Promise<{ messageId: string }>`.
   - **Rewrite `TelegramChannel.sendMessage`** as shown in §3 above — captures the first chunk's id.
-  - **Add `botSenderId(): string | undefined`** method (round-8): returns `this.bot.botInfo?.id ? String(this.bot.botInfo.id) : undefined`. `bot.botInfo` is populated by grammy after `bot.init()` completes; before then it may be undefined — the optional method signature accommodates that.
+  - **Add `botSenderId(): string | undefined`** method (round-8, round-11 fix — optional chain on `this.bot` added): returns `this.bot?.botInfo?.id ? String(this.bot.botInfo.id) : undefined`. Working-tree `TelegramChannel.bot: Bot | null` (telegram.ts:223) means the `this.bot?.` optional chain is required under TS `strict: true`. `bot.botInfo` is populated by grammy after `bot.init()` completes; before then it may be undefined — the optional method signature + double-optional-chain accommodates that.
 - **MOD** `src/db.ts`:
   - **`ALTER TABLE messages ADD COLUMN meta TEXT` made idempotent via PRAGMA-check wrapper** (SQLite raises `duplicate column name: meta` if the column already exists, so a naked `ALTER TABLE` is NOT idempotent across restarts):
     ```ts
@@ -1107,14 +1127,16 @@ Host (`src/`):
   - **Remove `import { downloadImage, processImage } from '../image.js'`** at line 4.
   - **Remove the `images: ImageAttachment[]` inline-import type at line 427** (and any local `images` variable construction).
   - **Remove any `processImage(...)` call inside the `message:photo` handler** — photos now flow through the structured-meta path (file_id only, no base64 inlining).
-- **MOD** `src/index.ts` — auto-vision deletion (round-10 cascade fix; v9 enumerated only 2 of 5 sites). Working-tree references to remove:
-  - Line 86: `const pendingImages = new Map<...>()` Map declaration.
-  - Line 88: `import('./container-runner.js').ImageAttachment[]` type ref.
-  - Line 242: `const batchImages: import('...ImageAttachment[]) = [];` local.
-  - Line 365: `images?: import('...ImageAttachment[]),` lambda param.
-  - Line 530, 549: `hasImages` branch in `processGroupMessages`.
-  - Line 720: `pendingImages.set(...)` write.
-  - All call sites that funnel images into `runAgent` / `runContainerAgent` payloads.
+- **MOD** `src/index.ts` (round-11 merge: previously had two separate bullets; combined here for coherence):
+  - **Migrate seven direct `channel.sendMessage(...)`** to `routeOutbound(channels, jid, text, opts)` at lines **304, 647, 667, 676, 682, 769, 777** (the last two are the single call inside each `deps.sendMessage` lambda — lambda bodies span 761-771 and 773-778 respectively). See §7 above for the scheduler-lambda try/catch wrap that preserves warn-and-skip semantics.
+  - **Auto-vision deletion (round-10 cascade)** — working-tree references to remove:
+    - Line 86: `const pendingImages = new Map<...>()` Map declaration.
+    - Line 88: `import('./container-runner.js').ImageAttachment[]` type ref.
+    - Line 242: `const batchImages: import('...ImageAttachment[]) = [];` local.
+    - Line 365: `images?: import('...ImageAttachment[]),` lambda param.
+    - Lines 530, 549: `hasImages` branch in `processGroupMessages`.
+    - Line 720: `pendingImages.set(...)` write.
+    - All call sites that funnel images into `runAgent` / `runContainerAgent` payloads.
 - **MOD** `src/router.ts`:
   - `formatMessages` reads both `content` and `meta`. When `meta` present: `<message ...>${meta}\n${content ? '<text>' + escapeXmlText(content) + '</text>' : ''}</message>`. When `meta` NULL: legacy `<message ...>${escapeXmlText(content)}</message>`. The `meta` payload is emitted verbatim (host pre-escaped every attribute at build time via `escapeXmlAttr` and every element-text-content via `escapeXmlText`).
   - **`routeOutbound`** as shown in §5 above — isolation of send vs store.
@@ -1123,9 +1145,6 @@ Host (`src/`):
   - **Add `Channel.botSenderId?(): string | undefined`** (round-8 fix — `routeOutbound` calls `channel.botSenderId?.()` to thread per-channel bot identity into `storeOutboundMessage.sender`; without this declaration TypeScript compile fails).
   - Add `NewMessage.meta?: string`.
   - **Remove `NewMessage.images?: ImageAttachment[]`** (auto-vision deprecated; nothing should produce or consume it post-migration). The `ImageAttachment` type itself can be removed if no other consumer exists — confirm with a grep before deletion.
-- **MOD** `src/index.ts`:
-  - All seven direct `channel.sendMessage(...)` migrated to `routeOutbound(channels, jid, text, opts)` at lines **304, 647, 667, 676, 682, 769, 777** (the last two are the single call inside each `deps.sendMessage` lambda — lambda bodies span 761-771 and 773-778 respectively).
-  - Delete `pendingImages` Map and `hasImages` branch.
 - **MOD** `src/channels/gmail.ts`:
   - `sendMessage` as shown in §4 above; handles `id | null | undefined` and `''` (truthy fallback).
   - **Add `botSenderId(): string | undefined`** method (round-8): returns the configured `'me'`-resolved email address if available (from `gmail.users.getProfile({userId: 'me'})` cached at connect time), otherwise undefined. If no profile cache is added, return undefined and the synthetic-sender fallback `'bot'` applies — acceptable since Gmail outbound IDs are already opaque, sender-based queries are less likely for Gmail.
