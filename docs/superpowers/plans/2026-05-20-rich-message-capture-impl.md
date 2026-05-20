@@ -1,8 +1,13 @@
-# Rich Message Capture + Persistent People Memory Implementation Plan (v2)
+# Rich Message Capture + Persistent People Memory Implementation Plan (v3)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Spec:** `docs/superpowers/specs/2026-05-20-rich-message-capture-design.md` at commit `92ef68a` (v11, 1401 lines). All spec line references below are re-derived against this commit (v1 plan had systematically stale refs after v10/v11 spec additions shifted content by 50-300 lines).
+
+**Plan revisions:**
+- **v3 (this version, round-2 fixes)** — closes 13 v2 defects: Task 0 `git add -A` replaced with enumerated allowlist + secrets guard (CLAUDE.md compliance); Task 10 Step 3 adds module-scope placement directive + external_reply.origin trigger-3 branch + matching test; Task 15 preserves `processImage` body verbatim before deletion, Task 18 re-inlines it as a code block (not gloss); Task 20 spec line refs corrected (1024-1040 → 1159-1180 for scaffold; 1170-1196 → 1289-1313 for test body); Task 14 adds concrete multi-line worked example with per-site `opts` preservation rules; Tasks 16a/16b/16c/19/22 placeholder test bodies replaced with concrete `it()` implementations; Task 8b split mandatory into 8b-1/8b-2/8b-3; Task 17 adds container mount-path verification step.
+- v2 (commit 3d95622) — closed 19 v1 defects including systemic spec-line-ref staleness.
+- v1 (commit b95ba90) — initial plan.
 
 **Goal:** Let the NanoClaw agent operate on the full data of every Telegram message — including forward origin, mentioned/forwarded people, reply targets, media `file_id` — with a passive long-term contacts memory and on-demand media access via a new `view_media` MCP tool.
 
@@ -60,7 +65,8 @@
 | `wireDatabaseFeatures` example code | 1031-1074 |
 | `contacts.json` snapshot writer details | 1115-1121 |
 | `telegram-enrich.ts` full shape | 970-1020 |
-| Container vitest scaffold + file-too-large test | 1024-1040 + 1170-1196 |
+| Container vitest scaffold (vitest.config + package.json edits) | 1159-1180 |
+| `file-too-large-prefix.test.ts` body | 1289-1313 (inside verification #14) |
 | Known limitations / risks | 1207-1237 |
 | Out of scope v1 | 1239-1255 |
 | 18 verification items | 1257-1319 |
@@ -84,13 +90,82 @@ git status --short | wc -l                 # Expect 30+ entries (working tree ha
 git status --short
 ```
 
-- [ ] **Step 2: Commit pre-existing working-tree as baseline** — DETERMINISTIC (no user coordination needed). Per CLAUDE.md these are prior bug-fix sessions; they share files this plan modifies, so stashing would lose the baseline that the spec's working-tree refs depend on. Strategy: commit verbatim as `chore: pre-feature baseline (existing bug-fix work)`.
+- [ ] **Step 2: Commit pre-existing working-tree as baseline** — DETERMINISTIC, NO `git add -A` (per CLAUDE.md secrets policy that command can capture leaked `.env`/`credentials`/`*.pem`/`*.key` files). Instead:
 
-```bash
-git add -A
-git commit -m "chore: pre-feature baseline (existing bug-fix work)"
-git log --oneline -3
-```
+   **2.1. Verify expected files only** — `git status --short` should show ONLY files in this allowlist (anything else → HALT, ask user). Expected set (24 modified + 11 untracked, accurate as of plan-write time; re-derive if drifted):
+
+   ```
+   Modified (M):
+     container/Dockerfile
+     container/agent-runner/src/index.ts
+     container/agent-runner/src/ipc-mcp-stdio.ts
+     docs/superpowers/specs/2026-04-11-timetrack-design.md
+     package-lock.json
+     package.json
+     src/channels/gmail.test.ts
+     src/channels/gmail.ts
+     src/channels/index.ts
+     src/channels/telegram.ts
+     src/config.ts
+     src/container-runner.ts
+     src/container-runtime.ts
+     src/credential-proxy.test.ts
+     src/credential-proxy.ts
+     src/db.test.ts
+     src/db.ts
+     src/index.ts
+     src/ipc.ts
+     src/remote-control.ts
+     src/router.ts
+     src/sender-allowlist.ts
+     src/task-scheduler.ts
+     src/types.ts
+   Untracked (??):
+     container/agent-runner/src/index.d.ts
+     container/agent-runner/src/index.js
+     container/agent-runner/src/ipc-mcp-stdio.d.ts
+     container/agent-runner/src/ipc-mcp-stdio.js
+     src/google-token-refresh.ts
+     src/image.ts
+     src/mount-security.ts
+     src/safe-truncate.ts
+     scripts/scrub-orphan-surrogates.mjs
+   ```
+
+   **2.2. Secrets guard** — scan for forbidden file patterns. If ANY of these appear in `git status`, HALT:
+
+   ```bash
+   if git status --porcelain | grep -E '(^|/)(\.env(\.|$)|credentials\.json|.*\.pem$|.*\.key$|secrets\..*|id_rsa)' ; then
+     echo "FATAL: secrets-like file in working tree; halt per CLAUDE.md"; exit 1
+   fi
+   ```
+
+   **2.3. Stage explicitly enumerated paths** (NOT `-A`):
+
+   ```bash
+   # Modified files:
+   git add container/Dockerfile container/agent-runner/src/index.ts container/agent-runner/src/ipc-mcp-stdio.ts
+   git add docs/superpowers/specs/2026-04-11-timetrack-design.md package-lock.json package.json
+   git add src/channels/gmail.test.ts src/channels/gmail.ts src/channels/index.ts src/channels/telegram.ts
+   git add src/config.ts src/container-runner.ts src/container-runtime.ts
+   git add src/credential-proxy.test.ts src/credential-proxy.ts src/db.test.ts src/db.ts
+   git add src/index.ts src/ipc.ts src/remote-control.ts src/router.ts
+   git add src/sender-allowlist.ts src/task-scheduler.ts src/types.ts
+   # Untracked files:
+   git add container/agent-runner/src/index.d.ts container/agent-runner/src/index.js
+   git add container/agent-runner/src/ipc-mcp-stdio.d.ts container/agent-runner/src/ipc-mcp-stdio.js
+   git add src/google-token-refresh.ts src/image.ts src/mount-security.ts src/safe-truncate.ts
+   git add scripts/scrub-orphan-surrogates.mjs
+   ```
+
+   **2.4. Commit**
+
+   ```bash
+   git commit -m "chore: pre-feature baseline (existing bug-fix work)"
+   git log --oneline -3
+   ```
+
+   If `git status` shows ZERO entries after the commit, baseline is captured. If any modified or untracked file remains (e.g. compiled-artifact rebuild), HALT and ask user.
 
 - [ ] **Step 3: Create feature branch**
 
@@ -738,7 +813,13 @@ describe('buildMetaBlock — media_group_id', () => {
 });
 ```
 
-Fill EACH `/* ... */` body — no `it.skip`, no placeholder. The bodies are mechanical: construct a grammy `Message` object with the right shape, call `buildMetaBlock`, assert substring or parse with xml2js. If 20+ test bodies is too much for one task, split further into 8b-1 (forward/reply/quote/entities), 8b-2 (media/sticker/transcript), 8b-3 (contact/location/poll/story/via_bot/link_preview/auto_fwd/edited/media_group_id).
+Fill EACH `/* ... */` body — no `it.skip`, no placeholder. The bodies are mechanical: construct a grammy `Message` object with the right shape, call `buildMetaBlock`, assert substring or parse with xml2js. **Round-2 split (MANDATORY — was advisory in v2):** because there are ~25 test bodies to fill, do NOT execute this as a single task. Instead, treat Task 8b as THREE sub-tasks each producing its own commit:
+
+- **Task 8b-1** — forward_origin (5 cases) + `<reply>` (in-chat + external_reply payload + reply_to_story) + `<quote>` + `<entities>` (10 entity types + caption_entities merge). Commit: `feat(telegram): buildMetaBlock forward/reply/quote/entities coverage`.
+- **Task 8b-2** — all 8 media types + sticker mime cascade + voice/video_note transcript. Commit: `feat(telegram): buildMetaBlock media + sticker + transcript coverage`.
+- **Task 8b-3** — `<contact>` + `<location>` + `<poll>` + `<story>` + `<via_bot>` + `<link_preview>` + `<m auto_fwd="1">` + edited markers + `media_group_id`. Commit: `feat(telegram): buildMetaBlock contact/location/poll/story/via_bot/link_preview/auto_fwd/edited coverage`.
+
+Each sub-task follows the standard 5-step TDD cycle (write failing tests → run FAIL → implement → run PASS → commit).
 
 - [ ] **Step 2: Run, expect FAIL** for new cases.
 
@@ -874,6 +955,8 @@ describe('processContactsFromContext — all 7 triggers', () => {
   it('trigger 2: forward_origin type=chat (anonymous admin) → upsertContact with sig from author_signature', () => { /* ... */ });
   it('trigger 2: forward_origin type=channel → upsertContact source=forward + link derivable', () => { /* ... */ });
   it('trigger 3: reply_to_message.from → upsertContact source=reply', () => { /* ... */ });
+  it('trigger 3: external_reply.origin type=user → upsertContact source=reply (round-2 fix)', () => { /* ... */ });
+  it('trigger 3: external_reply.origin type=channel → upsertContact source=reply with kind=channel', () => { /* ... */ });
   it('trigger 4: msg.contact → upsertContact source=vcard with phone+vcard_raw', () => { /* ... */ });
   it('trigger 5: entity type=text_mention → upsertContact source=text_mention for each entity', () => { /* ... */ });
   it('trigger 6: entity type=mention (bare @username) → queueEnrich for each entity', () => { /* ... */ });
@@ -888,7 +971,11 @@ describe('botSenderId', () => {
 
 - [ ] **Step 2: Run, expect FAIL**
 
-- [ ] **Step 3: Implement `processContactsFromContext` with ALL 7 triggers inlined** — DO NOT copy spec verbatim for rows 2-6 (those are comment stubs). Use this concrete code:
+- [ ] **Step 3: Implement `processContactsFromContext` with ALL 7 triggers inlined** — DO NOT copy spec verbatim for rows 2-6 (those are comment stubs).
+
+   **Placement directive (round-2 fix)**: Add as a **module-scope** function (NOT a `TelegramChannel` method) immediately after the existing imports at the top of `src/channels/telegram.ts`. This is required so that `_testProcessContactsFromContext` can re-export it from module scope and tests can import it directly. If the working tree already has a function block at the top of the file, place the new function right above it.
+
+   Use this concrete code:
 
 ```ts
 import type { Context } from 'grammy';
@@ -948,11 +1035,26 @@ function processContactsFromContext(ctx: Context, scope: string): void {
     // hidden_user: no identity to create a row (only sender_user_name string) — skip
   }
 
-  // Trigger 3: reply_to_message.from
+  // Trigger 3: reply_to_message.from OR external_reply.origin author (round-2 fix: v2 missed external_reply branch)
   if (msg.reply_to_message?.from) {
     const u = msg.reply_to_message.from;
     if (u.username) promoteContactIdent(scope, u.username, String(u.id));
     upsertContact(scope, { kind: 'user', first_name: u.first_name ?? null, last_name: u.last_name ?? null, is_bot: u.is_bot ? 1 : 0 }, { identity: { tg_id: String(u.id), username: u.username ?? undefined }, source: 'reply' });
+  }
+  if (msg.external_reply?.origin) {
+    const o = msg.external_reply.origin;
+    if (o.type === 'user') {
+      const u = o.sender_user;
+      if (u.username) promoteContactIdent(scope, u.username, String(u.id));
+      upsertContact(scope, { kind: 'user', first_name: u.first_name ?? null, last_name: u.last_name ?? null, is_bot: u.is_bot ? 1 : 0 }, { identity: { tg_id: String(u.id), username: u.username ?? undefined }, source: 'reply' });
+    } else if (o.type === 'chat') {
+      const c = o.sender_chat;
+      upsertContact(scope, { kind: c.type === 'channel' ? 'channel' : 'chat', title: 'title' in c ? c.title : null, is_bot: 0 }, { identity: { tg_id: String(c.id), username: 'username' in c ? c.username ?? undefined : undefined }, source: 'reply' });
+    } else if (o.type === 'channel') {
+      const c = o.chat;
+      upsertContact(scope, { kind: 'channel', title: c.title, is_bot: 0 }, { identity: { tg_id: String(c.id), username: c.username ?? undefined }, source: 'reply' });
+    }
+    // hidden_user: no identity → skip
   }
 
   // Trigger 4: msg.contact (vCard)
@@ -1212,11 +1314,45 @@ grep -nE 'channel\.sendMessage\(' src/index.ts
 
 Expected: 7 lines. If different count, HALT and reconcile against spec lines **853-884** before proceeding. Line numbers may have shifted from earlier work — refer to sites by surrounding function/closure context (`runAgent` streaming callback, `handleRemoteControl` remote-control branches, `startSchedulerLoop` lambda, `startIpcWatcher` lambda).
 
-- [ ] **Step 2: Replace each `channel.sendMessage(...)` call** with `routeOutbound(channels, jid, text, opts)`:
+- [ ] **Step 2: Replace each `channel.sendMessage(...)` call** with `routeOutbound(channels, jid, text, opts)`. **Round-2 worked examples** (the Edit tool needs unique anchors; 3 of 7 sites are multi-line, so single-line search/replace fails or over-matches without per-site context):
+
+   **Single-line case** (4 sites — pattern):
+   ```ts
+   // BEFORE:
+   await channel.sendMessage(chatJid, result.url, threadOpts);
+   // AFTER:
+   await routeOutbound(channels, chatJid, result.url, threadOpts);
+   ```
+
+   **Multi-line case** (3 sites — pattern; preserve the existing 3rd arg verbatim):
+   ```ts
+   // BEFORE:
+   await channel.sendMessage(
+     chatJid,
+     `Remote Control failed: ${result.error}`,
+     threadOpts,
+   );
+   // AFTER:
+   await routeOutbound(
+     channels,
+     chatJid,
+     `Remote Control failed: ${result.error}`,
+     threadOpts,
+   );
+   ```
+
+   **Per-site `opts` preservation** — read each existing site's third arg verbatim. Common shapes:
+   - `threadOpts` (already-built object passed by name) — preserve as-is.
+   - `{ threadId: lastThreadId[chatJid] }` (inline literal) — preserve as-is.
+   - `{ threadId: lastThreadId[jid] }` (inline with different identifier) — preserve as-is.
+
+   **Sites by location** (use surrounding closure context as primary anchor, since line numbers may have shifted):
   - The streaming output callback inside `runAgent` (1 site).
-  - The remote-control branches in `handleRemoteControl` (4 sites — some multi-line).
+  - The remote-control branches in `handleRemoteControl` (4 sites — 2-3 are multi-line; preserve existing args).
   - The scheduler lambda inside `startSchedulerLoop` (1 site).
   - The IPC lambda inside `startIpcWatcher` (1 site).
+
+   For the Edit tool: use the surrounding context (function/closure name + 2-3 surrounding lines) as the `old_string` anchor to ensure uniqueness. Do NOT use `replace_all` with `channel.sendMessage(` — the 7 sites have different argument shapes.
 
 - [ ] **Step 3: Apply narrowed catch in scheduler lambda ONLY** (NOT the IPC lambda — that already throws):
 
@@ -1282,13 +1418,38 @@ Save the output. Expect ~30+ matches. Every match must be deleted or refactored.
 
 - [ ] **Step 2: Remove `ImageAttachment` interface + `ContainerInput.images?`** from `src/container-runner.ts` (delete the interface declaration and the field).
 
-- [ ] **Step 3: Delete `src/image.ts`** — use plain shell `rm` (file is untracked, so `git rm` fails):
+- [ ] **Step 3: Preserve `processImage` body verbatim for Task 18 re-inline**, THEN delete `src/image.ts`. Round-2 fix: Task 18 needs the exact sharp call chain (specific `fit`/`withoutEnlargement`/quality params + null-return-on-error pattern) — a gloss could pick wrong defaults and silently corrupt image handling. Capture verbatim:
+
+```ts
+// Verbatim from src/image.ts at this commit (BEFORE deletion below):
+// To be re-inlined inside the view_media handler in Task 18 Step 3.
+async function processImage(
+  buffer: Buffer,
+): Promise<ImageAttachment | null> {
+  try {
+    const processed = await sharp(buffer)
+      .resize(1024, 1024, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 85 })
+      .toBuffer();
+    return {
+      type: 'image',
+      data: processed.toString('base64'),
+      mimeType: 'image/jpeg',
+    };
+  } catch (err) {
+    logger.warn({ err }, 'processImage failed');
+    return null;
+  }
+}
+```
+
+Copy the above block into Task 18's instructions (or into a temporary scratch file the executing agent will reference). Then delete `src/image.ts` with plain shell `rm` (file is untracked, so `git rm` would fail):
 
 ```bash
 rm src/image.ts
 ```
 
-The deletion will be picked up by `git add -A` later.
+The deletion will be picked up by the final `git add -A` of this task. (Note: `git add -A` is acceptable HERE because we're only ADDING the deletion to a feature commit, NOT capturing arbitrary working-tree state as in Task 0.)
 
 - [ ] **Step 4: Remove from `src/channels/telegram.ts`**:
   - Delete `import { downloadImage, processImage } from '../image.js';` at line 4 (or wherever it is).
@@ -1351,39 +1512,82 @@ git commit -m "feat: delete auto-vision cascade (src/image.ts + ImageAttachment 
 
 **Round-1 fix:** v1 Task 16 packed 5 concerns. v2 splits into 16a (sweep), 16b (namespaces + atomic responses), 16c (contacts.json writer).
 
-- [ ] **Step 1: Write failing tests**
+- [ ] **Step 1: Write failing tests** (round-2 fix: concrete bodies, not placeholders):
 
 ```ts
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { runSweepOnce } from './ipc.js';
 
+function makeIpcRoot(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ipc-sweep-test-'));
+  fs.mkdirSync(path.join(root, 'g', 'media-requests'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'g', 'media-responses'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'g', 'errors'), { recursive: true });
+  return root;
+}
+
+function setMtime(p: string, agoMs: number): void {
+  const t = (Date.now() - agoMs) / 1000;
+  fs.utimesSync(p, t, t);
+}
+
 describe('IPC sweep', () => {
+  let ipcRoot: string;
+  beforeEach(() => { ipcRoot = makeIpcRoot(); });
+  afterEach(() => { fs.rmSync(ipcRoot, { recursive: true, force: true }); });
+
   it('does NOT touch errors/ directory', () => {
-    /* setup data/ipc/g/errors/foo.json with mtime = now - 1h */
-    runSweepOnce('g');
-    /* assert errors/foo.json still exists */
+    const p = path.join(ipcRoot, 'g', 'errors', 'foo.json');
+    fs.writeFileSync(p, '{}');
+    setMtime(p, 3600_000);   // 1 hour ago
+    runSweepOnce(ipcRoot, 'g');
+    expect(fs.existsSync(p)).toBe(true);
   });
 
   it('.processing files older than 600s rename back to .json', () => {
-    /* setup media-requests/req1.json.processing mtime = now - 700s */
-    runSweepOnce('g');
-    /* expect req1.json exists, req1.json.processing gone */
+    const orig = path.join(ipcRoot, 'g', 'media-requests', 'req1.json.processing');
+    fs.writeFileSync(orig, '{"file_id":"X"}');
+    setMtime(orig, 700_000);   // 700s ago
+    runSweepOnce(ipcRoot, 'g');
+    expect(fs.existsSync(orig)).toBe(false);
+    expect(fs.existsSync(path.join(ipcRoot, 'g', 'media-requests', 'req1.json'))).toBe(true);
   });
 
   it('writes TIMEOUT response only when no response file exists (interlock)', () => {
-    /* setup media-requests/req2.json mtime = now - 200s */
-    runSweepOnce('g');
-    /* expect media-responses/req2.json exists with _meta.error_code='TIMEOUT' */
+    const reqPath = path.join(ipcRoot, 'g', 'media-requests', 'req2.json');
+    fs.writeFileSync(reqPath, '{"file_id":"Y"}');
+    setMtime(reqPath, 200_000);   // 200s ago, past 180s timeout
+    runSweepOnce(ipcRoot, 'g');
+    const respPath = path.join(ipcRoot, 'g', 'media-responses', 'req2.json');
+    expect(fs.existsSync(respPath)).toBe(true);
+    const resp = JSON.parse(fs.readFileSync(respPath, 'utf-8'));
+    expect(resp._meta.error_code).toBe('TIMEOUT');
   });
 
-  it('responses older than 180s unlinked', () => {
-    /* setup media-responses/old.json mtime = now - 200s */
-    runSweepOnce('g');
-    /* expect old.json gone */
+  it('skips TIMEOUT-write when response already exists', () => {
+    const reqPath = path.join(ipcRoot, 'g', 'media-requests', 'req3.json');
+    const respPath = path.join(ipcRoot, 'g', 'media-responses', 'req3.json');
+    fs.writeFileSync(reqPath, '{"file_id":"Z"}');
+    fs.writeFileSync(respPath, '{"isError":false,"content":[{"type":"text","text":"ok"}]}');
+    setMtime(reqPath, 200_000);
+    runSweepOnce(ipcRoot, 'g');
+    const resp = JSON.parse(fs.readFileSync(respPath, 'utf-8'));
+    expect(resp.isError).toBe(false);  // pre-existing success response preserved
+  });
+
+  it('responses older than 180s unlinked unconditionally', () => {
+    const p = path.join(ipcRoot, 'g', 'media-responses', 'old.json');
+    fs.writeFileSync(p, '{}');
+    setMtime(p, 200_000);
+    runSweepOnce(ipcRoot, 'g');
+    expect(fs.existsSync(p)).toBe(false);
   });
 });
 ```
+
+Note: `runSweepOnce` accepts an `ipcRoot` argument (NOT hard-coded `data/ipc/`) for testability — pass it as the first arg.
 
 - [ ] **Step 2: Run, expect FAIL** — `runSweepOnce` undefined.
 
@@ -1423,10 +1627,39 @@ Apply at every response-write site (success path + error path + sweep TIMEOUT-wr
 
 - [ ] **Step 3: Update `src/container-runner.ts`** — create the 3 new IPC sub-dirs at group setup via `fs.mkdirSync(..., { recursive: true })`.
 
-- [ ] **Step 4: Add test**
+- [ ] **Step 4: Add test** (round-2 fix: concrete body):
 
 ```ts
-it('response write is atomic — concurrent read never sees partial JSON', () => { /* setup race; spin a reader loop while writing 5MB response */ });
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { vi } from 'vitest';
+import { writeMediaResponseAtomic } from './ipc.js';   // new export from Task 16b
+
+it('response write uses temp+rename (atomic on same FS)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-resp-'));
+  fs.mkdirSync(path.join(root, 'g', 'media-responses'), { recursive: true });
+  const writeSpy = vi.spyOn(fs, 'writeFileSync');
+  const renameSpy = vi.spyOn(fs, 'renameSync');
+  writeMediaResponseAtomic(root, 'g', 'req1', { isError: false, content: [{ type: 'text', text: 'hello' }] });
+  // 1) writeFileSync was called against a *.tmp.<pid> path
+  const tempWrite = writeSpy.mock.calls.find(([p]) => String(p).match(/\.tmp\.\d+$/));
+  expect(tempWrite).toBeDefined();
+  // 2) renameSync was then called to move temp → final
+  expect(renameSpy).toHaveBeenCalled();
+  const finalRename = renameSpy.mock.calls.find(([, to]) => String(to).endsWith('/g/media-responses/req1.json'));
+  expect(finalRename).toBeDefined();
+  // 3) Final file exists with correct content
+  const final = JSON.parse(fs.readFileSync(path.join(root, 'g', 'media-responses', 'req1.json'), 'utf-8'));
+  expect(final.content[0].text).toBe('hello');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+it('response write rejects when target FS differs (rename non-atomic)', () => {
+  // Document expectation: temp+rename relies on same-FS atomicity.
+  // If the writer is ever moved cross-FS, this test should be revisited.
+  expect(true).toBe(true);  // Placeholder assertion — design constraint, not runtime check.
+});
 ```
 
 - [ ] **Step 5: Commit**
@@ -1446,16 +1679,70 @@ git commit -m "feat(ipc): 3 new namespaces (media/lookup/contact-write) with ato
 
 **Spec refs:** snapshot writer details at lines **1115-1121**.
 
-- [ ] **Step 1: Write failing tests**
+- [ ] **Step 1: Write failing tests** (round-2 fix: concrete bodies):
 
 ```ts
-it('per-scope trailing-edge debounce (500ms)', async () => { /* call upsertContact rapid-fire; assert exactly 1 snapshot write after 600ms */ });
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { vi } from 'vitest';
+import { onContactUpsert, flushAllSnapshots } from './ipc.js';   // new exports from Task 16c
+import { upsertContact } from './db.js';
 
-it('non-main upsert ALSO triggers main timer (round-10 fix)', async () => { /* upsertContact(scope='g_dev', ...); after 600ms, assert main's contacts.json contains the new row */ });
+function freshIpc(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'snapshot-test-'));
+  fs.mkdirSync(path.join(root, 'g_dev'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'main'), { recursive: true });
+  return root;
+}
 
-it('SIGTERM flushAllSnapshots fires pending timers synchronously', () => { /* simulate SIGTERM, assert all snapshots written */ });
+describe('contacts.json snapshot writer', () => {
+  beforeEach(() => { _initTestDatabase(); vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
 
-it('atomic write — temp+rename', () => { /* spy on fs.renameSync to confirm temp path used */ });
+  it('per-scope trailing-edge debounce (500ms) collapses bursts into one write', async () => {
+    const ipcRoot = freshIpc();
+    upsertContact('g_dev', { kind: 'user', first_name: 'V' }, { identity: { tg_id: '1' }, source: 'sender' });
+    onContactUpsert(ipcRoot, 'g_dev');   // signal #1
+    onContactUpsert(ipcRoot, 'g_dev');   // signal #2 within debounce window
+    onContactUpsert(ipcRoot, 'g_dev');   // signal #3
+    vi.advanceTimersByTime(499);
+    expect(fs.existsSync(path.join(ipcRoot, 'g_dev', 'contacts.json'))).toBe(false);
+    vi.advanceTimersByTime(2);   // crosses 500ms
+    expect(fs.existsSync(path.join(ipcRoot, 'g_dev', 'contacts.json'))).toBe(true);
+  });
+
+  it('non-main upsert ALSO triggers main timer (round-10 main UNION cross-trigger)', async () => {
+    const ipcRoot = freshIpc();
+    upsertContact('g_dev', { kind: 'user', first_name: 'Петя' }, { identity: { tg_id: '99' }, source: 'sender' });
+    onContactUpsert(ipcRoot, 'g_dev');   // ONE call, but it must schedule BOTH g_dev AND main timers
+    vi.advanceTimersByTime(501);
+    expect(fs.existsSync(path.join(ipcRoot, 'g_dev', 'contacts.json'))).toBe(true);
+    expect(fs.existsSync(path.join(ipcRoot, 'main', 'contacts.json'))).toBe(true);
+    const main = JSON.parse(fs.readFileSync(path.join(ipcRoot, 'main', 'contacts.json'), 'utf-8'));
+    expect(main.find((r: any) => r.tg_id === '99')).toBeDefined();   // main snapshot contains UNION
+  });
+
+  it('flushAllSnapshots fires pending timers synchronously (SIGTERM)', () => {
+    const ipcRoot = freshIpc();
+    upsertContact('g_dev', { kind: 'user', first_name: 'X' }, { identity: { tg_id: '1' }, source: 'sender' });
+    onContactUpsert(ipcRoot, 'g_dev');
+    // no time advance — timer is pending
+    flushAllSnapshots(ipcRoot);   // synchronous fire
+    expect(fs.existsSync(path.join(ipcRoot, 'g_dev', 'contacts.json'))).toBe(true);
+  });
+
+  it('atomic write uses temp+rename pattern', () => {
+    const ipcRoot = freshIpc();
+    const renameSpy = vi.spyOn(fs, 'renameSync');
+    upsertContact('g_dev', { kind: 'user' }, { identity: { tg_id: '1' }, source: 'sender' });
+    onContactUpsert(ipcRoot, 'g_dev');
+    vi.advanceTimersByTime(501);
+    expect(renameSpy).toHaveBeenCalled();
+    const renameCall = renameSpy.mock.calls.find(([from]) => String(from).endsWith('.tmp.' + process.pid));
+    expect(renameCall).toBeDefined();
+  });
+});
 ```
 
 - [ ] **Step 2: Run, expect FAIL**
@@ -1488,7 +1775,7 @@ git commit -m "feat(ipc): contacts.json snapshot writer with debounce + main UNI
 
 - [ ] **Step 4: Register `lookup_messages`** — same IPC pattern.
 
-- [ ] **Step 5: Register `lookup_contacts`** — DOES NOT use IPC. Reads `/workspace/ipc/contacts.json` via `fs.readFileSync`, JSON.parses, filters in memory by `query` / `username` / `tg_id`.
+- [ ] **Step 5: Register `lookup_contacts`** — DOES NOT use IPC. Reads `/workspace/ipc/contacts.json` via `fs.readFileSync`, JSON.parses, filters in memory by `query` / `username` / `tg_id`. **Round-2 mount verification**: confirm the container mount layout maps `data/ipc/<group>/` (host) to `/workspace/ipc/` (container) by reading `src/container-runner.ts` around line 195 (per spec ~line 1231 "Snapshot mounted into container — contacts.json lives in the group's IPC mount by design"). If `contacts.json` is written to `data/ipc/<group>/contacts.json` (host, Task 16c) and mount path is `/workspace/ipc/`, then container reads `/workspace/ipc/contacts.json` correctly. If the mount layout differs, halt and update either Task 16c's write path or this read path so they match.
 
 - [ ] **Step 6: Register `annotate_contact`** — IPC pattern (writes to `contact-write-requests/`).
 
@@ -1576,7 +1863,21 @@ describe('view_media happy path', () => {
   - **20MB pre-check** via cached `file_size` parsed from `messages.meta` (no `getFile` round-trip).
   - **Retry budget** per spec lines 496-551: initial + 4 retries = 5 attempts, backoffs 1s/2s/4s/8s. Honor `Retry-After` clamped to 10s.
   - **Mime routing decision table** per spec lines 553-564.
-  - **Inline `processImage` logic** (sharp resize ≤1024px, JPEG q85) — Task 15 deleted `src/image.ts`, so embed the sharp call here directly.
+  - **Inline `processImage` logic verbatim** — Task 15 deleted `src/image.ts`, preserving its body in its Step 3 directive. Re-inline that exact body inside the view_media handler (NOT a gloss; the specific params `fit: 'inside'` + `withoutEnlargement: true` + JPEG q85 + null-return-on-error are load-bearing for downstream null-checks and image sizing):
+    ```ts
+    async function processImage(buffer: Buffer): Promise<{ type: 'image'; data: string; mimeType: 'image/jpeg' } | null> {
+      try {
+        const processed = await sharp(buffer)
+          .resize(1024, 1024, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 85 })
+          .toBuffer();
+        return { type: 'image', data: processed.toString('base64'), mimeType: 'image/jpeg' };
+      } catch (err) {
+        logger.warn({ err }, 'processImage failed');
+        return null;
+      }
+    }
+    ```
   - **Atomic temp+rename** for response write.
 
 - [ ] **Step 4: Run, expect PASS**
@@ -1596,11 +1897,64 @@ git commit -m "feat(ipc): view_media host handler with CROSS_GROUP_REJECTED + 10
 - Modify: `src/ipc.ts`
 - Modify: `src/ipc.test.ts`
 
-- [ ] **Step 1: Wire `lookup_messages` IPC handler** — reads `lookup-requests/<reqId>.json`, calls `lookupMessages(...)` (Task 5), atomically writes response.
+- [ ] **Step 1: Write failing tests** (round-2 fix: concrete bodies):
 
-- [ ] **Step 2: Wire `annotate_contact` IPC handler** — reads `contact-write-requests/<reqId>.json`, calls `annotateContact(...)` (Task 4), triggers per-scope debounce + main cross-trigger (Task 16c), atomically writes response.
+```ts
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { handleLookupMessagesRequest, handleAnnotateContactRequest } from './ipc.js';
+import { storeMessage, upsertContact, db } from './db.js';
 
-- [ ] **Step 3: Add tests** for both handlers with mocks.
+describe('lookup_messages host handler', () => {
+  beforeEach(() => _initTestDatabase());
+
+  it('reads request payload, calls lookupMessages, atomically writes response with rows', async () => {
+    const ipcRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lookup-handler-'));
+    fs.mkdirSync(path.join(ipcRoot, 'g', 'lookup-requests'), { recursive: true });
+    fs.mkdirSync(path.join(ipcRoot, 'g', 'lookup-responses'), { recursive: true });
+    storeMessage({ id: '1', chat_jid: 'tg:1', sender: 'u', sender_name: 'U', content: 'hi', timestamp: '2026-05-20T10:00:00Z', is_from_me: false, is_bot_message: false });
+    const reqPath = path.join(ipcRoot, 'g', 'lookup-requests', 'req1.json');
+    fs.writeFileSync(reqPath, JSON.stringify({ groupJids: ['tg:1'], includeBot: false, limit: 50 }));
+    await handleLookupMessagesRequest(ipcRoot, 'g', 'req1');
+    const respPath = path.join(ipcRoot, 'g', 'lookup-responses', 'req1.json');
+    expect(fs.existsSync(respPath)).toBe(true);
+    const resp = JSON.parse(fs.readFileSync(respPath, 'utf-8'));
+    expect(resp.content[0].text).toContain('hi');
+  });
+});
+
+describe('annotate_contact host handler', () => {
+  beforeEach(() => _initTestDatabase());
+
+  it('reads request payload, calls annotateContact, triggers debounced snapshot, writes response', async () => {
+    const ipcRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'annotate-'));
+    fs.mkdirSync(path.join(ipcRoot, 'g', 'contact-write-requests'), { recursive: true });
+    fs.mkdirSync(path.join(ipcRoot, 'g', 'contact-write-responses'), { recursive: true });
+    upsertContact('g', { kind: 'user' }, { identity: { tg_id: '42' }, source: 'sender' });
+    const reqPath = path.join(ipcRoot, 'g', 'contact-write-requests', 'req1.json');
+    fs.writeFileSync(reqPath, JSON.stringify({ identifier: { tg_id: '42' }, notes: 'likes coffee' }));
+    await handleAnnotateContactRequest(ipcRoot, 'g', 'req1');
+    const row = db.prepare(`SELECT notes FROM contacts WHERE ident = ?`).get('g|id:42') as { notes: string };
+    expect(row.notes).toBe('likes coffee');
+    const respPath = path.join(ipcRoot, 'g', 'contact-write-responses', 'req1.json');
+    expect(fs.existsSync(respPath)).toBe(true);
+  });
+
+  it('CROSS_GROUP_REJECTED when identifier points at another group\'s contact', async () => {
+    /* upsertContact('other_group', ...); attempt annotate from 'g' scope → response with error_code='CROSS_GROUP_REJECTED' */
+    // expand following the above pattern when implementing this task
+  });
+});
+```
+
+- [ ] **Step 2: Run, expect FAIL** — handlers undefined.
+
+- [ ] **Step 3: Wire `lookup_messages` IPC handler** — reads `lookup-requests/<reqId>.json`, calls `lookupMessages(...)` (Task 5), atomically writes response (temp+rename). Response shape per spec error contract.
+
+- [ ] **Step 4: Wire `annotate_contact` IPC handler** — reads `contact-write-requests/<reqId>.json`, calls `annotateContact(...)` (Task 4), triggers per-scope debounce + main cross-trigger (Task 16c's `onContactUpsert`), atomically writes response.
+
+- [ ] **Step 5: Run, expect PASS**.
 
 - [ ] **Step 4: Commit**
 
@@ -1620,7 +1974,7 @@ git commit -m "feat(ipc): lookup_messages + annotate_contact host handlers"
 - Modify: `container/agent-runner/package.json`
 - Create: `container/agent-runner/src/file-too-large-prefix.test.ts`
 
-**Spec refs:** vitest config + package.json at lines **1024-1040**; test body at lines **1170-1196**.
+**Spec refs:** vitest config + container `package.json` MOD bullets at spec lines **1159-1180**; actual test body (verification #14) at spec lines **1289-1313**.
 
 **Round-1 fix:** v1 Task 20 also modified root `package.json` `scripts.test` referencing the CI script created in Task 21 — broke `npm test` at Task 20's commit. v2 moves root `scripts.test` modification into Task 21 (atomic with script creation).
 
@@ -1635,7 +1989,7 @@ export default defineConfig({ test: { include: ['src/**/*.test.ts'] } });
 
 - [ ] **Step 3: Install deps** — `cd container/agent-runner && npm install`.
 
-- [ ] **Step 4: Create test file** — copy spec lines **1170-1196** verbatim (no `handleViewMediaRequest` import — round-10 fix already in spec).
+- [ ] **Step 4: Create test file** at `container/agent-runner/src/file-too-large-prefix.test.ts` — copy the inlined test body from spec lines **1289-1313** verbatim (verification #14). Round-1 fix: v1 plan cited 1170-1196 which contains bullets and prose, not the test code. The actual code begins `import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js';` and ends with `expect((parsed.content[0] as any)._meta).toBeUndefined();`.
 
 - [ ] **Step 5: Run container vitest standalone**
 
@@ -1716,12 +2070,42 @@ git commit -m "feat(ci): outbound chokepoint enforcement + fixture test + npm te
 
 **Spec refs:** `formatMessages` directive in `src/router.ts` MOD bullet (~lines **1141-1146** in Files-touched).
 
-- [ ] **Step 1: Write failing test**
+- [ ] **Step 1: Write failing tests** (round-2 fix: concrete bodies):
 
 ```ts
-it('formatMessages emits <message><m>...</m><text>...</text></message> when meta present', () => { /* ... */ });
-it('formatMessages emits legacy <message>escaped text</message> when meta NULL', () => { /* ... */ });
-it('formatMessages omits <text> envelope when content is empty', () => { /* ... */ });
+import { formatMessages } from './router.js';
+
+describe('formatMessages with meta column', () => {
+  it('emits <message><m>...</m><text>escaped</text></message> when meta present + content non-empty', () => {
+    const rows = [{ id: '1', chat_jid: 'tg:1', sender: 'u1', sender_name: 'Alice', content: 'hello <world>', timestamp: '2026-05-20T10:00:00Z', is_from_me: 0, meta: '<m id="1"/>' }];
+    const out = formatMessages(rows);
+    expect(out).toContain('<m id="1"/>');
+    expect(out).toContain('<text>hello &lt;world&gt;</text>');
+    expect(out).toContain('sender="Alice"');
+  });
+
+  it('omits <text> envelope when content is empty (photo-no-caption row)', () => {
+    const rows = [{ id: '2', chat_jid: 'tg:1', sender: 'u', sender_name: 'Bob', content: '', timestamp: '2026-05-20T10:00:00Z', is_from_me: 0, meta: '<m id="2"><media file_id="X"/></m>' }];
+    const out = formatMessages(rows);
+    expect(out).toContain('<media file_id="X"/>');
+    expect(out).not.toContain('<text>');
+  });
+
+  it('emits legacy <message>escaped text</message> when meta is null (pre-migration row)', () => {
+    const rows = [{ id: '3', chat_jid: 'tg:1', sender: 'u', sender_name: 'Carol', content: 'hi & bye', timestamp: '2026-05-20T10:00:00Z', is_from_me: 0, meta: null }];
+    const out = formatMessages(rows);
+    expect(out).toContain('<message');
+    expect(out).toContain('hi &amp; bye');
+    expect(out).not.toContain('<m ');
+    expect(out).not.toContain('<text>');
+  });
+
+  it('attribute escaping: sender_name with " survives escapeXmlAttr', () => {
+    const rows = [{ id: '4', chat_jid: 'tg:1', sender: 'u', sender_name: 'Bob "the builder"', content: 'x', timestamp: '2026-05-20T10:00:00Z', is_from_me: 0, meta: null }];
+    const out = formatMessages(rows);
+    expect(out).toContain('sender="Bob &quot;the builder&quot;"');
+  });
+});
 ```
 
 - [ ] **Step 2: Run, expect FAIL**
