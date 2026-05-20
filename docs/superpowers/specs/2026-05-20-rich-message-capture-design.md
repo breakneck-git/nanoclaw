@@ -327,7 +327,7 @@ Per-group isolation; main group sees UNION (mirrors `src/container-runner.ts:884
 
 ### Host upsert rules
 
-**Integration site (v8 — round-7 fix)**: the host upsert pipeline lives in `src/channels/telegram.ts` INSIDE each `bot.on('message:*')` / `bot.on('edited_message:*')` / `bot.on('channel_post:*')` / `bot.on('edited_channel_post:*')` handler, after `buildMetaBlock(ctx.update.message)` but BEFORE `this.opts.onMessage(chatJid, newMessage)`. This is the only point where the raw grammy `Context` (carrying `forward_origin`, `external_reply`, `entities`, `sender_chat`, `contact`, etc.) is still in scope. The 9+ `bot.on(...)` handlers each invoke a single shared helper `processContactsFromContext(ctx, scope)` that runs the 7-trigger pipeline in order:
+**Integration site (v8 — round-7 fix)**: the host upsert pipeline lives in `src/channels/telegram.ts` INSIDE each `bot.on('message:*')` / `bot.on('edited_message:*')` / `bot.on('channel_post:*')` / `bot.on('edited_channel_post:*')` handler, after `buildMetaBlock(ctx.msg)` but BEFORE `this.opts.onMessage(chatJid, newMessage)`. This is the only point where the raw grammy `Context` (carrying `forward_origin`, `external_reply`, `entities`, `sender_chat`, `contact`, etc.) is still in scope. The 9+ `bot.on(...)` handlers each invoke a single shared helper `processContactsFromContext(ctx, scope)` that runs the 7-trigger pipeline in order:
 
 ```ts
 import type { Context } from 'grammy';
