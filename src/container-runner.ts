@@ -187,6 +187,13 @@ function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  // Rich-message-capture: request/response queues for in-container tools
+  // that need to call back to the host (e.g. media downloads). The sweep
+  // in src/ipc.ts (runSweepOnce) handles stale-file cleanup; errors/ is
+  // operator-review quarantine and is never swept.
+  fs.mkdirSync(path.join(groupIpcDir, 'media-requests'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'media-responses'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'errors'), { recursive: true });
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',

@@ -36,6 +36,77 @@ let ipcWatcherRunning = false;
 const ipcRetryCounts = new Map<string, number>();
 const IPC_MAX_RETRIES = 5;
 
+/**
+ * Sweep stale IPC request/response files for a single group.
+ *
+ * Scans `<ipcRootDir>/<group>/<subdir>/` for any subdir whose name ends in
+ * `-requests` or `-responses` (e.g. `media-requests`, `media-responses`).
+ * The `errors/` directory is operator-review quarantine and is NEVER swept —
+ * it's naturally excluded by the regex filter.
+ *
+ * Rules:
+ *  - `.processing` files older than 600s in a request-dir are renamed back
+ *    to `<reqId>.json` (orphan recovery — the watcher crashed mid-download).
+ *  - Other `.processing` files are skipped (in-flight).
+ *  - Request files older than 180s get a TIMEOUT response written (only when
+ *    no response file already exists — interlock against watcher/sweep race),
+ *    then the request is unlinked.
+ *  - Response files older than 180s are unlinked unconditionally.
+ */
+export function runSweepOnce(ipcRootDir: string, group: string): void {
+  const ipcRoot = path.join(ipcRootDir, group);
+  if (!fs.existsSync(ipcRoot)) return;
+  const subdirs = fs
+    .readdirSync(ipcRoot, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && /-(requests|responses)$/.test(d.name))
+    .map((d) => path.join(ipcRoot, d.name));
+  for (const dir of subdirs) {
+    const isRequestDir = /-requests$/.test(path.basename(dir));
+    for (const f of fs.readdirSync(dir)) {
+      const full = path.join(dir, f);
+      const stat = fs.statSync(full);
+      const ageMs = Date.now() - stat.mtimeMs;
+
+      // Round-7: orphan .processing recovery (watcher crashed mid-download).
+      if (isRequestDir && f.endsWith('.processing') && ageMs > 600_000) {
+        const reqPath = full.replace(/\.processing$/, '');
+        fs.renameSync(full, reqPath);
+        continue;
+      }
+      // Skip in-flight requests (watcher renamed to .processing).
+      if (f.endsWith('.processing')) continue;
+
+      if (ageMs > 180_000) {
+        if (isRequestDir) {
+          // Write TIMEOUT response ONLY if no response file exists yet
+          // (round-6 interlock against watcher/sweep race).
+          const reqId = f.replace(/\.json$/, '');
+          const responsePath = path.join(
+            ipcRoot,
+            path.basename(dir).replace('-requests', '-responses'),
+            `${reqId}.json`,
+          );
+          if (!fs.existsSync(responsePath)) {
+            fs.writeFileSync(
+              responsePath + '.tmp',
+              JSON.stringify({
+                isError: true,
+                _meta: { error_code: 'TIMEOUT', retryable: true },
+                content: [{ type: 'text', text: 'TIMEOUT: sweep' }],
+              }),
+            );
+            fs.renameSync(responsePath + '.tmp', responsePath);
+          }
+          fs.unlinkSync(full);
+        } else {
+          // Response dir: unlink unconditionally.
+          fs.unlinkSync(full);
+        }
+      }
+    }
+  }
+}
+
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
     logger.debug('IPC watcher already running, skipping duplicate start');
