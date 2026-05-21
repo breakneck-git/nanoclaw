@@ -269,47 +269,42 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // would advance as if the user got the reply — losing it permanently.
   let streamingSendFailed = false;
 
-  const output = await runAgent(
-    group,
-    prompt,
-    chatJid,
-    async (result) => {
-      // Streaming output callback — called for each agent result
-      if (result.result) {
-        const raw =
-          typeof result.result === 'string'
-            ? result.result
-            : JSON.stringify(result.result);
-        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-        logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-        if (text) {
-          try {
-            await routeOutbound(channels, chatJid, text, {
-              threadId: lastThreadId[chatJid],
-            });
-            outputSentToUser = true;
-          } catch (err) {
-            logger.error(
-              { chatJid, err },
-              'Failed to deliver streamed agent output',
-            );
-            streamingSendFailed = true;
-          }
+  const output = await runAgent(group, prompt, chatJid, async (result) => {
+    // Streaming output callback — called for each agent result
+    if (result.result) {
+      const raw =
+        typeof result.result === 'string'
+          ? result.result
+          : JSON.stringify(result.result);
+      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+      logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
+      if (text) {
+        try {
+          await routeOutbound(channels, chatJid, text, {
+            threadId: lastThreadId[chatJid],
+          });
+          outputSentToUser = true;
+        } catch (err) {
+          logger.error(
+            { chatJid, err },
+            'Failed to deliver streamed agent output',
+          );
+          streamingSendFailed = true;
         }
-        // Only reset idle timer on actual results, not session-update markers (result: null)
-        resetIdleTimer();
       }
+      // Only reset idle timer on actual results, not session-update markers (result: null)
+      resetIdleTimer();
+    }
 
-      if (result.status === 'success') {
-        queue.notifyIdle(chatJid);
-      }
+    if (result.status === 'success') {
+      queue.notifyIdle(chatJid);
+    }
 
-      if (result.status === 'error') {
-        hadError = true;
-      }
-    },
-  );
+    if (result.status === 'error') {
+      hadError = true;
+    }
+  });
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
