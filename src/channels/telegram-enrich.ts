@@ -17,9 +17,10 @@
  * instance per host).
  */
 
-import type { Bot } from 'grammy';
+import { GrammyError, type Bot } from 'grammy';
 import type Database from 'better-sqlite3';
 import { upsertContact, type ContactPatch } from '../db.js';
+import { logger } from '../logger.js';
 
 // ── Internal state (module-level, scoped per process) ──────────────────────
 type EnrichRecord = {
@@ -58,11 +59,7 @@ export function queueEnrich(scope: string, username: string): void {
   const now = Date.now();
 
   // (a) Cache fresh + success → apply patch to THIS scope (cross-scope reuse).
-  if (
-    cached &&
-    cached.kind === 'success' &&
-    now - cached.ts < TTL_SUCCESS_MS
-  ) {
+  if (cached && cached.kind === 'success' && now - cached.ts < TTL_SUCCESS_MS) {
     if (cached.data) {
       upsertContact(scope, cached.data, {
         identity: { username: un },
@@ -74,11 +71,7 @@ export function queueEnrich(scope: string, username: string): void {
   }
 
   // (b) Cache fresh + failure → no-op (don't retry; bot API rejected).
-  if (
-    cached &&
-    cached.kind === 'failure' &&
-    now - cached.ts < TTL_FAILURE_MS
-  ) {
+  if (cached && cached.kind === 'failure' && now - cached.ts < TTL_FAILURE_MS) {
     return;
   }
 
@@ -99,9 +92,7 @@ export function queueEnrich(scope: string, username: string): void {
  * 'hidden_user' is not reachable via getChat (that's a Bot API ghost — see
  * forwards from privacy-protected senders).
  */
-function chatTypeToKind(
-  type: string,
-): 'user' | 'chat' | 'channel' | undefined {
+function chatTypeToKind(type: string): 'user' | 'chat' | 'channel' | undefined {
   switch (type) {
     case 'private':
       return 'user';
@@ -138,6 +129,33 @@ export function startEnrichWorker(
       const key = `${entry.scope}|${entry.username}`;
       inFlight.add(key);
       try {
+        // Re-check cache before hitting the API. A sibling queueEnrich for a
+        // different scope may have populated the cache after this entry was
+        // enqueued (round-2 worker fix — Defect 2).
+        const cached = enrichCache.get(entry.username);
+        const now = Date.now();
+        if (
+          cached &&
+          cached.kind === 'success' &&
+          now - cached.ts < TTL_SUCCESS_MS
+        ) {
+          if (cached.data) {
+            upsertContact(entry.scope, cached.data, {
+              identity: { username: entry.username },
+              source: 'getChat',
+              enriched: 1,
+            });
+          }
+          continue;
+        }
+        if (
+          cached &&
+          cached.kind === 'failure' &&
+          now - cached.ts < TTL_FAILURE_MS
+        ) {
+          continue;
+        }
+
         const chat = await bot.api.getChat('@' + entry.username);
         const patch: ContactPatch = {};
         if ('first_name' in chat && chat.first_name) {
@@ -157,21 +175,43 @@ export function startEnrichWorker(
           if (mapped) patch.kind = mapped;
         }
 
-        enrichCache.set(entry.username, {
-          kind: 'success',
-          ts: Date.now(),
-          data: patch,
-        });
+        // Upsert first, then cache — if upsert throws, cache must not claim
+        // success for a row that doesn't exist (Defect 3).
         upsertContact(entry.scope, patch, {
           identity: { username: entry.username },
           source: 'getChat',
           enriched: 1,
         });
-      } catch {
         enrichCache.set(entry.username, {
-          kind: 'failure',
+          kind: 'success',
           ts: Date.now(),
+          data: patch,
         });
+      } catch (err) {
+        // Discriminate transient vs permanent failures (Defect 1).
+        // Only Bot-API 400 means "username/chat truly doesn't exist" — that
+        // outcome is stable, safe to cache for the full failure TTL.
+        // Everything else (401 auth, 429 flood, 5xx, network/HttpError) is
+        // transient — leave the cache untouched so the next mention retries.
+        if (err instanceof GrammyError && err.error_code === 400) {
+          enrichCache.set(entry.username, {
+            kind: 'failure',
+            ts: Date.now(),
+          });
+          logger.debug(
+            {
+              username: entry.username,
+              code: err.error_code,
+              desc: err.description,
+            },
+            'getChat rejected (chat not found), caching failure',
+          );
+        } else {
+          logger.warn(
+            { username: entry.username, err: String(err) },
+            'getChat failed (transient); not caching',
+          );
+        }
       } finally {
         inFlight.delete(key);
       }
@@ -186,15 +226,16 @@ export function startEnrichWorker(
 // suite at `telegram-enrich.test.ts` to seed and clear state cleanly.
 // Not part of the public API — do not import outside tests.
 
-export function _test_primeCache(
-  username: string,
-  record: EnrichRecord,
-): void {
+export function _test_primeCache(username: string, record: EnrichRecord): void {
   enrichCache.set(username.toLowerCase(), record);
 }
 
 export function _test_getQueueSize(): number {
   return enrichQueue.length;
+}
+
+export function _test_getCacheRecord(username: string): EnrichRecord | undefined {
+  return enrichCache.get(username.toLowerCase());
 }
 
 export function _test_resetState(): void {
