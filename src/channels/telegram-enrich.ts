@@ -234,7 +234,9 @@ export function _test_getQueueSize(): number {
   return enrichQueue.length;
 }
 
-export function _test_getCacheRecord(username: string): EnrichRecord | undefined {
+export function _test_getCacheRecord(
+  username: string,
+): EnrichRecord | undefined {
   return enrichCache.get(username.toLowerCase());
 }
 
