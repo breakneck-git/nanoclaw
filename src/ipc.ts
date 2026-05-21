@@ -37,6 +37,87 @@ const ipcRetryCounts = new Map<string, number>();
 const IPC_MAX_RETRIES = 5;
 
 /**
+ * Atomic host→container IPC response writer.
+ *
+ * Writes `payload` as JSON to
+ * `<ipcRootDir>/<group>/<responseDirName>/<reqId>.json` using a temp+rename
+ * pattern (`<final>.tmp.<pid>` → `<final>`). The temp suffix includes
+ * `process.pid` so multiple host processes sharing the same group cannot
+ * collide on the same temp file (defensive — current architecture is single
+ * host process, but cheap insurance).
+ *
+ * Atomicity relies on same-FS rename semantics: the temp file MUST live on
+ * the same filesystem as the final path (it does — both are under the same
+ * group/response-dir). Cross-FS rename would degrade to copy+unlink and
+ * lose atomicity.
+ *
+ * The in-container watcher reads the response file as a unit, so partial
+ * writes must never be visible. rename(2) provides that guarantee.
+ */
+export function writeIpcResponseAtomic(
+  ipcRootDir: string,
+  group: string,
+  responseDirName: string,
+  reqId: string,
+  payload: unknown,
+): void {
+  const responsePath = path.join(
+    ipcRootDir,
+    group,
+    responseDirName,
+    `${reqId}.json`,
+  );
+  const tmp = `${responsePath}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(payload));
+  fs.renameSync(tmp, responsePath);
+}
+
+/**
+ * Convenience: atomic write to `media-responses/<reqId>.json`.
+ * Used by the media-download IPC handler (Tasks 18/19).
+ */
+export function writeMediaResponseAtomic(
+  ipcRootDir: string,
+  group: string,
+  reqId: string,
+  payload: unknown,
+): void {
+  writeIpcResponseAtomic(ipcRootDir, group, 'media-responses', reqId, payload);
+}
+
+/**
+ * Convenience: atomic write to `lookup-responses/<reqId>.json`.
+ * Used by the contact-lookup IPC handler (Tasks 18/19).
+ */
+export function writeLookupResponseAtomic(
+  ipcRootDir: string,
+  group: string,
+  reqId: string,
+  payload: unknown,
+): void {
+  writeIpcResponseAtomic(ipcRootDir, group, 'lookup-responses', reqId, payload);
+}
+
+/**
+ * Convenience: atomic write to `contact-write-responses/<reqId>.json`.
+ * Used by the contact-write IPC handler (Tasks 18/19).
+ */
+export function writeContactWriteResponseAtomic(
+  ipcRootDir: string,
+  group: string,
+  reqId: string,
+  payload: unknown,
+): void {
+  writeIpcResponseAtomic(
+    ipcRootDir,
+    group,
+    'contact-write-responses',
+    reqId,
+    payload,
+  );
+}
+
+/**
  * Sweep stale IPC request/response files for a single group.
  *
  * Scans `<ipcRootDir>/<group>/<subdir>/` for any subdir whose name ends in

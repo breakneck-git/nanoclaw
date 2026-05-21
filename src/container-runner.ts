@@ -188,11 +188,24 @@ function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
   // Rich-message-capture: request/response queues for in-container tools
-  // that need to call back to the host (e.g. media downloads). The sweep
-  // in src/ipc.ts (runSweepOnce) handles stale-file cleanup; errors/ is
-  // operator-review quarantine and is never swept.
+  // that need to call back to the host. Three namespaces:
+  //   - media-*          (file download / attachment fetch)
+  //   - lookup-*         (contact lookup by JID/phone)
+  //   - contact-write-*  (contact upsert / display-name set)
+  // All six dirs MUST exist at group setup time so the watcher and the
+  // in-container tools never race on first use. The sweep in src/ipc.ts
+  // (runSweepOnce) handles stale-file cleanup; errors/ is operator-review
+  // quarantine and is never swept.
   fs.mkdirSync(path.join(groupIpcDir, 'media-requests'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'media-responses'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'lookup-requests'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'lookup-responses'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'contact-write-requests'), {
+    recursive: true,
+  });
+  fs.mkdirSync(path.join(groupIpcDir, 'contact-write-responses'), {
+    recursive: true,
+  });
   fs.mkdirSync(path.join(groupIpcDir, 'errors'), { recursive: true });
   mounts.push({
     hostPath: groupIpcDir,
