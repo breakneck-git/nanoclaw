@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Context } from 'grammy';
 import {
@@ -465,5 +468,35 @@ describe('botSenderId', () => {
   });
   it('returns undefined when botInfo missing', () => {
     expect(_testBotSenderId({ bot: {} } as any)).toBeUndefined();
+  });
+});
+
+describe('deliverInbound — exception isolation', () => {
+  // Source-inspection tests: deliverInbound is a private method on
+  // TelegramChannel which needs a full Bot to instantiate. Instead of
+  // constructing one, we verify structurally that the wrapper exists.
+  // These fail loudly if anyone removes the try/catch around the contact
+  // pipeline or meta builder — a regression that would silently drop
+  // inbound messages whenever the contact pipeline throws.
+  const telegramSrc = readFileSync(
+    path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      './telegram.ts',
+    ),
+    'utf-8',
+  );
+
+  it('deliverInbound wraps processContactsFromContext in try/catch', () => {
+    const match = telegramSrc.match(
+      /deliverInbound[\s\S]+?try\s*{[\s\S]+?processContactsFromContext[\s\S]+?}\s*catch/,
+    );
+    expect(match).not.toBeNull();
+  });
+
+  it('deliverInbound wraps buildMetaBlock in try/catch', () => {
+    const match = telegramSrc.match(
+      /deliverInbound[\s\S]+?try\s*{[\s\S]+?buildMetaBlock[\s\S]+?}\s*catch/,
+    );
+    expect(match).not.toBeNull();
   });
 });

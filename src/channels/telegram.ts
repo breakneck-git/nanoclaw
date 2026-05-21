@@ -568,8 +568,27 @@ export class TelegramChannel implements Channel {
     extras?: BuildMetaBlockExtras,
   ): void {
     const scope = this.scopeForGroup(group);
-    processContactsFromContext(ctx, scope);
-    const meta = ctx.msg ? buildMetaBlock(ctx.msg, extras) : undefined;
+    // The contact pipeline is best-effort observability — its failure
+    // (SQLITE_BUSY, schema mismatch, NOT NULL constraint) must never drop
+    // the user's actual message. Wrap separately from meta so a meta
+    // builder bug doesn't suppress contact persistence either.
+    try {
+      processContactsFromContext(ctx, scope);
+    } catch (err) {
+      logger.warn(
+        { err: String(err), chatJid },
+        'processContactsFromContext failed; delivering message anyway',
+      );
+    }
+    let meta: string | undefined;
+    try {
+      meta = ctx.msg ? buildMetaBlock(ctx.msg, extras) : undefined;
+    } catch (err) {
+      logger.warn(
+        { err: String(err), chatJid },
+        'buildMetaBlock failed; delivering message without meta',
+      );
+    }
     this.opts.onMessage(chatJid, {
       ...newMsg,
       meta: meta ?? newMsg.meta,
