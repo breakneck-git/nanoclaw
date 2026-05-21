@@ -2,6 +2,7 @@ import { Channel, NewMessage, SendMessageOptions } from './types.js';
 import { formatLocalTime } from './timezone.js';
 import { storeOutboundMessage } from './db.js';
 import { logger } from './logger.js';
+import { escapeXmlAttr, escapeXmlText } from './channels/telegram-meta.js';
 
 export function escapeXml(s: string): string {
   if (!s) return '';
@@ -18,10 +19,22 @@ export function formatMessages(
 ): string {
   const lines = messages.map((m) => {
     const displayTime = formatLocalTime(m.timestamp, timezone);
-    return `<message sender="${escapeXml(m.sender_name)}" time="${escapeXml(displayTime)}">${escapeXml(m.content)}</message>`;
+    // Rich-message-capture: when `meta` is present (Task 18+ rows), emit the
+    // structured <m>...</m> block inside <message>, with an optional <text>
+    // envelope holding the user's caption/body. Empty content (e.g. photo with
+    // no caption) skips the <text> envelope entirely — the meta carries enough
+    // signal on its own. Pre-migration rows (meta === null/undefined) fall back
+    // to the legacy form so existing groups keep rendering identically.
+    if (m.meta) {
+      const textEnvelope = m.content
+        ? `\n<text>${escapeXmlText(m.content)}</text>`
+        : '';
+      return `<message sender="${escapeXmlAttr(m.sender_name)}" time="${escapeXmlAttr(displayTime)}">${m.meta}${textEnvelope}</message>`;
+    }
+    return `<message sender="${escapeXmlAttr(m.sender_name)}" time="${escapeXmlAttr(displayTime)}">${escapeXmlText(m.content)}</message>`;
   });
 
-  const header = `<context timezone="${escapeXml(timezone)}" />\n`;
+  const header = `<context timezone="${escapeXmlAttr(timezone)}" />\n`;
 
   return `${header}<messages>\n${lines.join('\n')}\n</messages>`;
 }

@@ -96,13 +96,13 @@ describe('formatMessages', () => {
   });
 
   it('escapes special characters in content', () => {
+    // Text content (between tags) only needs &, <, > escaped per XML spec —
+    // `"` is legal in text nodes and is left as-is by escapeXmlText.
     const result = formatMessages(
       [makeMsg({ content: '<script>alert("xss")</script>' })],
       TZ,
     );
-    expect(result).toContain(
-      '&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;',
-    );
+    expect(result).toContain('&lt;script&gt;alert("xss")&lt;/script&gt;');
   });
 
   it('handles empty array', () => {
@@ -120,6 +120,84 @@ describe('formatMessages', () => {
     expect(result).toContain('1:30');
     expect(result).toContain('PM');
     expect(result).toContain('<context timezone="America/New_York" />');
+  });
+});
+
+// --- formatMessages with meta column (Task 22) ---
+
+describe('formatMessages with meta column', () => {
+  it('emits <message><m>...</m><text>escaped</text></message> when meta present + content non-empty', () => {
+    const rows = [
+      {
+        id: '1',
+        chat_jid: 'tg:1',
+        sender: 'u1',
+        sender_name: 'Alice',
+        content: 'hello <world>',
+        timestamp: '2026-05-20T10:00:00Z',
+        is_from_me: 0,
+        meta: '<m id="1"/>',
+      },
+    ];
+    const out = formatMessages(rows as any, 'UTC');
+    expect(out).toContain('<m id="1"/>');
+    expect(out).toContain('<text>hello &lt;world&gt;</text>');
+    expect(out).toContain('sender="Alice"');
+  });
+
+  it('omits <text> envelope when content is empty (photo-no-caption row)', () => {
+    const rows = [
+      {
+        id: '2',
+        chat_jid: 'tg:1',
+        sender: 'u',
+        sender_name: 'Bob',
+        content: '',
+        timestamp: '2026-05-20T10:00:00Z',
+        is_from_me: 0,
+        meta: '<m id="2"><media file_id="X"/></m>',
+      },
+    ];
+    const out = formatMessages(rows as any, 'UTC');
+    expect(out).toContain('<media file_id="X"/>');
+    expect(out).not.toContain('<text>');
+  });
+
+  it('emits legacy <message>escaped text</message> when meta is null (pre-migration row)', () => {
+    const rows = [
+      {
+        id: '3',
+        chat_jid: 'tg:1',
+        sender: 'u',
+        sender_name: 'Carol',
+        content: 'hi & bye',
+        timestamp: '2026-05-20T10:00:00Z',
+        is_from_me: 0,
+        meta: null,
+      },
+    ];
+    const out = formatMessages(rows as any, 'UTC');
+    expect(out).toContain('<message');
+    expect(out).toContain('hi &amp; bye');
+    expect(out).not.toContain('<m ');
+    expect(out).not.toContain('<text>');
+  });
+
+  it('attribute escaping: sender_name with " survives escapeXmlAttr', () => {
+    const rows = [
+      {
+        id: '4',
+        chat_jid: 'tg:1',
+        sender: 'u',
+        sender_name: 'Bob "the builder"',
+        content: 'x',
+        timestamp: '2026-05-20T10:00:00Z',
+        is_from_me: 0,
+        meta: null,
+      },
+    ];
+    const out = formatMessages(rows as any, 'UTC');
+    expect(out).toContain('sender="Bob &quot;the builder&quot;"');
   });
 });
 
