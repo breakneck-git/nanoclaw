@@ -497,27 +497,50 @@ function splitForTelegram(text: string, maxLen: number): string[] {
 }
 
 /**
- * Send a message with Telegram Markdown parse mode, falling back to plain text.
+ * Send a message with Telegram Markdown parse mode, falling back to plain text
+ * only when Telegram explicitly rejected the Markdown parsing. Transport
+ * errors (429 rate limit, 5xx, network) propagate so the caller's retry /
+ * backoff machinery decides — a plain-text retry would just hit the same
+ * transport failure and consume the rate-limit budget twice.
+ *
  * Claude's output naturally matches Telegram's Markdown v1 format:
  *   *bold*, _italic_, `code`, ```code blocks```, [links](url)
+ *
+ * Returns the sent message's id as a string (grammy types it as a number on
+ * `Message.TextMessage.message_id`; coerce for the channel contract).
  */
 async function sendTelegramMessage(
   api: { sendMessage: Api['sendMessage'] },
   chatId: string | number,
   text: string,
   options: { message_thread_id?: number } = {},
-): Promise<void> {
+): Promise<{ messageId: string }> {
+  let result: Message.TextMessage;
   try {
-    await api.sendMessage(chatId, text, {
+    result = await api.sendMessage(chatId, text, {
       ...options,
       parse_mode: 'Markdown',
     });
   } catch (err) {
-    // Fallback: send as plain text if Markdown parsing fails
-    logger.debug({ err }, 'Markdown send failed, falling back to plain text');
-    await api.sendMessage(chatId, text, options);
+    // Narrow catch: only retry plain when Telegram rejected the *parsing*
+    // of the Markdown. For transport errors (429, 5xx, network) re-throw
+    // so the caller's retry/backoff machinery decides.
+    const e = err as { error_code?: number; description?: string };
+    const isMarkdownParseError =
+      e?.error_code === 400 &&
+      /can't parse entities|entity/i.test(e.description ?? '');
+    if (!isMarkdownParseError) throw err;
+    logger.debug({ err }, 'Markdown parse failed, falling back to plain text');
+    result = await api.sendMessage(chatId, text, options);
   }
+  return { messageId: String(result.message_id) };
 }
+
+/**
+ * Test-only re-export at module scope. Exposes the narrowed-catch helper so
+ * tests can drive Markdown→plain fallback paths without instantiating a Bot.
+ */
+export const _test_sendTelegramMessage = sendTelegramMessage;
 
 export class TelegramChannel implements Channel {
   name = 'telegram';
@@ -1047,11 +1070,11 @@ export class TelegramChannel implements Channel {
     jid: string,
     text: string,
     opts?: { threadId?: string },
-  ): Promise<void> {
+  ): Promise<{ messageId?: string }> {
     const threadId = opts?.threadId;
     if (!this.bot) {
       logger.warn('Telegram bot not initialized');
-      return;
+      return { messageId: undefined };
     }
 
     try {
@@ -1066,13 +1089,27 @@ export class TelegramChannel implements Channel {
       // UTF-8 and the fallback retry sends the same garbage. Back off by 1
       // when the boundary lands on a high surrogate.
       const MAX_LENGTH = 4096;
-      for (const chunk of splitForTelegram(text, MAX_LENGTH)) {
-        await sendTelegramMessage(this.bot.api, numericId, chunk, options);
+      const chunks = splitForTelegram(text, MAX_LENGTH);
+      let firstId: string | undefined;
+      for (let i = 0; i < chunks.length; i++) {
+        // No try/catch here — any throw aborts further chunks AND propagates
+        // to the caller (routeOutbound), which means streamingSendFailed
+        // triggers and the cursor rolls back. Chunks 0..i-1 are already
+        // delivered; that is the documented partial-delivery known
+        // limitation.
+        const r = await sendTelegramMessage(
+          this.bot.api,
+          numericId,
+          chunks[i],
+          options,
+        );
+        if (i === 0) firstId = r.messageId;
       }
       logger.info(
         { jid, length: text.length, threadId },
         'Telegram message sent',
       );
+      return { messageId: firstId };
     } catch (err) {
       // Log AND propagate so callers (router, scheduler, IPC, agent stream)
       // don't advance state machines as if the message was delivered.

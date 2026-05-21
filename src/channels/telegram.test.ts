@@ -6,6 +6,8 @@ import type { Context } from 'grammy';
 import {
   _testProcessContactsFromContext,
   _testBotSenderId,
+  _test_sendTelegramMessage,
+  TelegramChannel,
 } from './telegram.js';
 import * as db from '../db.js';
 import * as enrich from './telegram-enrich.js';
@@ -495,5 +497,125 @@ describe('deliverInbound — exception isolation', () => {
       /deliverInbound[\s\S]+?try\s*{[\s\S]+?buildMetaBlock[\s\S]+?}\s*catch/,
     );
     expect(match).not.toBeNull();
+  });
+});
+
+describe('sendTelegramMessage narrowed catch', () => {
+  it('Markdown 400 parse-error retries plain', async () => {
+    const api = {
+      sendMessage: vi
+        .fn()
+        .mockRejectedValueOnce({
+          error_code: 400,
+          description: "Bad Request: can't parse entities: ...",
+        })
+        .mockResolvedValueOnce({ message_id: 7 } as any),
+    };
+    const r = await _test_sendTelegramMessage(api as any, 1, 'text');
+    expect(r.messageId).toBe('7');
+    expect(api.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('429 rate-limit propagates WITHOUT retry', async () => {
+    const api = {
+      sendMessage: vi.fn().mockRejectedValue({
+        error_code: 429,
+        description: 'Too Many Requests',
+      }),
+    };
+    await expect(
+      _test_sendTelegramMessage(api as any, 1, 'text'),
+    ).rejects.toMatchObject({ error_code: 429 });
+    expect(api.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('503 service unavailable propagates WITHOUT retry', async () => {
+    const api = {
+      sendMessage: vi.fn().mockRejectedValue({
+        error_code: 503,
+        description: 'Service Unavailable',
+      }),
+    };
+    await expect(
+      _test_sendTelegramMessage(api as any, 1, 'text'),
+    ).rejects.toMatchObject({ error_code: 503 });
+    expect(api.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('plain network error (no error_code) propagates WITHOUT retry', async () => {
+    const networkErr = new Error('ECONNRESET');
+    const api = { sendMessage: vi.fn().mockRejectedValue(networkErr) };
+    await expect(
+      _test_sendTelegramMessage(api as any, 1, 'text'),
+    ).rejects.toThrow('ECONNRESET');
+    expect(api.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("400 'chat not found' (non-parse) propagates WITHOUT retry", async () => {
+    const api = {
+      sendMessage: vi.fn().mockRejectedValue({
+        error_code: 400,
+        description: 'Bad Request: chat not found',
+      }),
+    };
+    await expect(
+      _test_sendTelegramMessage(api as any, 1, 'text'),
+    ).rejects.toMatchObject({
+      error_code: 400,
+      description: expect.stringMatching(/chat not found/),
+    });
+    expect(api.sendMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('TelegramChannel.sendMessage multi-chunk', () => {
+  // Construct a TelegramChannel with the bot stubbed at the private field via
+  // `as any`. The opts object only needs the three required callbacks; their
+  // implementations don't matter for sendMessage tests.
+  function makeChannel(sendMessage: ReturnType<typeof vi.fn>): {
+    channel: TelegramChannel;
+    sendMessageMock: ReturnType<typeof vi.fn>;
+  } {
+    const channel = new TelegramChannel('test-token', {
+      onMessage: vi.fn(),
+      onChatMetadata: vi.fn(),
+      registeredGroups: () => ({}),
+    });
+    (channel as any).bot = { api: { sendMessage } };
+    return { channel, sendMessageMock: sendMessage };
+  }
+
+  it("single chunk: returns that chunk's messageId", async () => {
+    const sendMessage = vi.fn().mockResolvedValue({ message_id: 5 } as any);
+    const { channel, sendMessageMock } = makeChannel(sendMessage);
+    const result = await channel.sendMessage('tg:42', 'short text');
+    expect(result).toEqual({ messageId: '5' });
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('multi-chunk: returns FIRST chunk messageId, sends all chunks', async () => {
+    const sendMessage = vi
+      .fn()
+      .mockResolvedValueOnce({ message_id: 100 } as any)
+      .mockResolvedValueOnce({ message_id: 101 } as any);
+    const { channel, sendMessageMock } = makeChannel(sendMessage);
+    // 5000 chars > MAX_LENGTH (4096) → splits into 2 chunks
+    const longText = 'x'.repeat(5000);
+    const result = await channel.sendMessage('tg:42', longText);
+    expect(result).toEqual({ messageId: '100' });
+    expect(sendMessageMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('partial failure (chunk 2 throws): throw propagates, chunk 1 messageId not returned (known limitation)', async () => {
+    const sendMessage = vi
+      .fn()
+      .mockResolvedValueOnce({ message_id: 200 } as any)
+      .mockRejectedValueOnce(new Error('Telegram API error during chunk 2'));
+    const { channel, sendMessageMock } = makeChannel(sendMessage);
+    const longText = 'y'.repeat(5000);
+    await expect(channel.sendMessage('tg:42', longText)).rejects.toThrow(
+      'Telegram API error during chunk 2',
+    );
+    expect(sendMessageMock).toHaveBeenCalledTimes(2);
   });
 });
