@@ -1,4 +1,5 @@
 import type { Message, MessageEntity, MessageOrigin } from 'grammy/types';
+import { safeTruncate } from '../safe-truncate.js';
 
 export function escapeXmlAttr(v: unknown): string {
   return String(v ?? '')
@@ -128,11 +129,14 @@ export function buildMetaBlock(message: Message): string {
   return parts.join('');
 }
 
-/** Render <fwd kind="..."/> from a MessageOrigin discriminator. */
+/** Render <fwd kind="..."/> from a MessageOrigin discriminator.
+ *  Each known-case branch computes orig_date locally — hoisting it above the
+ *  switch would crash with `RangeError: Invalid time value` on a future
+ *  unknown origin type that lacks `date`, defeating the default branch's intent. */
 function buildFwdTag(origin: MessageOrigin): string {
-  const orig_date = new Date(origin.date * 1000).toISOString();
   switch (origin.type) {
     case 'user': {
+      const orig_date = new Date(origin.date * 1000).toISOString();
       const u = origin.sender_user;
       const attrs = [
         `kind="user"`,
@@ -148,27 +152,28 @@ function buildFwdTag(origin: MessageOrigin): string {
       return `<fwd ${attrs.join(' ')}/>`;
     }
     case 'hidden_user': {
+      const orig_date = new Date(origin.date * 1000).toISOString();
       return `<fwd kind="hidden_user" sig="${escapeXmlAttr(origin.sender_user_name)}" orig_date="${escapeXmlAttr(orig_date)}"/>`;
     }
     case 'chat': {
+      const orig_date = new Date(origin.date * 1000).toISOString();
       const sc = origin.sender_chat;
       const attrs = [`kind="chat"`, `chat_id="${escapeXmlAttr(sc.id)}"`];
-      attrs.push(
-        `un="${escapeXmlAttr('username' in sc ? (sc.username ?? '') : '')}"`,
-      );
-      attrs.push(
-        `title="${escapeXmlAttr('title' in sc ? (sc.title ?? '') : '')}"`,
-      );
+      if ('username' in sc && sc.username)
+        attrs.push(`un="${escapeXmlAttr(sc.username)}"`);
+      if ('title' in sc && sc.title)
+        attrs.push(`title="${escapeXmlAttr(sc.title)}"`);
       if (origin.author_signature)
         attrs.push(`sig="${escapeXmlAttr(origin.author_signature)}"`);
       attrs.push(`orig_date="${escapeXmlAttr(orig_date)}"`);
       return `<fwd ${attrs.join(' ')}/>`;
     }
     case 'channel': {
+      const orig_date = new Date(origin.date * 1000).toISOString();
       const ch = origin.chat;
       const attrs = [`kind="channel"`, `chat_id="${escapeXmlAttr(ch.id)}"`];
-      attrs.push(`un="${escapeXmlAttr(ch.username ?? '')}"`);
-      attrs.push(`title="${escapeXmlAttr(ch.title ?? '')}"`);
+      if (ch.username) attrs.push(`un="${escapeXmlAttr(ch.username)}"`);
+      if (ch.title) attrs.push(`title="${escapeXmlAttr(ch.title)}"`);
       if (origin.author_signature)
         attrs.push(`sig="${escapeXmlAttr(origin.author_signature)}"`);
       attrs.push(`orig_date="${escapeXmlAttr(orig_date)}"`);
@@ -211,7 +216,7 @@ function buildInChatReplyTag(
       : undefined) ??
     '';
   if (snippetSource) {
-    attrs.push(`snippet="${escapeXmlAttr(snippetSource.slice(0, 500))}"`);
+    attrs.push(`snippet="${escapeXmlAttr(safeTruncate(snippetSource, 500))}"`);
   }
   return `<reply ${attrs.join(' ')}/>`;
 }
@@ -224,9 +229,11 @@ function buildExternalReplyTag(
 ): string {
   const attrs: string[] = [`external="1"`];
   const origin = reply.origin;
-  const orig_date = new Date(origin.date * 1000).toISOString();
+  // orig_date computed per-case so a future unknown origin without `date`
+  // does not crash with RangeError before the default branch is reached.
   switch (origin.type) {
     case 'user': {
+      const orig_date = new Date(origin.date * 1000).toISOString();
       const u = origin.sender_user;
       attrs.push(`kind="user"`);
       attrs.push(`id="${escapeXmlAttr(u.id)}"`);
@@ -240,32 +247,33 @@ function buildExternalReplyTag(
       break;
     }
     case 'hidden_user': {
+      const orig_date = new Date(origin.date * 1000).toISOString();
       attrs.push(`kind="hidden_user"`);
       attrs.push(`sig="${escapeXmlAttr(origin.sender_user_name)}"`);
       attrs.push(`orig_date="${escapeXmlAttr(orig_date)}"`);
       break;
     }
     case 'chat': {
+      const orig_date = new Date(origin.date * 1000).toISOString();
       const sc = origin.sender_chat;
       attrs.push(`kind="chat"`);
       attrs.push(`chat_id="${escapeXmlAttr(sc.id)}"`);
-      attrs.push(
-        `un="${escapeXmlAttr('username' in sc ? (sc.username ?? '') : '')}"`,
-      );
-      attrs.push(
-        `title="${escapeXmlAttr('title' in sc ? (sc.title ?? '') : '')}"`,
-      );
+      if ('username' in sc && sc.username)
+        attrs.push(`un="${escapeXmlAttr(sc.username)}"`);
+      if ('title' in sc && sc.title)
+        attrs.push(`title="${escapeXmlAttr(sc.title)}"`);
       if (origin.author_signature)
         attrs.push(`sig="${escapeXmlAttr(origin.author_signature)}"`);
       attrs.push(`orig_date="${escapeXmlAttr(orig_date)}"`);
       break;
     }
     case 'channel': {
+      const orig_date = new Date(origin.date * 1000).toISOString();
       const ch = origin.chat;
       attrs.push(`kind="channel"`);
       attrs.push(`chat_id="${escapeXmlAttr(ch.id)}"`);
-      attrs.push(`un="${escapeXmlAttr(ch.username ?? '')}"`);
-      attrs.push(`title="${escapeXmlAttr(ch.title ?? '')}"`);
+      if (ch.username) attrs.push(`un="${escapeXmlAttr(ch.username)}"`);
+      if (ch.title) attrs.push(`title="${escapeXmlAttr(ch.title)}"`);
       if (origin.author_signature)
         attrs.push(`sig="${escapeXmlAttr(origin.author_signature)}"`);
       attrs.push(`orig_date="${escapeXmlAttr(orig_date)}"`);
@@ -330,10 +338,8 @@ function renderEntity(e: MessageEntity, text: string): string {
       return `<text_link href="${escapeXmlAttr(e.url)}">${escapeXmlText(fullSlice)}</text_link>`;
     case 'text_mention': {
       const u = e.user;
-      const attrs: string[] = [
-        `id="${escapeXmlAttr(u.id)}"`,
-        `un="${escapeXmlAttr(u.username ?? '')}"`,
-      ];
+      const attrs: string[] = [`id="${escapeXmlAttr(u.id)}"`];
+      if (u.username) attrs.push(`un="${escapeXmlAttr(u.username)}"`);
       if (u.first_name)
         attrs.push(
           `name="${escapeXmlAttr(u.first_name)}${u.last_name ? ' ' + escapeXmlAttr(u.last_name) : ''}"`,

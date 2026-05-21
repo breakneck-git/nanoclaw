@@ -6,6 +6,18 @@ import {
   escapeXmlText,
 } from './telegram-meta.js';
 
+/**
+ * Smoke-parse the meta fragment to confirm strict XML well-formedness.
+ * Plan Task 8b-1 Step 1 requires `xml2js.parseStringPromise` for every new
+ * test in addition to substring assertions — catches unclosed tags, missing
+ * spaces between attributes, duplicate attribute names, illegal XML chars,
+ * and wrong nesting that `.toContain()` would miss. Wrap in <root> because
+ * meta is a fragment (multiple sibling tags are possible).
+ */
+async function smokeParseXml(metaBlock: string): Promise<void> {
+  await parseStringPromise(`<root>${metaBlock}</root>`);
+}
+
 describe('escapeXmlAttr', () => {
   it('escapes all 5 special chars', () => {
     expect(escapeXmlAttr('a&b<c>d"e\'f')).toBe(
@@ -118,7 +130,7 @@ describe('buildMetaBlock — <from> attributes', () => {
 });
 
 describe('buildMetaBlock — <fwd>', () => {
-  it('user kind: emits id un name is_bot from sender_user', () => {
+  it('user kind: emits id un name is_bot from sender_user', async () => {
     const msg = {
       message_id: 1,
       date: 1747731600,
@@ -142,8 +154,9 @@ describe('buildMetaBlock — <fwd>', () => {
     expect(meta).toContain('un="v"');
     expect(meta).toContain('name="V"');
     expect(meta).toContain('is_bot="0"');
+    await smokeParseXml(meta);
   });
-  it('hidden_user kind: emits sig from sender_user_name (no id)', () => {
+  it('hidden_user kind: emits sig from sender_user_name (no id)', async () => {
     const msg = {
       message_id: 1,
       date: 1747731600,
@@ -159,8 +172,9 @@ describe('buildMetaBlock — <fwd>', () => {
     expect(meta).toContain('kind="hidden_user"');
     expect(meta).toContain('sig="AnonymousUser"');
     expect(meta).not.toMatch(/<fwd[^>]*\sid=/);
+    await smokeParseXml(meta);
   });
-  it('chat kind: anonymous group admin, emits sig from author_signature', () => {
+  it('chat kind: anonymous group admin, emits sig from author_signature', async () => {
     const msg = {
       message_id: 1,
       date: 1747731600,
@@ -181,8 +195,9 @@ describe('buildMetaBlock — <fwd>', () => {
     expect(meta).toContain('kind="chat"');
     expect(meta).toContain('chat_id="-100"');
     expect(meta).toContain('sig="Pavel"');
+    await smokeParseXml(meta);
   });
-  it('channel kind: emits chat_id un title link orig_msg_id', () => {
+  it('channel kind: emits chat_id un title link orig_msg_id', async () => {
     const msg = {
       message_id: 1,
       date: 1747731600,
@@ -206,8 +221,9 @@ describe('buildMetaBlock — <fwd>', () => {
     expect(meta).toContain('title="Durov"');
     expect(meta).toContain('link="https://t.me/durov/123"');
     expect(meta).toContain('orig_msg_id="123"');
+    await smokeParseXml(meta);
   });
-  it('unknown kind: emits raw= with escaped JSON.stringify(origin)', () => {
+  it('unknown kind: emits raw= with escaped JSON.stringify(origin)', async () => {
     const msg = {
       message_id: 1,
       date: 1747731600,
@@ -221,11 +237,44 @@ describe('buildMetaBlock — <fwd>', () => {
     const meta = buildMetaBlock(msg as any);
     expect(meta).toContain('kind="unknown"');
     expect(meta).toContain('raw=');
+    await smokeParseXml(meta);
+  });
+  it('unknown kind: does not throw when origin lacks date field', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      forward_origin: { type: 'future_unknown_kind', some_field: 'x' } as any,
+    };
+    expect(() => buildMetaBlock(msg as any)).not.toThrow();
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<fwd kind="unknown"');
+    expect(meta).toContain('raw=');
+    await smokeParseXml(meta);
+  });
+  it('chat kind: omits un and title when sender_chat has no username/title', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      forward_origin: {
+        type: 'chat' as const,
+        date: 1747731600,
+        sender_chat: { id: -100, type: 'group' as const, title: '' }, // empty title
+        author_signature: 'Anon',
+      } as any,
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<fwd kind="chat"');
+    expect(meta).not.toContain('un=""');
+    expect(meta).not.toContain('title=""');
+    await smokeParseXml(meta);
   });
 });
 
 describe('buildMetaBlock — <reply>', () => {
-  it('in-chat reply: external="0" with mid + from_id + snippet', () => {
+  it('in-chat reply: external="0" with mid + from_id + snippet', async () => {
     const msg = {
       message_id: 5,
       date: 1747731600,
@@ -245,8 +294,9 @@ describe('buildMetaBlock — <reply>', () => {
     expect(meta).toContain('mid="4"');
     expect(meta).toContain('from_id="42"');
     expect(meta).toContain('snippet="original message text"');
+    await smokeParseXml(meta);
   });
-  it('external_reply: external="1" with origin attributes', () => {
+  it('external_reply: external="1" with origin attributes', async () => {
     const msg = {
       message_id: 5,
       date: 1747731600,
@@ -268,11 +318,35 @@ describe('buildMetaBlock — <reply>', () => {
     const meta = buildMetaBlock(msg as any);
     expect(meta).toContain('<reply');
     expect(meta).toContain('external="1"');
+    await smokeParseXml(meta);
+  });
+  it('in-chat reply: snippet truncation preserves surrogate pairs (no orphan high surrogate)', async () => {
+    const longText = 'a'.repeat(499) + '🐬'; // 501 code units; char 500 = U+D83D (high surrogate)
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      reply_to_message: {
+        message_id: 99,
+        date: 1747731600,
+        chat: { id: 1, type: 'private' as const, first_name: 'X' },
+        text: longText,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    // Extract snippet attribute and confirm no orphan high surrogate
+    const m = meta.match(/snippet="([^"]*)"/);
+    expect(m).not.toBeNull();
+    const snippet = m![1];
+    // Last code unit must not be an unpaired high surrogate (0xD800-0xDBFF)
+    const lastCharCode = snippet.charCodeAt(snippet.length - 1);
+    expect(lastCharCode >= 0xd800 && lastCharCode <= 0xdbff).toBe(false);
+    await smokeParseXml(meta);
   });
 });
 
 describe('buildMetaBlock — <reply_to_story>', () => {
-  it('top-level emission from message.reply_to_story', () => {
+  it('top-level emission from message.reply_to_story', async () => {
     const msg = {
       message_id: 5,
       date: 1747731600,
@@ -287,11 +361,12 @@ describe('buildMetaBlock — <reply_to_story>', () => {
     expect(meta).toContain('<reply_to_story');
     expect(meta).toContain('chat_id="-100"');
     expect(meta).toContain('story_id="42"');
+    await smokeParseXml(meta);
   });
 });
 
 describe('buildMetaBlock — <quote>', () => {
-  it('emits escaped text content (not attribute)', () => {
+  it('emits escaped text content (not attribute)', async () => {
     const msg = {
       message_id: 5,
       date: 1747731600,
@@ -301,11 +376,12 @@ describe('buildMetaBlock — <quote>', () => {
     };
     const meta = buildMetaBlock(msg as any);
     expect(meta).toContain('<quote>quoted &lt;fragment&gt; &amp; rest</quote>');
+    await smokeParseXml(meta);
   });
 });
 
 describe('buildMetaBlock — <entities>', () => {
-  it('emits canonical entity types from message.entities', () => {
+  it('emits canonical entity types from message.entities', async () => {
     const msg = {
       message_id: 5,
       date: 1747731600,
@@ -331,8 +407,9 @@ describe('buildMetaBlock — <entities>', () => {
     expect(meta).toContain('<phone_number>+79991234567</phone_number>');
     expect(meta).toContain('<email>me@x.com</email>');
     expect(meta).toContain('<cashtag>BTC</cashtag>');
+    await smokeParseXml(meta);
   });
-  it('emits text_link with href attribute and inner text', () => {
+  it('emits text_link with href attribute and inner text', async () => {
     const msg = {
       message_id: 5,
       date: 1747731600,
@@ -352,8 +429,9 @@ describe('buildMetaBlock — <entities>', () => {
     expect(meta).toContain(
       '<text_link href="https://example.com">here</text_link>',
     );
+    await smokeParseXml(meta);
   });
-  it('emits text_mention with user attributes', () => {
+  it('emits text_mention with user attributes', async () => {
     const msg = {
       message_id: 5,
       date: 1747731600,
@@ -379,8 +457,29 @@ describe('buildMetaBlock — <entities>', () => {
     expect(meta).toContain('id="111"');
     expect(meta).toContain('un="ivan"');
     expect(meta).toContain('name="Иван"');
+    await smokeParseXml(meta);
   });
-  it('emits custom_emoji with id', () => {
+  it('text_mention: omits un attribute when user has no username', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      text: '@user',
+      entities: [
+        {
+          type: 'text_mention' as const,
+          offset: 0,
+          length: 5,
+          user: { id: 111, is_bot: false, first_name: 'NoHandle' },
+        },
+      ],
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<text_mention');
+    expect(meta).not.toContain('un=""');
+    await smokeParseXml(meta);
+  });
+  it('emits custom_emoji with id', async () => {
     const msg = {
       message_id: 5,
       date: 1747731600,
@@ -398,8 +497,9 @@ describe('buildMetaBlock — <entities>', () => {
     };
     const meta = buildMetaBlock(msg as any);
     expect(meta).toContain('<custom_emoji id="5368324170671202286"/>');
+    await smokeParseXml(meta);
   });
-  it('drops formatting entities (bold/italic/code/etc.)', () => {
+  it('drops formatting entities (bold/italic/code/etc.)', async () => {
     const msg = {
       message_id: 5,
       date: 1747731600,
@@ -414,8 +514,9 @@ describe('buildMetaBlock — <entities>', () => {
     const meta = buildMetaBlock(msg as any);
     expect(meta).not.toContain('<entities'); // empty after filtering — entire block omitted
     expect(meta).not.toContain('<bold');
+    await smokeParseXml(meta);
   });
-  it('merges caption_entities into the same <entities> block', () => {
+  it('merges caption_entities into the same <entities> block', async () => {
     const msg = {
       message_id: 5,
       date: 1747731600,
@@ -427,8 +528,9 @@ describe('buildMetaBlock — <entities>', () => {
     const meta = buildMetaBlock(msg as any);
     expect(meta).toContain('<entities>');
     expect(meta).toContain('<mention>vasya</mention>');
+    await smokeParseXml(meta);
   });
-  it('dedupes entities by (offset, length, type)', () => {
+  it('dedupes entities by (offset, length, type)', async () => {
     const msg = {
       message_id: 5,
       date: 1747731600,
@@ -441,5 +543,6 @@ describe('buildMetaBlock — <entities>', () => {
     const meta = buildMetaBlock(msg as any);
     const mentions = (meta.match(/<mention>/g) || []).length;
     expect(mentions).toBe(1);
+    await smokeParseXml(meta);
   });
 });
