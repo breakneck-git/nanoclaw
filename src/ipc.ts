@@ -13,6 +13,7 @@ import {
   updateTask,
 } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
+import { ViewMediaPayload, ViewMediaResponse } from './ipc-media-handler.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
@@ -32,6 +33,17 @@ export interface IpcDeps {
     registeredJids: Set<string>,
   ) => void;
   onTasksChanged: () => void;
+  /**
+   * Optional: dispatch a view_media IPC request. Provided by the orchestrator
+   * when a Telegram channel is connected (it resolves the grammy Bot and the
+   * authorized JID set, then delegates to `handleViewMediaRequest`). Absent
+   * when no media-capable channel is wired in — the watcher then leaves
+   * media-requests/ files in place for the sweep to TIMEOUT.
+   */
+  viewMedia?: (
+    payload: ViewMediaPayload,
+    requestingGroupJids: string[],
+  ) => Promise<ViewMediaResponse>;
 }
 
 let ipcWatcherRunning = false;
@@ -395,6 +407,100 @@ export function startIpcWatcher(deps: IpcDeps): void {
         logger.error(
           { err, sourceGroup },
           'Error reading IPC messages directory',
+        );
+      }
+
+      // Process media-requests from this group's IPC directory (Task 18).
+      // Uses the .processing interlock so the sweep doesn't race-cancel an
+      // in-flight download. When `deps.viewMedia` is unset (no media channel
+      // wired in), the watcher leaves files alone and the sweep eventually
+      // emits TIMEOUT.
+      try {
+        const mediaReqDir = path.join(
+          ipcBaseDir,
+          sourceGroup,
+          'media-requests',
+        );
+        if (deps.viewMedia && fs.existsSync(mediaReqDir)) {
+          const mediaFiles = fs
+            .readdirSync(mediaReqDir)
+            .filter((f) => f.endsWith('.json'));
+          // Compute the JID list for this folder once per sweep iteration.
+          const requestingGroupJids = Object.entries(registeredGroups)
+            .filter(([, g]) => g.folder === sourceGroup)
+            .map(([jid]) => jid);
+          for (const file of mediaFiles) {
+            const filePath = path.join(mediaReqDir, file);
+            const processingPath = `${filePath}.processing`;
+            // .processing interlock: atomically rename before reading so
+            // concurrent sweep ticks don't re-enter.
+            try {
+              fs.renameSync(filePath, processingPath);
+            } catch {
+              // Another tick claimed the file (or it disappeared). Skip.
+              continue;
+            }
+            let payload: ViewMediaPayload | null = null;
+            try {
+              const raw = fs.readFileSync(processingPath, 'utf-8');
+              payload = JSON.parse(raw) as ViewMediaPayload;
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'view_media parse failed — quarantining',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              try {
+                fs.mkdirSync(errorDir, { recursive: true });
+                fs.renameSync(
+                  processingPath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              } catch {
+                /* best effort */
+              }
+              continue;
+            }
+            const reqId = payload.reqId || file.replace(/\.json$/, '');
+            try {
+              const response = await deps.viewMedia(
+                payload,
+                requestingGroupJids,
+              );
+              writeMediaResponseAtomic(
+                ipcBaseDir,
+                sourceGroup,
+                reqId,
+                response,
+              );
+              fs.unlinkSync(processingPath);
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'view_media handler threw — writing UPSTREAM_ERROR',
+              );
+              writeMediaResponseAtomic(ipcBaseDir, sourceGroup, reqId, {
+                isError: true,
+                _meta: { error_code: 'UPSTREAM_ERROR', retryable: true },
+                content: [
+                  {
+                    type: 'text',
+                    text: `UPSTREAM_ERROR: handler threw — ${(err as Error).message}`,
+                  },
+                ],
+              });
+              try {
+                fs.unlinkSync(processingPath);
+              } catch {
+                /* best effort */
+              }
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, sourceGroup },
+          'Error reading IPC media-requests directory',
         );
       }
 
