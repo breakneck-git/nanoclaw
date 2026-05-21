@@ -5,7 +5,13 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import {
+  createTask,
+  deleteTask,
+  getContactsForGroup,
+  getTaskById,
+  updateTask,
+} from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
@@ -115,6 +121,84 @@ export function writeContactWriteResponseAtomic(
     reqId,
     payload,
   );
+}
+
+/**
+ * Debounced per-scope `contacts.json` snapshot writer (Task 16c).
+ *
+ * Whenever a contact is upserted into a scope, `onContactUpsert(ipcRoot, scope)`
+ * is called. We schedule a 500ms trailing-edge timer for that scope: if more
+ * upserts arrive within the window, the timer resets. When it finally fires,
+ * we write `<ipcRoot>/<scope>/contacts.json` atomically.
+ *
+ * **Round-10 main-UNION cross-trigger.** The main scope's snapshot is the
+ * UNION of all contacts across every scope. If only non-main scopes upsert,
+ * main's debounce timer never gets touched, so its snapshot stays stale.
+ * Fix: every non-main `onContactUpsert(_, scope)` ALSO schedules main's timer.
+ *
+ * State is module-scope (per-process) — intentional. Tests use
+ * `vi.useFakeTimers()` for isolation.
+ */
+const SNAPSHOT_DEBOUNCE_MS = 500;
+const snapshotTimers = new Map<string, NodeJS.Timeout>(); // key: `${ipcRoot}|${scope}`
+
+function writeContactsSnapshot(ipcRootDir: string, scope: string): void {
+  const contacts = getContactsForGroup({
+    scope,
+    includeUnion: scope === 'main',
+  });
+  const dir = path.join(ipcRootDir, scope);
+  fs.mkdirSync(dir, { recursive: true });
+  const finalPath = path.join(dir, 'contacts.json');
+  const tmp = `${finalPath}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(contacts, null, 2));
+  fs.renameSync(tmp, finalPath);
+}
+
+function scheduleSnapshot(ipcRootDir: string, scope: string): void {
+  const key = `${ipcRootDir}|${scope}`;
+  const existing = snapshotTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const t = setTimeout(() => {
+    snapshotTimers.delete(key);
+    try {
+      writeContactsSnapshot(ipcRootDir, scope);
+    } catch (err) {
+      logger.error(
+        { err, ipcRootDir, scope },
+        'writeContactsSnapshot failed',
+      );
+    }
+  }, SNAPSHOT_DEBOUNCE_MS);
+  snapshotTimers.set(key, t);
+}
+
+export function onContactUpsert(ipcRootDir: string, scope: string): void {
+  scheduleSnapshot(ipcRootDir, scope);
+  // Round-10 fix: when only non-main scopes upsert, main's debounce never
+  // fires, leaving the UNION snapshot stale. Cross-trigger main timer too.
+  if (scope !== 'main') {
+    scheduleSnapshot(ipcRootDir, 'main');
+  }
+}
+
+export function flushAllSnapshots(ipcRootDir: string): void {
+  // Fire any pending timers synchronously for the given ipcRoot. Called on
+  // SIGTERM so pending writes hit disk before the process exits.
+  for (const [key, timer] of snapshotTimers.entries()) {
+    const [keyRoot, keyScope] = key.split('|');
+    if (keyRoot !== ipcRootDir) continue;
+    clearTimeout(timer);
+    snapshotTimers.delete(key);
+    try {
+      writeContactsSnapshot(ipcRootDir, keyScope);
+    } catch (err) {
+      logger.error(
+        { err, scope: keyScope },
+        'flushAllSnapshots: writeContactsSnapshot failed',
+      );
+    }
+  }
 }
 
 /**

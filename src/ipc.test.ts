@@ -3,7 +3,21 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
-import { runSweepOnce, writeMediaResponseAtomic } from './ipc.js';
+import {
+  runSweepOnce,
+  writeMediaResponseAtomic,
+  onContactUpsert,
+  flushAllSnapshots,
+} from './ipc.js';
+import * as db from './db.js';
+
+vi.mock('./db.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./db.js')>();
+  return {
+    ...actual,
+    getContactsForGroup: vi.fn(actual.getContactsForGroup),
+  };
+});
 
 function makeIpcRoot(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ipc-sweep-test-'));
@@ -127,5 +141,98 @@ describe('IPC atomic response writer — writeMediaResponseAtomic', () => {
     // Document expectation: temp+rename relies on same-FS atomicity.
     // If the writer is ever moved cross-FS, this test should be revisited.
     expect(true).toBe(true); // Placeholder assertion — design constraint, not runtime check.
+  });
+});
+
+function freshIpc(): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'snapshot-test-'));
+}
+
+describe('contacts.json snapshot writer', () => {
+  let ipcRoot: string;
+  beforeEach(() => {
+    vi.useFakeTimers();
+    ipcRoot = freshIpc();
+    vi.mocked(db.getContactsForGroup).mockReturnValue([
+      {
+        ident: 'g_dev|id:99',
+        scope: 'g_dev',
+        tg_id: '99',
+        username: null,
+        kind: 'user',
+        first_name: 'Петя',
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
+    ]);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    fs.rmSync(ipcRoot, { recursive: true, force: true });
+    vi.mocked(db.getContactsForGroup).mockReset();
+  });
+
+  it('per-scope trailing-edge debounce (500ms) collapses bursts into one write', () => {
+    onContactUpsert(ipcRoot, 'g_dev');
+    onContactUpsert(ipcRoot, 'g_dev');
+    onContactUpsert(ipcRoot, 'g_dev');
+    vi.advanceTimersByTime(499);
+    expect(fs.existsSync(path.join(ipcRoot, 'g_dev', 'contacts.json'))).toBe(
+      false,
+    );
+    vi.advanceTimersByTime(2);
+    expect(fs.existsSync(path.join(ipcRoot, 'g_dev', 'contacts.json'))).toBe(
+      true,
+    );
+    // Mock should have been called exactly once for g_dev (debounced)
+    const gDevCalls = vi
+      .mocked(db.getContactsForGroup)
+      .mock.calls.filter((c) => c[0].scope === 'g_dev');
+    expect(gDevCalls.length).toBe(1);
+  });
+
+  it('non-main upsert ALSO triggers main timer (round-10 main UNION cross-trigger)', () => {
+    onContactUpsert(ipcRoot, 'g_dev');
+    vi.advanceTimersByTime(501);
+    expect(fs.existsSync(path.join(ipcRoot, 'g_dev', 'contacts.json'))).toBe(
+      true,
+    );
+    expect(fs.existsSync(path.join(ipcRoot, 'main', 'contacts.json'))).toBe(
+      true,
+    );
+    // getContactsForGroup called twice: once for g_dev (includeUnion: false),
+    // once for main (includeUnion: true)
+    const calls = vi.mocked(db.getContactsForGroup).mock.calls;
+    expect(
+      calls.some(
+        (c) => c[0].scope === 'g_dev' && c[0].includeUnion === false,
+      ),
+    ).toBe(true);
+    expect(
+      calls.some((c) => c[0].scope === 'main' && c[0].includeUnion === true),
+    ).toBe(true);
+  });
+
+  it('flushAllSnapshots fires pending timers synchronously (SIGTERM)', () => {
+    onContactUpsert(ipcRoot, 'g_dev');
+    // No time advance — timer pending
+    flushAllSnapshots(ipcRoot);
+    expect(fs.existsSync(path.join(ipcRoot, 'g_dev', 'contacts.json'))).toBe(
+      true,
+    );
+    expect(fs.existsSync(path.join(ipcRoot, 'main', 'contacts.json'))).toBe(
+      true,
+    );
+  });
+
+  it('atomic write uses temp+rename pattern', () => {
+    const renameSpy = vi.spyOn(fs, 'renameSync');
+    onContactUpsert(ipcRoot, 'g_dev');
+    vi.advanceTimersByTime(501);
+    expect(renameSpy).toHaveBeenCalled();
+    const renameCall = renameSpy.mock.calls.find(([from]) =>
+      String(from).match(/\.tmp\.\d+$/),
+    );
+    expect(renameCall).toBeDefined();
+    renameSpy.mockRestore();
   });
 });
