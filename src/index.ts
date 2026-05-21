@@ -46,7 +46,12 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import {
+  findChannel,
+  formatMessages,
+  formatOutbound,
+  routeOutbound,
+} from './router.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -301,7 +306,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
         if (text) {
           try {
-            await channel.sendMessage(chatJid, text, {
+            await routeOutbound(channels, chatJid, text, {
               threadId: lastThreadId[chatJid],
             });
             outputSentToUser = true;
@@ -632,9 +637,6 @@ async function main(): Promise<void> {
       return;
     }
 
-    const channel = findChannel(channels, chatJid);
-    if (!channel) return;
-
     const threadOpts = { threadId: lastThreadId[chatJid] };
     if (command === '/remote-control') {
       const result = await startRemoteControl(
@@ -644,7 +646,7 @@ async function main(): Promise<void> {
       );
       if (result.ok) {
         try {
-          await channel.sendMessage(chatJid, result.url, threadOpts);
+          await routeOutbound(channels, chatJid, result.url, threadOpts);
         } catch (err) {
           // URL never reached the user. Tear down the session we just
           // started so the next /remote-control isn't blocked by an
@@ -664,7 +666,8 @@ async function main(): Promise<void> {
           throw err;
         }
       } else {
-        await channel.sendMessage(
+        await routeOutbound(
+          channels,
           chatJid,
           `Remote Control failed: ${result.error}`,
           threadOpts,
@@ -673,13 +676,14 @@ async function main(): Promise<void> {
     } else {
       const result = stopRemoteControl();
       if (result.ok) {
-        await channel.sendMessage(
+        await routeOutbound(
+          channels,
           chatJid,
           'Remote Control session ended.',
           threadOpts,
         );
       } else {
-        await channel.sendMessage(chatJid, result.error, threadOpts);
+        await routeOutbound(channels, chatJid, result.error, threadOpts);
       }
     }
   }
@@ -759,22 +763,30 @@ async function main(): Promise<void> {
     onProcess: (groupJid, proc, containerName, groupFolder) =>
       queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) {
-        logger.warn({ jid }, 'No channel owns JID, cannot send message');
-        return;
-      }
       const text = formatOutbound(rawText);
-      if (text) {
-        await channel.sendMessage(jid, text, { threadId: lastThreadId[jid] });
+      if (!text) return;
+      try {
+        await routeOutbound(channels, jid, text, {
+          threadId: lastThreadId[jid],
+        });
+      } catch (err) {
+        // Round-11 narrow catch: only swallow "No channel for JID". Rethrow
+        // other errors so the outer task-scheduler catch records the task as
+        // failed.
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.startsWith('No channel for JID')) {
+          logger.warn({ jid }, 'Scheduled task: no channel owns JID, skipping');
+          return;
+        }
+        throw err;
       }
     },
   });
   startIpcWatcher({
     sendMessage: (jid, text) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text, { threadId: lastThreadId[jid] });
+      return routeOutbound(channels, jid, text, {
+        threadId: lastThreadId[jid],
+      });
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
