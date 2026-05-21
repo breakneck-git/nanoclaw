@@ -203,9 +203,7 @@ describe('contacts.json snapshot writer', () => {
     // once for main (includeUnion: true)
     const calls = vi.mocked(db.getContactsForGroup).mock.calls;
     expect(
-      calls.some(
-        (c) => c[0].scope === 'g_dev' && c[0].includeUnion === false,
-      ),
+      calls.some((c) => c[0].scope === 'g_dev' && c[0].includeUnion === false),
     ).toBe(true);
     expect(
       calls.some((c) => c[0].scope === 'main' && c[0].includeUnion === true),

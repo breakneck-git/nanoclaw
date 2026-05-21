@@ -164,10 +164,7 @@ function scheduleSnapshot(ipcRootDir: string, scope: string): void {
     try {
       writeContactsSnapshot(ipcRootDir, scope);
     } catch (err) {
-      logger.error(
-        { err, ipcRootDir, scope },
-        'writeContactsSnapshot failed',
-      );
+      logger.error({ err, ipcRootDir, scope }, 'writeContactsSnapshot failed');
     }
   }, SNAPSHOT_DEBOUNCE_MS);
   snapshotTimers.set(key, t);
