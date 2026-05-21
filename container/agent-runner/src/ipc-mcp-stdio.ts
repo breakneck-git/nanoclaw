@@ -6,15 +6,24 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
+import { randomBytes } from 'node:crypto';
 import { CronExpressionParser } from 'cron-parser';
 import { safeTruncate } from './safe-truncate.js';
 
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const MEDIA_REQ_DIR = path.join(IPC_DIR, 'media-requests');
+const MEDIA_RESP_DIR = path.join(IPC_DIR, 'media-responses');
+const LOOKUP_REQ_DIR = path.join(IPC_DIR, 'lookup-requests');
+const LOOKUP_RESP_DIR = path.join(IPC_DIR, 'lookup-responses');
+const CONTACT_WRITE_REQ_DIR = path.join(IPC_DIR, 'contact-write-requests');
+const CONTACT_WRITE_RESP_DIR = path.join(IPC_DIR, 'contact-write-responses');
+const CONTACTS_JSON_PATH = path.join(IPC_DIR, 'contacts.json');
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -50,10 +59,16 @@ function isValidLocalTimestamp(s: string): boolean {
   );
 }
 
-function writeIpcFile(dir: string, data: object): string {
+function writeIpcFile(
+  dir: string,
+  data: object,
+  filenameOverride?: string,
+): string {
   fs.mkdirSync(dir, { recursive: true });
 
-  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
+  const filename =
+    filenameOverride ??
+    `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
   const filepath = path.join(dir, filename);
 
   // Atomic write: temp file then rename
@@ -62,6 +77,62 @@ function writeIpcFile(dir: string, data: object): string {
   fs.renameSync(tempPath, filepath);
 
   return filename;
+}
+
+function generateReqId(): string {
+  return `${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}`;
+}
+
+/**
+ * Poll for a host-written response file. Used by tools that round-trip
+ * through the host (view_media, lookup_messages, annotate_contact). The
+ * host writes the response atomically (temp+rename), so once `existsSync`
+ * is true the file should be complete. Defense-in-depth catches partial
+ * reads or invalid JSON if the rename ever races.
+ *
+ * On timeout returns a structured error response with `isError: true`
+ * and `_meta.error_code = 'TIMEOUT'` so the agent can surface the code.
+ */
+async function pollResponseFile(
+  responseDir: string,
+  reqId: string,
+  timeoutMs: number = 120000,
+  intervalMs: number = 100,
+): Promise<CallToolResult> {
+  const responsePath = path.join(responseDir, `${reqId}.json`);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(responsePath)) {
+      try {
+        const raw = fs.readFileSync(responsePath, 'utf-8');
+        // Host writes responses conforming to MCP CallToolResult — relay
+        // directly to the SDK. We don't re-validate here; the host owns
+        // the schema and the SDK will catch protocol-level breakage.
+        const parsed = JSON.parse(raw) as CallToolResult;
+        // Best-effort cleanup — don't fail if unlink races
+        try {
+          fs.unlinkSync(responsePath);
+        } catch {}
+        return parsed;
+      } catch {
+        // Partial read or invalid JSON — wait and retry (atomic temp+rename
+        // should prevent this, but defense-in-depth)
+        await new Promise((r) => setTimeout(r, intervalMs));
+        continue;
+      }
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return {
+    isError: true,
+    _meta: { error_code: 'TIMEOUT', retryable: true },
+    content: [
+      {
+        type: 'text',
+        text: 'TIMEOUT: no response within ' + timeoutMs + 'ms',
+      },
+    ],
+  };
 }
 
 const server = new McpServer({
@@ -404,6 +475,201 @@ Use available_groups.json to find the JID for a group. The folder name must be c
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
     };
+  },
+);
+
+server.tool(
+  'view_media',
+  "Fetch a Telegram media file by `file_id`. Use when the user asks to look at / view / show / посмотри / покажи a photo, image, sticker, document, or PDF you have a `file_id` for. Pass `tg_message_id` alongside `file_id` — it's the `<m id=\"...\">` value on the message that contained the file_id; used by the host for cross-group authorization. `mode` default `auto`: images → image content, PDFs → extracted text. `mode:'image'` with `pages:'1-3'` for visual PDF rendering (max 10 pages). On failure the response text starts with the error code followed by `:` — e.g. `TIMEOUT: ...`, `FILE_TOO_LARGE: ...`, `FILE_EXPIRED: ...`, `EXTRACTOR_MISSING: ...`, `EXTRACTOR_OUTPUT_INVALID: ...`, `NO_TEXT_LAYER: ... (PDF has no extractable text — retry with mode:'image' and a small pages range to render the scan)`, `UNSUPPORTED_TYPE: ...`, `PAGES_OUT_OF_RANGE: ...`, `UPSTREAM_ERROR: ...`, `CROSS_GROUP_REJECTED: ...`. Parse the prefix from the first line and relay the code to the user.",
+  {
+    file_id: z
+      .string()
+      .describe('The Telegram file_id from <m><media file_id="...">'),
+    tg_message_id: z
+      .string()
+      .describe(
+        'The <m id="..."> value of the message that contained the file_id (for cross-group authorization)',
+      ),
+    mode: z
+      .enum(['auto', 'image', 'text'])
+      .optional()
+      .describe(
+        "auto (default): images → image content, PDFs → text. image: visual rendering. text: forced extraction.",
+      ),
+    pages: z
+      .string()
+      .optional()
+      .describe('Page range for PDFs in image mode, e.g. "1-3". Max 10 pages.'),
+  },
+  async (args) => {
+    const reqId = generateReqId();
+    writeIpcFile(
+      MEDIA_REQ_DIR,
+      {
+        type: 'view_media',
+        reqId,
+        file_id: args.file_id,
+        tg_message_id: args.tg_message_id,
+        mode: args.mode,
+        pages: args.pages,
+        chatJid,
+        groupFolder,
+      },
+      `${reqId}.json`,
+    );
+    return pollResponseFile(MEDIA_RESP_DIR, reqId, 120000, 100);
+  },
+);
+
+server.tool(
+  'lookup_messages',
+  "Search this group's stored message history. Use when the user references something older than the recent context, when walking a reply chain (`<reply mid=\"X\">`), or to find a specific message. Filters: `tg_message_id`, `sender_id`, `since`/`until`, `query` (case-insensitive substring on text — incl. Cyrillic; `%` and `_` in the query are escaped and matched literally). `include_bot` default `false`; pass `true` to UNION the bot's own past replies into the result (not \"only bot\"). Default returns last 50; max 200.",
+  {
+    tg_message_id: z.string().optional(),
+    sender_id: z.string().optional(),
+    since: z.string().optional().describe('ISO timestamp'),
+    until: z.string().optional().describe('ISO timestamp'),
+    query: z
+      .string()
+      .optional()
+      .describe('Case-insensitive substring on text (Cyrillic supported)'),
+    include_bot: z
+      .boolean()
+      .optional()
+      .describe(
+        'Default false. When true, includes bot replies in results.',
+      ),
+    limit: z.number().optional().describe('Default 50; max 200'),
+  },
+  async (args) => {
+    const reqId = generateReqId();
+    writeIpcFile(
+      LOOKUP_REQ_DIR,
+      {
+        type: 'lookup_messages',
+        reqId,
+        tg_message_id: args.tg_message_id,
+        sender_id: args.sender_id,
+        since: args.since,
+        until: args.until,
+        query: args.query,
+        include_bot: args.include_bot,
+        limit: args.limit,
+        chatJid,
+        groupFolder,
+      },
+      `${reqId}.json`,
+    );
+    return pollResponseFile(LOOKUP_RESP_DIR, reqId, 120000, 100);
+  },
+);
+
+server.tool(
+  'lookup_contacts',
+  "Search this group's known people/contacts. Use when the user references a person by name / nickname / `@username` / phone. `query` for free-text; `username` exact (lowercase, no `@`); `tg_id` exact. Returns up to `limit` rows (default 50). Reads a snapshot file refreshed within ~500ms of last upsert — enrichment from `@mention` resolution may not be reflected on the same turn; if a row is missing or `enriched=0`, say so honestly.",
+  {
+    query: z.string().optional().describe('Free-text search'),
+    username: z
+      .string()
+      .optional()
+      .describe('Exact username (lowercase, no @)'),
+    tg_id: z.string().optional().describe('Exact tg_id'),
+    limit: z.number().optional().describe('Default 50'),
+  },
+  async (args) => {
+    try {
+      const raw = fs.readFileSync(CONTACTS_JSON_PATH, 'utf-8');
+      const contacts: Array<Record<string, unknown>> = JSON.parse(raw);
+      const limit = args.limit ?? 50;
+      const lowerQuery = args.query?.toLowerCase();
+      const lowerUsername = args.username?.toLowerCase();
+      const filtered = contacts
+        .filter((c) => {
+          if (args.tg_id && c.tg_id !== args.tg_id) return false;
+          if (lowerUsername && c.username !== lowerUsername) return false;
+          if (lowerQuery) {
+            const haystack = [
+              c.first_name,
+              c.last_name,
+              c.title,
+              c.username,
+              c.bio,
+              c.notes,
+            ]
+              .filter((v): v is string => typeof v === 'string' && v.length > 0)
+              .join(' ')
+              .toLowerCase();
+            if (!haystack.includes(lowerQuery)) return false;
+          }
+          return true;
+        })
+        .slice(0, limit);
+      return {
+        content: [
+          { type: 'text' as const, text: JSON.stringify(filtered, null, 2) },
+        ],
+      };
+    } catch (err) {
+      // ENOENT = no snapshot yet (host hasn't written contacts.json — first
+      // run, or empty contacts table)
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { content: [{ type: 'text' as const, text: '[]' }] };
+      }
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'lookup_contacts failed: ' + String(err),
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'annotate_contact',
+  'Attach a note or tag. Identify by ONE of `ident`, `username`, `tg_id`. `notes` REPLACES previous notes (use for the canonical summary); `tags` APPENDS unique comma-separated tags.',
+  {
+    ident: z.string().optional(),
+    username: z.string().optional(),
+    tg_id: z.string().optional(),
+    notes: z.string().optional().describe('REPLACES previous notes'),
+    tags: z
+      .string()
+      .optional()
+      .describe('APPENDS unique comma-separated tags'),
+  },
+  async (args) => {
+    if (!args.ident && !args.username && !args.tg_id) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'annotate_contact: must provide ident, username, or tg_id',
+          },
+        ],
+        isError: true,
+      };
+    }
+    const reqId = generateReqId();
+    writeIpcFile(
+      CONTACT_WRITE_REQ_DIR,
+      {
+        type: 'annotate_contact',
+        reqId,
+        ident: args.ident,
+        username: args.username,
+        tg_id: args.tg_id,
+        notes: args.notes,
+        tags: args.tags,
+        chatJid,
+        groupFolder,
+      },
+      `${reqId}.json`,
+    );
+    return pollResponseFile(CONTACT_WRITE_RESP_DIR, reqId, 120000, 100);
   },
 );
 
