@@ -17,7 +17,7 @@
     "auth": "tsx src/whatsapp-auth.ts",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
-    "test": "vitest run",
+    "test": "vitest run && (cd container/agent-runner && npm test) && bash scripts/check-outbound-chokepoint.sh",
     "test:watch": "vitest"
   },
   "dependencies": {
