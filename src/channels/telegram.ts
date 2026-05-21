@@ -2,7 +2,7 @@ import https from 'https';
 import http from 'http';
 import FormData from 'form-data';
 import { downloadImage, processImage } from '../image.js';
-import { Api, Bot } from 'grammy';
+import { Api, Bot, type Context } from 'grammy';
 import type { Message } from 'grammy/types';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
@@ -15,6 +15,308 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+import { upsertContact, promoteContactIdent } from '../db.js';
+import { queueEnrich } from './telegram-enrich.js';
+import { buildMetaBlock, type BuildMetaBlockExtras } from './telegram-meta.js';
+
+/**
+ * Test-only re-export at module scope so tests can drive the contact pipeline
+ * without instantiating a Bot. Delegates to the private implementation below.
+ */
+export function _testProcessContactsFromContext(
+  ctx: Context,
+  scope: string,
+): void {
+  return processContactsFromContext(ctx, scope);
+}
+
+/**
+ * Test-only re-export of the `botSenderId` accessor. Mirrors the instance
+ * method's logic with no this-binding, so tests can pass a minimal `{ bot }`
+ * shim without constructing a TelegramChannel.
+ */
+export function _testBotSenderId(self: {
+  bot: { botInfo?: { id: number } } | null;
+}): string | undefined {
+  return self.bot?.botInfo?.id ? String(self.bot.botInfo.id) : undefined;
+}
+
+/**
+ * Walk a grammy `Context` for every channel that may carry a contact identity
+ * (sender, forward, reply, vCard, text-mention, bare @mention) and persist
+ * each one via `upsertContact`/`promoteContactIdent`/`queueEnrich`.
+ *
+ * Called per inbound update (all 4 wired kinds — `message`, `edited_message`,
+ * `channel_post`, `edited_channel_post`) BEFORE `onMessage` delivers the
+ * NewMessage to the orchestrator. Uses `ctx.msg` — grammy's omnibus accessor
+ * (Context.d.ts:222-227) — to handle every wired update kind uniformly.
+ *
+ * `scope` is the per-group contact namespace (`group.folder` for ordinary
+ * groups, `'main'` for the main control group, mirroring the
+ * isMain-precedent at `src/container-runner.ts:884`). All seven triggers
+ * receive the same scope.
+ *
+ * Module-scope (NOT a `TelegramChannel` method) because the test-only
+ * re-export above needs to import it from module scope, and the function
+ * itself is pure (no `this` access — every dependency comes through `ctx`).
+ */
+function processContactsFromContext(ctx: Context, scope: string): void {
+  const msg = ctx.msg;
+  if (!msg) return;
+
+  // Trigger 1: sender. `sender_chat` and `from` are mutually exclusive per
+  // spec line 193-194 — when `sender_chat` is set (e.g. anonymous group
+  // admin), `from` carries the placeholder GroupAnonymousBot and must be
+  // skipped to avoid spurious upserts.
+  if (msg.sender_chat) {
+    const sc = msg.sender_chat;
+    upsertContact(
+      scope,
+      {
+        kind: sc.type === 'channel' ? 'channel' : 'chat',
+        title: 'title' in sc ? sc.title : null,
+        is_bot: 0,
+      },
+      {
+        identity: {
+          tg_id: String(sc.id),
+          username: 'username' in sc ? (sc.username ?? undefined) : undefined,
+        },
+        source: 'sender',
+      },
+    );
+  } else if (msg.from) {
+    // Promote-then-upsert ordering: if a |un: row exists for this user,
+    // merge it into the |id: row first so the subsequent upsert lands on
+    // the merged identity (matches `promoteContactIdent` contract).
+    if (msg.from.username) {
+      promoteContactIdent(scope, msg.from.username, String(msg.from.id));
+    }
+    upsertContact(
+      scope,
+      {
+        kind: 'user',
+        first_name: msg.from.first_name ?? null,
+        last_name: msg.from.last_name ?? null,
+        is_bot: msg.from.is_bot ? 1 : 0,
+      },
+      {
+        identity: {
+          tg_id: String(msg.from.id),
+          username: msg.from.username ?? undefined,
+        },
+        source: 'sender',
+      },
+    );
+  }
+
+  // Trigger 2: forward_origin (Bot API 7.0+ discriminated union).
+  if (msg.forward_origin) {
+    const o = msg.forward_origin;
+    if (o.type === 'user') {
+      const u = o.sender_user;
+      if (u.username) promoteContactIdent(scope, u.username, String(u.id));
+      upsertContact(
+        scope,
+        {
+          kind: 'user',
+          first_name: u.first_name ?? null,
+          last_name: u.last_name ?? null,
+          is_bot: u.is_bot ? 1 : 0,
+        },
+        {
+          identity: {
+            tg_id: String(u.id),
+            username: u.username ?? undefined,
+          },
+          source: 'forward',
+        },
+      );
+    } else if (o.type === 'chat') {
+      const c = o.sender_chat;
+      upsertContact(
+        scope,
+        {
+          kind: c.type === 'channel' ? 'channel' : 'chat',
+          title: 'title' in c ? c.title : null,
+          is_bot: 0,
+        },
+        {
+          identity: {
+            tg_id: String(c.id),
+            username: 'username' in c ? (c.username ?? undefined) : undefined,
+          },
+          source: 'forward',
+        },
+      );
+    } else if (o.type === 'channel') {
+      const c = o.chat;
+      // Channel forward → message link is derivable when the channel is
+      // public (has a `username`). Private channels (no username) omit `link`.
+      const link = c.username
+        ? `https://t.me/${c.username}/${o.message_id}`
+        : null;
+      upsertContact(
+        scope,
+        {
+          kind: 'channel',
+          title: c.title,
+          link,
+          is_bot: 0,
+        },
+        {
+          identity: {
+            tg_id: String(c.id),
+            username: c.username ?? undefined,
+          },
+          source: 'forward',
+        },
+      );
+    }
+    // o.type === 'hidden_user' → only `sender_user_name` (string) is
+    // available, no identity column can be derived → skip.
+  }
+
+  // Trigger 3a: in-chat reply author.
+  if (msg.reply_to_message?.from) {
+    const u = msg.reply_to_message.from;
+    if (u.username) promoteContactIdent(scope, u.username, String(u.id));
+    upsertContact(
+      scope,
+      {
+        kind: 'user',
+        first_name: u.first_name ?? null,
+        last_name: u.last_name ?? null,
+        is_bot: u.is_bot ? 1 : 0,
+      },
+      {
+        identity: {
+          tg_id: String(u.id),
+          username: u.username ?? undefined,
+        },
+        source: 'reply',
+      },
+    );
+  }
+
+  // Trigger 3b: cross-chat external_reply origin author.
+  if (msg.external_reply?.origin) {
+    const o = msg.external_reply.origin;
+    if (o.type === 'user') {
+      const u = o.sender_user;
+      if (u.username) promoteContactIdent(scope, u.username, String(u.id));
+      upsertContact(
+        scope,
+        {
+          kind: 'user',
+          first_name: u.first_name ?? null,
+          last_name: u.last_name ?? null,
+          is_bot: u.is_bot ? 1 : 0,
+        },
+        {
+          identity: {
+            tg_id: String(u.id),
+            username: u.username ?? undefined,
+          },
+          source: 'reply',
+        },
+      );
+    } else if (o.type === 'chat') {
+      const c = o.sender_chat;
+      upsertContact(
+        scope,
+        {
+          kind: c.type === 'channel' ? 'channel' : 'chat',
+          title: 'title' in c ? c.title : null,
+          is_bot: 0,
+        },
+        {
+          identity: {
+            tg_id: String(c.id),
+            username: 'username' in c ? (c.username ?? undefined) : undefined,
+          },
+          source: 'reply',
+        },
+      );
+    } else if (o.type === 'channel') {
+      const c = o.chat;
+      upsertContact(
+        scope,
+        {
+          kind: 'channel',
+          title: c.title,
+          is_bot: 0,
+        },
+        {
+          identity: {
+            tg_id: String(c.id),
+            username: c.username ?? undefined,
+          },
+          source: 'reply',
+        },
+      );
+    }
+    // o.type === 'hidden_user' → no identity → skip (same as trigger 2).
+  }
+
+  // Trigger 4: vCard / shared phone contact.
+  if (msg.contact) {
+    const c = msg.contact;
+    upsertContact(
+      scope,
+      {
+        kind: 'user',
+        first_name: c.first_name ?? null,
+        last_name: c.last_name ?? null,
+        phone: c.phone_number ?? null,
+        is_bot: 0,
+      },
+      {
+        // `user_id` only present when the contact is a registered Telegram
+        // user. Otherwise fall back to a name-based ident.
+        identity: c.user_id
+          ? { tg_id: String(c.user_id) }
+          : { name: `${c.first_name ?? ''} ${c.last_name ?? ''}`.trim() },
+        source: 'vcard',
+      },
+    );
+  }
+
+  // Trigger 5 + 6: walk entities + caption_entities for typed mentions.
+  const entities = [...(msg.entities ?? []), ...(msg.caption_entities ?? [])];
+  for (const e of entities) {
+    if (e.type === 'text_mention') {
+      const u = e.user;
+      if (u.username) promoteContactIdent(scope, u.username, String(u.id));
+      upsertContact(
+        scope,
+        {
+          kind: 'user',
+          first_name: u.first_name ?? null,
+          last_name: u.last_name ?? null,
+          is_bot: u.is_bot ? 1 : 0,
+        },
+        {
+          identity: {
+            tg_id: String(u.id),
+            username: u.username ?? undefined,
+          },
+          source: 'text_mention',
+        },
+      );
+    }
+  }
+  // Bare `@username` mentions don't carry a User payload — we only know the
+  // string. Queue an enrich via getChat (rate-limited, cached).
+  const text = msg.text ?? msg.caption ?? '';
+  for (const e of entities) {
+    if (e.type === 'mention') {
+      // Strip the leading '@' — entity slice is `@username`.
+      const username = text.slice(e.offset + 1, e.offset + e.length);
+      if (username) queueEnrich(scope, username);
+    }
+  }
+}
 
 async function downloadTelegramFile(
   botToken: string,
@@ -229,6 +531,51 @@ export class TelegramChannel implements Channel {
     this.opts = opts;
   }
 
+  /**
+   * Returns the bot's own Telegram user ID as a string, or undefined if the
+   * Bot hasn't finished init (`bot.botInfo` is populated after `connect`'s
+   * `onStart`). Mirrors the optional `Channel.botSenderId()` contract so the
+   * orchestrator can mark outbound rows with the bot's identity.
+   */
+  botSenderId(): string | undefined {
+    return this.bot?.botInfo?.id ? String(this.bot.botInfo.id) : undefined;
+  }
+
+  /**
+   * Derive the contacts namespace for a chat. Main control group → `'main'`
+   * (matches `getContactsForGroup({ scope: 'main', includeUnion: true })`
+   * convention); ordinary groups → their folder slug.
+   */
+  private scopeForGroup(group: RegisteredGroup): string {
+    return group.isMain ? 'main' : group.folder;
+  }
+
+  /**
+   * Final delivery chokepoint for every wired update kind. Runs the contact
+   * pipeline + builds the meta block + attaches it to the NewMessage before
+   * calling `opts.onMessage`. Each existing type-specific handler builds the
+   * content + assembles the partial NewMessage, then routes through here so
+   * the meta and contact persistence happen uniformly.
+   *
+   * `extras` is forwarded to `buildMetaBlock` — voice handlers pass
+   * `transcript` so the meta carries the transcription status.
+   */
+  private deliverInbound(
+    ctx: Context,
+    chatJid: string,
+    group: RegisteredGroup,
+    newMsg: import('../types.js').NewMessage,
+    extras?: BuildMetaBlockExtras,
+  ): void {
+    const scope = this.scopeForGroup(group);
+    processContactsFromContext(ctx, scope);
+    const meta = ctx.msg ? buildMetaBlock(ctx.msg, extras) : undefined;
+    this.opts.onMessage(chatJid, {
+      ...newMsg,
+      meta: meta ?? newMsg.meta,
+    });
+  }
+
   async connect(): Promise<void> {
     this.bot = new Bot(this.botToken, {
       client: {
@@ -337,7 +684,7 @@ export class TelegramChannel implements Channel {
       }
 
       // Deliver message — startMessageLoop() will pick it up
-      this.opts.onMessage(chatJid, {
+      this.deliverInbound(ctx, chatJid, group, {
         id: msgId,
         chat_jid: chatJid,
         sender,
@@ -381,7 +728,7 @@ export class TelegramChannel implements Channel {
         'telegram',
         isGroup,
       );
-      this.opts.onMessage(chatJid, {
+      this.deliverInbound(ctx, chatJid, group, {
         id: ctx.message.message_id.toString(),
         chat_jid: chatJid,
         sender: ctx.from?.id?.toString() || '',
@@ -447,7 +794,7 @@ export class TelegramChannel implements Channel {
         }
       }
 
-      this.opts.onMessage(chatJid, {
+      this.deliverInbound(ctx, chatJid, group, {
         id: ctx.message.message_id.toString(),
         chat_jid: chatJid,
         sender: ctx.from?.id?.toString() || '',
@@ -490,21 +837,33 @@ export class TelegramChannel implements Channel {
       );
 
       let content = `${fwd}${reply}[Voice message]${caption}`;
+      // Track transcription outcome for the meta block (carries status to
+      // the agent so it can distinguish "no audio downloaded" from "audio
+      // present but Groq returned empty").
+      let transcriptStatus: 'ok' | 'failed' | 'missing_key' | 'skipped' =
+        'skipped';
+      let transcriptText: string | undefined;
 
-      if (groqKey && fileId) {
+      if (!groqKey) {
+        transcriptStatus = 'missing_key';
+      } else if (groqKey && fileId) {
         const audioBuffer = await downloadTelegramFile(this.botToken, fileId);
         if (audioBuffer) {
           const transcript = await transcribeWithGroq(audioBuffer, groqKey);
           if (transcript) {
             content = `${fwd}${reply}[Voice message]: ${transcript}${caption}`;
+            transcriptStatus = 'ok';
+            transcriptText = transcript;
             logger.info({ chatJid, senderName }, 'Voice message transcribed');
           } else {
+            transcriptStatus = 'failed';
             logger.warn(
               { chatJid },
               'Groq transcription returned empty result',
             );
           }
         } else {
+          transcriptStatus = 'failed';
           logger.warn(
             { chatJid },
             'Failed to download voice file from Telegram',
@@ -512,15 +871,21 @@ export class TelegramChannel implements Channel {
         }
       }
 
-      this.opts.onMessage(chatJid, {
-        id: ctx.message.message_id.toString(),
-        chat_jid: chatJid,
-        sender: ctx.from?.id?.toString() || '',
-        sender_name: senderName,
-        content,
-        timestamp,
-        is_from_me: false,
-      });
+      this.deliverInbound(
+        ctx,
+        chatJid,
+        group,
+        {
+          id: ctx.message.message_id.toString(),
+          chat_jid: chatJid,
+          sender: ctx.from?.id?.toString() || '',
+          sender_name: senderName,
+          content,
+          timestamp,
+          is_from_me: false,
+        },
+        { transcript: { status: transcriptStatus, text: transcriptText } },
+      );
     });
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
     this.bot.on('message:document', (ctx) => {
@@ -533,6 +898,72 @@ export class TelegramChannel implements Channel {
     });
     this.bot.on('message:location', (ctx) => storeNonText(ctx, '[Location]'));
     this.bot.on('message:contact', (ctx) => storeNonText(ctx, '[Contact]'));
+
+    // Edits and channel posts share the same delivery path: run contact
+    // pipeline + emit meta block, content body is whatever text/caption the
+    // edited or channel message carries (or a stub when neither is set).
+    // These are NEW handlers (not in the existing surface) — they do NOT
+    // overlap with `bot.on('message:*')` because grammy registers each
+    // update-kind handler independently (no fall-through between `message`
+    // and `edited_message`/`channel_post`/`edited_channel_post`).
+    const deliverEditedOrChannel = (
+      ctx: Context,
+      msg: Message,
+      placeholder: string,
+    ) => {
+      const chatJid = `tg:${ctx.chat?.id ?? msg.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+      const timestamp = new Date(msg.date * 1000).toISOString();
+      const senderName =
+        msg.from?.first_name ||
+        msg.from?.username ||
+        msg.from?.id?.toString() ||
+        ('sender_chat' in msg && msg.sender_chat && 'title' in msg.sender_chat
+          ? msg.sender_chat.title
+          : undefined) ||
+        'Unknown';
+      const content = msg.text ?? msg.caption ?? placeholder;
+      const isGroupChat =
+        ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroupChat,
+      );
+      this.deliverInbound(ctx, chatJid, group, {
+        id: msg.message_id.toString(),
+        chat_jid: chatJid,
+        sender:
+          msg.from?.id?.toString() ||
+          ('sender_chat' in msg && msg.sender_chat
+            ? String(msg.sender_chat.id)
+            : ''),
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+    };
+
+    this.bot.on('edited_message', (ctx) => {
+      if (!ctx.editedMessage) return;
+      deliverEditedOrChannel(ctx, ctx.editedMessage, '[edited media]');
+    });
+    this.bot.on('channel_post', (ctx) => {
+      if (!ctx.channelPost) return;
+      deliverEditedOrChannel(ctx, ctx.channelPost, '[channel post]');
+    });
+    this.bot.on('edited_channel_post', (ctx) => {
+      if (!ctx.editedChannelPost) return;
+      deliverEditedOrChannel(
+        ctx,
+        ctx.editedChannelPost,
+        '[edited channel post]',
+      );
+    });
 
     // Handle errors: on 409 conflict restart polling with exponential backoff
     // (happens when a previous instance's long-poll hasn't timed out yet)
