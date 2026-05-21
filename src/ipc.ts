@@ -13,9 +13,34 @@ import {
   updateTask,
 } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
+import {
+  AnnotateContactPayload,
+  AnnotateResponse,
+  handleAnnotateContactRequest,
+  handleLookupMessagesRequest,
+  LookupMessagesPayload,
+  LookupResponse,
+  processAnnotateContact,
+  processLookupMessages,
+} from './ipc-lookup-handler.js';
 import { ViewMediaPayload, ViewMediaResponse } from './ipc-media-handler.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
+
+// Re-export the handlers and their response types so tests + other modules
+// import everything through `./ipc.js`.
+export {
+  handleAnnotateContactRequest,
+  handleLookupMessagesRequest,
+  processAnnotateContact,
+  processLookupMessages,
+};
+export type {
+  AnnotateContactPayload,
+  AnnotateResponse,
+  LookupMessagesPayload,
+  LookupResponse,
+};
 
 export interface IpcDeps {
   sendMessage: (
@@ -44,6 +69,26 @@ export interface IpcDeps {
     payload: ViewMediaPayload,
     requestingGroupJids: string[],
   ) => Promise<ViewMediaResponse>;
+  /**
+   * Optional: dispatch a lookup_messages IPC request. Provided when the
+   * orchestrator wants to expose message history lookups to agents (Task 19).
+   * The callback resolves `requestingGroupJids` from `registeredGroups`,
+   * enriches the payload, and delegates to `handleLookupMessagesRequest`.
+   */
+  lookupMessages?: (
+    payload: LookupMessagesPayload,
+    requestingGroupJids: string[],
+  ) => Promise<LookupResponse>;
+  /**
+   * Optional: dispatch an annotate_contact IPC request. Provided when the
+   * orchestrator wants to expose contact annotation to agents (Task 19).
+   * The callback delegates to `handleAnnotateContactRequest` which enforces
+   * the CROSS_GROUP_REJECTED scope guard.
+   */
+  annotateContact?: (
+    payload: AnnotateContactPayload,
+    group: string,
+  ) => Promise<AnnotateResponse>;
 }
 
 let ipcWatcherRunning = false;
@@ -501,6 +546,182 @@ export function startIpcWatcher(deps: IpcDeps): void {
         logger.error(
           { err, sourceGroup },
           'Error reading IPC media-requests directory',
+        );
+      }
+
+      // Process lookup-requests from this group's IPC directory (Task 19).
+      // Same .processing interlock pattern as media-requests above.
+      try {
+        const lookupReqDir = path.join(
+          ipcBaseDir,
+          sourceGroup,
+          'lookup-requests',
+        );
+        if (deps.lookupMessages && fs.existsSync(lookupReqDir)) {
+          const lookupFiles = fs
+            .readdirSync(lookupReqDir)
+            .filter((f) => f.endsWith('.json'));
+          const requestingGroupJids = Object.entries(registeredGroups)
+            .filter(([, g]) => g.folder === sourceGroup)
+            .map(([jid]) => jid);
+          for (const file of lookupFiles) {
+            const filePath = path.join(lookupReqDir, file);
+            const processingPath = `${filePath}.processing`;
+            try {
+              fs.renameSync(filePath, processingPath);
+            } catch {
+              continue;
+            }
+            let payload: LookupMessagesPayload | null = null;
+            try {
+              const raw = fs.readFileSync(processingPath, 'utf-8');
+              payload = JSON.parse(raw) as LookupMessagesPayload;
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'lookup_messages parse failed — quarantining',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              try {
+                fs.mkdirSync(errorDir, { recursive: true });
+                fs.renameSync(
+                  processingPath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              } catch {
+                /* best effort */
+              }
+              continue;
+            }
+            const reqId = payload.reqId || file.replace(/\.json$/, '');
+            try {
+              const response = await deps.lookupMessages(
+                payload,
+                requestingGroupJids,
+              );
+              writeLookupResponseAtomic(
+                ipcBaseDir,
+                sourceGroup,
+                reqId,
+                response,
+              );
+              try {
+                fs.unlinkSync(processingPath);
+              } catch {
+                /* best effort */
+              }
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'lookup_messages handler threw — writing UPSTREAM_ERROR',
+              );
+              writeLookupResponseAtomic(ipcBaseDir, sourceGroup, reqId, {
+                isError: true,
+                _meta: { error_code: 'UPSTREAM_ERROR', retryable: true },
+                content: [
+                  {
+                    type: 'text',
+                    text: `UPSTREAM_ERROR: handler threw — ${(err as Error).message}`,
+                  },
+                ],
+              });
+              try {
+                fs.unlinkSync(processingPath);
+              } catch {
+                /* best effort */
+              }
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, sourceGroup },
+          'Error reading IPC lookup-requests directory',
+        );
+      }
+
+      // Process contact-write-requests from this group's IPC directory (Task 19).
+      // Same .processing interlock pattern as media-requests above.
+      try {
+        const contactWriteReqDir = path.join(
+          ipcBaseDir,
+          sourceGroup,
+          'contact-write-requests',
+        );
+        if (deps.annotateContact && fs.existsSync(contactWriteReqDir)) {
+          const writeFiles = fs
+            .readdirSync(contactWriteReqDir)
+            .filter((f) => f.endsWith('.json'));
+          for (const file of writeFiles) {
+            const filePath = path.join(contactWriteReqDir, file);
+            const processingPath = `${filePath}.processing`;
+            try {
+              fs.renameSync(filePath, processingPath);
+            } catch {
+              continue;
+            }
+            let payload: AnnotateContactPayload | null = null;
+            try {
+              const raw = fs.readFileSync(processingPath, 'utf-8');
+              payload = JSON.parse(raw) as AnnotateContactPayload;
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'annotate_contact parse failed — quarantining',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              try {
+                fs.mkdirSync(errorDir, { recursive: true });
+                fs.renameSync(
+                  processingPath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              } catch {
+                /* best effort */
+              }
+              continue;
+            }
+            const reqId = payload.reqId || file.replace(/\.json$/, '');
+            try {
+              const response = await deps.annotateContact(payload, sourceGroup);
+              writeContactWriteResponseAtomic(
+                ipcBaseDir,
+                sourceGroup,
+                reqId,
+                response,
+              );
+              try {
+                fs.unlinkSync(processingPath);
+              } catch {
+                /* best effort */
+              }
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'annotate_contact handler threw — writing UPSTREAM_ERROR',
+              );
+              writeContactWriteResponseAtomic(ipcBaseDir, sourceGroup, reqId, {
+                isError: true,
+                _meta: { error_code: 'UPSTREAM_ERROR', retryable: true },
+                content: [
+                  {
+                    type: 'text',
+                    text: `UPSTREAM_ERROR: handler threw — ${(err as Error).message}`,
+                  },
+                ],
+              });
+              try {
+                fs.unlinkSync(processingPath);
+              } catch {
+                /* best effort */
+              }
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, sourceGroup },
+          'Error reading IPC contact-write-requests directory',
         );
       }
 

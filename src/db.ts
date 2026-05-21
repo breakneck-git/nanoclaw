@@ -1146,6 +1146,60 @@ export function annotateContact(
   }
 }
 
+/**
+ * Fetch a single contact row by its fully-qualified `ident`. Returns
+ * `undefined` when no row matches. Used by tests + future single-contact
+ * lookup needs; the bulk read path is `getContactsForGroup`.
+ */
+export function getContactByIdent(ident: string): ContactRow | undefined {
+  return db.prepare('SELECT * FROM contacts WHERE ident = ?').get(ident) as
+    | ContactRow
+    | undefined;
+}
+
+/**
+ * Resolve a contact identifier (`ident` | `tg_id` | `username`) to its
+ * (scope, ident) tuple. Used by the `annotate_contact` IPC handler to enforce
+ * the CROSS_GROUP_REJECTED scope guard before delegating to `annotateContact`.
+ *
+ * Resolution priority mirrors `annotateContact`:
+ *   1. explicit `ident` → SELECT WHERE ident = ?  (unique).
+ *   2. `tg_id` → SELECT WHERE tg_id = ? LIMIT 1   (globally unique; one row).
+ *   3. `username` → SELECT WHERE username = ? LIMIT 1
+ *      (NOT unique across scopes — first row by B-tree iteration wins;
+ *       callers wanting scope-precise resolution must pass `ident`).
+ *
+ * Returns `null` when no row matches. The caller decides whether that's
+ * NOT_FOUND or something else.
+ */
+export function getContactScopeByIdentity(identifier: {
+  ident?: string;
+  username?: string;
+  tg_id?: string;
+}): { scope: string; ident: string } | null {
+  if (identifier.ident) {
+    const row = db
+      .prepare('SELECT scope, ident FROM contacts WHERE ident = ? LIMIT 1')
+      .get(identifier.ident) as { scope: string; ident: string } | undefined;
+    return row ?? null;
+  }
+  if (identifier.tg_id != null) {
+    const row = db
+      .prepare('SELECT scope, ident FROM contacts WHERE tg_id = ? LIMIT 1')
+      .get(identifier.tg_id) as { scope: string; ident: string } | undefined;
+    return row ?? null;
+  }
+  if (identifier.username != null) {
+    const row = db
+      .prepare('SELECT scope, ident FROM contacts WHERE username = ? LIMIT 1')
+      .get(identifier.username.toLowerCase()) as
+      | { scope: string; ident: string }
+      | undefined;
+    return row ?? null;
+  }
+  return null;
+}
+
 // --- Router state accessors ---
 
 export function getRouterState(key: string): string | undefined {

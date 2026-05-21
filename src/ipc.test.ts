@@ -8,8 +8,16 @@ import {
   writeMediaResponseAtomic,
   onContactUpsert,
   flushAllSnapshots,
+  handleLookupMessagesRequest,
+  handleAnnotateContactRequest,
 } from './ipc.js';
 import * as db from './db.js';
+import {
+  _initTestDatabase,
+  getContactByIdent,
+  storeMessage,
+  upsertContact,
+} from './db.js';
 
 vi.mock('./db.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./db.js')>();
@@ -232,5 +240,138 @@ describe('contacts.json snapshot writer', () => {
     );
     expect(renameCall).toBeDefined();
     renameSpy.mockRestore();
+  });
+});
+
+describe('lookup_messages host handler', () => {
+  let ipcRoot: string;
+  beforeEach(() => {
+    _initTestDatabase();
+    ipcRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lookup-handler-'));
+    fs.mkdirSync(path.join(ipcRoot, 'g', 'lookup-requests'), {
+      recursive: true,
+    });
+    fs.mkdirSync(path.join(ipcRoot, 'g', 'lookup-responses'), {
+      recursive: true,
+    });
+  });
+  afterEach(() => {
+    fs.rmSync(ipcRoot, { recursive: true, force: true });
+  });
+
+  it('reads request payload, calls lookupMessages, atomically writes response with rows', async () => {
+    storeMessage({
+      id: '1',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'hi',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    const reqPath = path.join(ipcRoot, 'g', 'lookup-requests', 'req1.json');
+    fs.writeFileSync(
+      reqPath,
+      JSON.stringify({ groupJids: ['tg:1'], includeBot: false, limit: 50 }),
+    );
+    await handleLookupMessagesRequest(ipcRoot, 'g', 'req1');
+    const respPath = path.join(ipcRoot, 'g', 'lookup-responses', 'req1.json');
+    expect(fs.existsSync(respPath)).toBe(true);
+    const resp = JSON.parse(fs.readFileSync(respPath, 'utf-8'));
+    expect(resp.content[0].text).toContain('hi');
+    // Request file unlinked after processing
+    expect(fs.existsSync(reqPath)).toBe(false);
+  });
+});
+
+describe('annotate_contact host handler', () => {
+  let ipcRoot: string;
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _initTestDatabase();
+    // Snapshot writer reads getContactsForGroup; keep it returning [] so the
+    // debounced snapshot (when it fires) doesn't try to stringify undefined.
+    vi.mocked(db.getContactsForGroup).mockReturnValue([]);
+    ipcRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'annotate-'));
+    fs.mkdirSync(path.join(ipcRoot, 'g', 'contact-write-requests'), {
+      recursive: true,
+    });
+    fs.mkdirSync(path.join(ipcRoot, 'g', 'contact-write-responses'), {
+      recursive: true,
+    });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    fs.rmSync(ipcRoot, { recursive: true, force: true });
+    vi.mocked(db.getContactsForGroup).mockReset();
+  });
+
+  it('reads request payload, calls annotateContact, triggers debounced snapshot, writes response', async () => {
+    upsertContact(
+      'g',
+      { kind: 'user' },
+      { identity: { tg_id: '42' }, source: 'sender' },
+    );
+    const reqPath = path.join(
+      ipcRoot,
+      'g',
+      'contact-write-requests',
+      'req1.json',
+    );
+    fs.writeFileSync(
+      reqPath,
+      JSON.stringify({ identifier: { tg_id: '42' }, notes: 'likes coffee' }),
+    );
+    await handleAnnotateContactRequest(ipcRoot, 'g', 'req1');
+    const row = getContactByIdent('g|id:42');
+    expect(row?.notes).toBe('likes coffee');
+    const respPath = path.join(
+      ipcRoot,
+      'g',
+      'contact-write-responses',
+      'req1.json',
+    );
+    expect(fs.existsSync(respPath)).toBe(true);
+    expect(fs.existsSync(reqPath)).toBe(false);
+    // Snapshot debounce was scheduled — advance to flush
+    vi.advanceTimersByTime(501);
+  });
+
+  it("CROSS_GROUP_REJECTED when identifier points at another group's contact", async () => {
+    // Seed contact in DIFFERENT scope
+    upsertContact(
+      'other_group',
+      { kind: 'user' },
+      { identity: { tg_id: '777' }, source: 'sender' },
+    );
+    // Request annotation from scope 'g' for that other_group contact
+    const reqPath = path.join(
+      ipcRoot,
+      'g',
+      'contact-write-requests',
+      'req2.json',
+    );
+    fs.writeFileSync(
+      reqPath,
+      JSON.stringify({
+        identifier: { tg_id: '777' },
+        notes: 'cross-group attempt',
+      }),
+    );
+    await handleAnnotateContactRequest(ipcRoot, 'g', 'req2');
+    // Assert response carries CROSS_GROUP_REJECTED
+    const respPath = path.join(
+      ipcRoot,
+      'g',
+      'contact-write-responses',
+      'req2.json',
+    );
+    const resp = JSON.parse(fs.readFileSync(respPath, 'utf-8'));
+    expect(resp.isError).toBe(true);
+    expect(resp._meta.error_code).toBe('CROSS_GROUP_REJECTED');
+    // Assert NO mutation occurred on the other_group row
+    const row = getContactByIdent('other_group|id:777');
+    expect(row?.notes).toBeNull();
   });
 });
