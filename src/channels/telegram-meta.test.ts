@@ -546,3 +546,584 @@ describe('buildMetaBlock — <entities>', () => {
     await smokeParseXml(meta);
   });
 });
+
+describe('buildMetaBlock — <media> for all 8 types', () => {
+  it.each([
+    {
+      type: 'photo',
+      fixture: {
+        photo: [
+          {
+            file_id: 'photo123',
+            file_unique_id: 'pu1',
+            width: 1280,
+            height: 960,
+            file_size: 5000,
+          },
+        ],
+      },
+      expectedMime: 'image/jpeg',
+    },
+    {
+      type: 'video',
+      fixture: {
+        video: {
+          file_id: 'vid123',
+          file_unique_id: 'vu1',
+          width: 1920,
+          height: 1080,
+          duration: 30,
+          mime_type: 'video/mp4',
+          file_size: 50000,
+        },
+      },
+      expectedMime: 'video/mp4',
+    },
+    {
+      type: 'voice',
+      fixture: {
+        voice: {
+          file_id: 'voice123',
+          file_unique_id: 'voiceu1',
+          duration: 10,
+          mime_type: 'audio/ogg',
+          file_size: 8000,
+        },
+      },
+      expectedMime: 'audio/ogg',
+    },
+    {
+      type: 'audio',
+      fixture: {
+        audio: {
+          file_id: 'audio123',
+          file_unique_id: 'au1',
+          duration: 180,
+          mime_type: 'audio/mpeg',
+          title: 'Song',
+          performer: 'Band',
+          file_size: 4000000,
+        },
+      },
+      expectedMime: 'audio/mpeg',
+    },
+    {
+      type: 'document',
+      fixture: {
+        document: {
+          file_id: 'doc123',
+          file_unique_id: 'du1',
+          file_name: 'report.pdf',
+          mime_type: 'application/pdf',
+          file_size: 20480,
+        },
+      },
+      expectedMime: 'application/pdf',
+    },
+    {
+      type: 'sticker',
+      fixture: {
+        sticker: {
+          file_id: 'sticker123',
+          file_unique_id: 'su1',
+          width: 512,
+          height: 512,
+          type: 'regular',
+          emoji: '🐬',
+          is_animated: false,
+          is_video: false,
+        },
+      },
+      expectedMime: 'image/webp',
+    },
+    {
+      type: 'animation',
+      fixture: {
+        animation: {
+          file_id: 'anim123',
+          file_unique_id: 'aniu1',
+          width: 480,
+          height: 270,
+          duration: 5,
+          mime_type: 'video/mp4',
+          file_size: 100000,
+        },
+      },
+      expectedMime: 'video/mp4',
+    },
+    {
+      type: 'video_note',
+      fixture: {
+        video_note: {
+          file_id: 'vnote123',
+          file_unique_id: 'vnu1',
+          length: 240,
+          duration: 8,
+          file_size: 50000,
+        },
+      },
+      expectedMime: undefined,
+    },
+  ])(
+    'emits <media type="$type"> with file_id and expected mime',
+    async ({ type, fixture, expectedMime }) => {
+      const msg = {
+        message_id: 1,
+        date: 1747731600,
+        chat: { id: 1, type: 'private' as const, first_name: 'X' },
+        ...fixture,
+      };
+      const meta = buildMetaBlock(msg as any);
+      expect(meta).toContain(`<media type="${type}"`);
+      expect(meta).toContain('file_id=');
+      if (expectedMime) {
+        expect(meta).toContain(`mime="${expectedMime}"`);
+      } else {
+        expect(meta).not.toContain('mime=');
+      }
+      await smokeParseXml(meta);
+    },
+  );
+
+  it('photo: uses last (largest) PhotoSize for file_id + dimensions', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      photo: [
+        {
+          file_id: 'thumb_id',
+          file_unique_id: 'thumb_u',
+          width: 90,
+          height: 67,
+          file_size: 1500,
+        },
+        {
+          file_id: 'medium_id',
+          file_unique_id: 'medium_u',
+          width: 320,
+          height: 240,
+          file_size: 8000,
+        },
+        {
+          file_id: 'largest_id',
+          file_unique_id: 'largest_u',
+          width: 1280,
+          height: 960,
+          file_size: 50000,
+        },
+      ],
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('file_id="largest_id"');
+    expect(meta).toContain('file_unique_id="largest_u"');
+    expect(meta).toContain('w="1280"');
+    expect(meta).toContain('h="960"');
+    expect(meta).toContain('size="50000"');
+    expect(meta).not.toContain('thumb_id');
+    expect(meta).not.toContain('medium_id');
+    await smokeParseXml(meta);
+  });
+
+  it('document: emits name attribute from file_name', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      document: {
+        file_id: 'doc123',
+        file_unique_id: 'du1',
+        file_name: 'report.pdf',
+        mime_type: 'application/pdf',
+        file_size: 20480,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('name="report.pdf"');
+    expect(meta).toContain('size="20480"');
+    await smokeParseXml(meta);
+  });
+
+  it('audio: emits title and performer attributes', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      audio: {
+        file_id: 'audio123',
+        file_unique_id: 'au1',
+        duration: 180,
+        mime_type: 'audio/mpeg',
+        title: 'Song',
+        performer: 'Band',
+        file_size: 4000000,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('title="Song"');
+    expect(meta).toContain('performer="Band"');
+    expect(meta).toContain('duration="180"');
+    await smokeParseXml(meta);
+  });
+
+  it('video_note: emits length attribute (square video diameter)', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      video_note: {
+        file_id: 'vnote123',
+        file_unique_id: 'vnu1',
+        length: 240,
+        duration: 8,
+        file_size: 50000,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('length="240"');
+    expect(meta).toContain('duration="8"');
+    await smokeParseXml(meta);
+  });
+});
+
+describe('buildMetaBlock — sticker mime cascade', () => {
+  it('is_animated=true → application/x-tgsticker (wins over is_video)', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      sticker: {
+        file_id: 'sticker123',
+        file_unique_id: 'su1',
+        width: 512,
+        height: 512,
+        type: 'regular' as const,
+        is_animated: true,
+        is_video: true, // proves animated wins over video
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('mime="application/x-tgsticker"');
+    expect(meta).not.toContain('mime="video/webm"');
+    expect(meta).not.toContain('mime="image/webp"');
+    await smokeParseXml(meta);
+  });
+  it('is_video=true → video/webm (when is_animated false)', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      sticker: {
+        file_id: 'sticker123',
+        file_unique_id: 'su1',
+        width: 512,
+        height: 512,
+        type: 'regular' as const,
+        is_animated: false,
+        is_video: true,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('mime="video/webm"');
+    expect(meta).not.toContain('mime="application/x-tgsticker"');
+    expect(meta).not.toContain('mime="image/webp"');
+    await smokeParseXml(meta);
+  });
+  it('else → image/webp', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      sticker: {
+        file_id: 'sticker123',
+        file_unique_id: 'su1',
+        width: 512,
+        height: 512,
+        type: 'regular' as const,
+        is_animated: false,
+        is_video: false,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('mime="image/webp"');
+    expect(meta).not.toContain('mime="application/x-tgsticker"');
+    expect(meta).not.toContain('mime="video/webm"');
+    await smokeParseXml(meta);
+  });
+});
+
+describe('buildMetaBlock — sticker_kind orthogonal', () => {
+  it('emits sticker_kind="regular" alongside mime cascade', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      sticker: {
+        file_id: 'sticker123',
+        file_unique_id: 'su1',
+        width: 512,
+        height: 512,
+        type: 'regular' as const,
+        is_animated: false,
+        is_video: false,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('sticker_kind="regular"');
+    expect(meta).toContain('mime="image/webp"');
+    await smokeParseXml(meta);
+  });
+  it('emits sticker_kind="mask"', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      sticker: {
+        file_id: 'sticker123',
+        file_unique_id: 'su1',
+        width: 512,
+        height: 512,
+        type: 'mask' as const,
+        is_animated: false,
+        is_video: false,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('sticker_kind="mask"');
+    await smokeParseXml(meta);
+  });
+  it('emits sticker_kind="custom_emoji"', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      sticker: {
+        file_id: 'sticker123',
+        file_unique_id: 'su1',
+        width: 512,
+        height: 512,
+        type: 'custom_emoji' as const,
+        is_animated: false,
+        is_video: false,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('sticker_kind="custom_emoji"');
+    await smokeParseXml(meta);
+  });
+  it('emits emoji and set_name when present', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      sticker: {
+        file_id: 'sticker123',
+        file_unique_id: 'su1',
+        width: 512,
+        height: 512,
+        type: 'regular' as const,
+        emoji: '🐬',
+        set_name: 'MyPack',
+        is_animated: false,
+        is_video: false,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('emoji="🐬"');
+    expect(meta).toContain('set_name="MyPack"');
+    await smokeParseXml(meta);
+  });
+});
+
+describe('buildMetaBlock — voice/video_note transcript', () => {
+  it('voice: emits transcript_status="ok" + transcript attribute when extras.transcript.status="ok"', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      voice: {
+        file_id: 'voice123',
+        file_unique_id: 'voiceu1',
+        duration: 10,
+        mime_type: 'audio/ogg',
+        file_size: 8000,
+      },
+    };
+    const meta = buildMetaBlock(msg as any, {
+      transcript: { status: 'ok', text: 'hello world' },
+    });
+    expect(meta).toContain('transcript_status="ok"');
+    expect(meta).toContain('transcript="hello world"');
+    await smokeParseXml(meta);
+  });
+  it('voice: emits transcript_status="failed" without transcript attribute', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      voice: {
+        file_id: 'voice123',
+        file_unique_id: 'voiceu1',
+        duration: 10,
+        mime_type: 'audio/ogg',
+        file_size: 8000,
+      },
+    };
+    const meta = buildMetaBlock(msg as any, {
+      transcript: { status: 'failed' },
+    });
+    expect(meta).toContain('transcript_status="failed"');
+    expect(meta).not.toContain('transcript="');
+    await smokeParseXml(meta);
+  });
+  it('voice: emits transcript_status="missing_key"', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      voice: {
+        file_id: 'voice123',
+        file_unique_id: 'voiceu1',
+        duration: 10,
+        mime_type: 'audio/ogg',
+        file_size: 8000,
+      },
+    };
+    const meta = buildMetaBlock(msg as any, {
+      transcript: { status: 'missing_key' },
+    });
+    expect(meta).toContain('transcript_status="missing_key"');
+    expect(meta).not.toContain('transcript="');
+    await smokeParseXml(meta);
+  });
+  it('voice: emits transcript_status="skipped"', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      voice: {
+        file_id: 'voice123',
+        file_unique_id: 'voiceu1',
+        duration: 10,
+        mime_type: 'audio/ogg',
+        file_size: 8000,
+      },
+    };
+    const meta = buildMetaBlock(msg as any, {
+      transcript: { status: 'skipped' },
+    });
+    expect(meta).toContain('transcript_status="skipped"');
+    expect(meta).not.toContain('transcript="');
+    await smokeParseXml(meta);
+  });
+  it('voice: omits transcript attributes when extras undefined', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      voice: {
+        file_id: 'voice123',
+        file_unique_id: 'voiceu1',
+        duration: 10,
+        mime_type: 'audio/ogg',
+        file_size: 8000,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).not.toContain('transcript_status=');
+    expect(meta).not.toContain('transcript=');
+    await smokeParseXml(meta);
+  });
+  it('video_note: emits transcript_status + transcript', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      video_note: {
+        file_id: 'vnote123',
+        file_unique_id: 'vnu1',
+        length: 240,
+        duration: 8,
+        file_size: 50000,
+      },
+    };
+    const meta = buildMetaBlock(msg as any, {
+      transcript: { status: 'ok', text: 'recorded clip' },
+    });
+    expect(meta).toContain('<media type="video_note"');
+    expect(meta).toContain('transcript_status="ok"');
+    expect(meta).toContain('transcript="recorded clip"');
+    await smokeParseXml(meta);
+  });
+  it('transcript truncates safely (no orphan surrogate at boundary)', async () => {
+    // 1999 ASCII chars + 🐬 (2 UTF-16 code units = 1 code point).
+    // Total = 2000 code points; safeTruncate(.., 2000) returns intact string.
+    // For the orphan test, use 2000 ASCII chars + 🐬 → safeTruncate(.., 2000)
+    // must drop the 🐬 entirely, not split it.
+    const longText = 'a'.repeat(2000) + '🐬';
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      voice: {
+        file_id: 'voice123',
+        file_unique_id: 'voiceu1',
+        duration: 10,
+        mime_type: 'audio/ogg',
+        file_size: 8000,
+      },
+    };
+    const meta = buildMetaBlock(msg as any, {
+      transcript: { status: 'ok', text: longText },
+    });
+    const m = meta.match(/transcript="([^"]*)"/);
+    expect(m).not.toBeNull();
+    const transcriptAttr = m![1];
+    const lastCharCode = transcriptAttr.charCodeAt(transcriptAttr.length - 1);
+    expect(lastCharCode >= 0xd800 && lastCharCode <= 0xdbff).toBe(false);
+    await smokeParseXml(meta);
+  });
+  it('transcript: escapes XML special chars in text', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      voice: {
+        file_id: 'voice123',
+        file_unique_id: 'voiceu1',
+        duration: 10,
+        mime_type: 'audio/ogg',
+        file_size: 8000,
+      },
+    };
+    const meta = buildMetaBlock(msg as any, {
+      transcript: { status: 'ok', text: 'hello "world" <tag> & end' },
+    });
+    expect(meta).toContain(
+      'transcript="hello &quot;world&quot; &lt;tag&gt; &amp; end"',
+    );
+    await smokeParseXml(meta);
+  });
+  it('non-voice/video_note types: extras.transcript ignored', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      video: {
+        file_id: 'vid123',
+        file_unique_id: 'vu1',
+        width: 1920,
+        height: 1080,
+        duration: 30,
+        mime_type: 'video/mp4',
+        file_size: 50000,
+      },
+    };
+    const meta = buildMetaBlock(msg as any, {
+      transcript: { status: 'ok', text: 'ignored' },
+    });
+    expect(meta).not.toContain('transcript_status=');
+    expect(meta).not.toContain('transcript=');
+    await smokeParseXml(meta);
+  });
+});

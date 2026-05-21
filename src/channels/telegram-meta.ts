@@ -18,6 +18,18 @@ export function escapeXmlText(v: unknown): string {
 }
 
 /**
+ * Optional context the channel layer can pass to buildMetaBlock — populated
+ * elsewhere (e.g. voice transcription pipeline in src/channels/telegram.ts).
+ * Purely additive so existing callers that don't yet supply extras keep working.
+ */
+export interface BuildMetaBlockExtras {
+  transcript?: {
+    text?: string;
+    status: 'ok' | 'failed' | 'missing_key' | 'skipped';
+  };
+}
+
+/**
  * Build the structured <m>...</m> XML block from a Telegram Message.
  * Returns the raw block (no enclosing root). Caller stores in messages.meta column.
  *
@@ -34,7 +46,10 @@ export function escapeXmlText(v: unknown): string {
  * when both present (matches typical agent prompt format). If last_name absent,
  * name = first_name alone.
  */
-export function buildMetaBlock(message: Message): string {
+export function buildMetaBlock(
+  message: Message,
+  extras?: BuildMetaBlockExtras,
+): string {
   const parts: string[] = [];
   const mAttrs: string[] = [`id="${escapeXmlAttr(message.message_id)}"`];
   mAttrs.push(
@@ -124,6 +139,11 @@ export function buildMetaBlock(message: Message): string {
   if (entityChildren.length > 0) {
     parts.push(`<entities>${entityChildren.join('')}</entities>`);
   }
+
+  // <media>: photo/video/voice/audio/document/sticker/animation/video_note
+  // (mutex — Telegram sets at most one of these per message).
+  const mediaTag = buildMediaTag(message, extras);
+  if (mediaTag) parts.push(mediaTag);
 
   parts.push(`</m>`);
   return parts.join('');
@@ -292,6 +312,161 @@ function buildExternalReplyTag(
     }
   }
   return `<reply ${attrs.join(' ')}/>`;
+}
+
+/**
+ * Render <media .../> for whichever single media field is set on the message
+ * (Telegram populates at most one). Returns null when no media is present so the
+ * caller can skip emission entirely (spec line 188 — omit empty tags).
+ *
+ * Sticker mime cascade (spec line 199, priority order, first match wins):
+ *   1. is_animated === true  → application/x-tgsticker
+ *   2. is_video === true     → video/webm
+ *   3. else                  → image/webp
+ * sticker_kind is orthogonal to mime — both emitted from sticker.type ∈
+ * {regular, mask, custom_emoji}. Photos synthesize image/jpeg (Telegram never
+ * reports a mime for photos).
+ *
+ * Voice and video_note pull transcript text + status from `extras.transcript`
+ * — populated by the channel layer's transcription pipeline (Task 10 wiring).
+ * Transcript text is safeTruncate'd to 2000 code points so surrogate pairs
+ * survive the boundary cut (orphan high surrogates poison Claude API requests).
+ */
+function buildMediaTag(
+  message: Message,
+  extras: BuildMetaBlockExtras | undefined,
+): string | null {
+  if ('photo' in message && message.photo && message.photo.length > 0) {
+    // PhotoSize[] is sorted ascending; the largest is what view_media will fetch.
+    const largest = message.photo[message.photo.length - 1];
+    const attrs = [
+      `type="photo"`,
+      `file_id="${escapeXmlAttr(largest.file_id)}"`,
+      `mime="image/jpeg"`,
+    ];
+    if (largest.file_unique_id)
+      attrs.push(`file_unique_id="${escapeXmlAttr(largest.file_unique_id)}"`);
+    if (largest.width) attrs.push(`w="${escapeXmlAttr(largest.width)}"`);
+    if (largest.height) attrs.push(`h="${escapeXmlAttr(largest.height)}"`);
+    if (largest.file_size)
+      attrs.push(`size="${escapeXmlAttr(largest.file_size)}"`);
+    return `<media ${attrs.join(' ')}/>`;
+  }
+  if ('video' in message && message.video) {
+    const v = message.video;
+    const attrs = [`type="video"`, `file_id="${escapeXmlAttr(v.file_id)}"`];
+    if (v.mime_type) attrs.push(`mime="${escapeXmlAttr(v.mime_type)}"`);
+    if (v.file_unique_id)
+      attrs.push(`file_unique_id="${escapeXmlAttr(v.file_unique_id)}"`);
+    if (v.width) attrs.push(`w="${escapeXmlAttr(v.width)}"`);
+    if (v.height) attrs.push(`h="${escapeXmlAttr(v.height)}"`);
+    if (v.duration) attrs.push(`duration="${escapeXmlAttr(v.duration)}"`);
+    if (v.file_size) attrs.push(`size="${escapeXmlAttr(v.file_size)}"`);
+    if (v.file_name) attrs.push(`name="${escapeXmlAttr(v.file_name)}"`);
+    return `<media ${attrs.join(' ')}/>`;
+  }
+  if ('voice' in message && message.voice) {
+    const v = message.voice;
+    const attrs = [`type="voice"`, `file_id="${escapeXmlAttr(v.file_id)}"`];
+    if (v.mime_type) attrs.push(`mime="${escapeXmlAttr(v.mime_type)}"`);
+    if (v.file_unique_id)
+      attrs.push(`file_unique_id="${escapeXmlAttr(v.file_unique_id)}"`);
+    if (v.duration) attrs.push(`duration="${escapeXmlAttr(v.duration)}"`);
+    if (v.file_size) attrs.push(`size="${escapeXmlAttr(v.file_size)}"`);
+    appendTranscriptAttrs(attrs, extras);
+    return `<media ${attrs.join(' ')}/>`;
+  }
+  if ('audio' in message && message.audio) {
+    const a = message.audio;
+    const attrs = [`type="audio"`, `file_id="${escapeXmlAttr(a.file_id)}"`];
+    if (a.mime_type) attrs.push(`mime="${escapeXmlAttr(a.mime_type)}"`);
+    if (a.file_unique_id)
+      attrs.push(`file_unique_id="${escapeXmlAttr(a.file_unique_id)}"`);
+    if (a.duration) attrs.push(`duration="${escapeXmlAttr(a.duration)}"`);
+    if (a.file_size) attrs.push(`size="${escapeXmlAttr(a.file_size)}"`);
+    if (a.title) attrs.push(`title="${escapeXmlAttr(a.title)}"`);
+    if (a.performer) attrs.push(`performer="${escapeXmlAttr(a.performer)}"`);
+    return `<media ${attrs.join(' ')}/>`;
+  }
+  if ('document' in message && message.document) {
+    const d = message.document;
+    const attrs = [`type="document"`, `file_id="${escapeXmlAttr(d.file_id)}"`];
+    if (d.mime_type) attrs.push(`mime="${escapeXmlAttr(d.mime_type)}"`);
+    if (d.file_unique_id)
+      attrs.push(`file_unique_id="${escapeXmlAttr(d.file_unique_id)}"`);
+    if (d.file_name) attrs.push(`name="${escapeXmlAttr(d.file_name)}"`);
+    if (d.file_size) attrs.push(`size="${escapeXmlAttr(d.file_size)}"`);
+    return `<media ${attrs.join(' ')}/>`;
+  }
+  if ('sticker' in message && message.sticker) {
+    const s = message.sticker;
+    // Mime cascade — DO NOT trust s.mime_type / sticker doesn't reliably set it.
+    // Priority is fixed per spec; first truthy flag wins.
+    const mime = s.is_animated
+      ? 'application/x-tgsticker'
+      : s.is_video
+        ? 'video/webm'
+        : 'image/webp';
+    const attrs = [
+      `type="sticker"`,
+      `file_id="${escapeXmlAttr(s.file_id)}"`,
+      `mime="${escapeXmlAttr(mime)}"`,
+      `sticker_kind="${escapeXmlAttr(s.type)}"`,
+    ];
+    if (s.file_unique_id)
+      attrs.push(`file_unique_id="${escapeXmlAttr(s.file_unique_id)}"`);
+    if (s.width) attrs.push(`w="${escapeXmlAttr(s.width)}"`);
+    if (s.height) attrs.push(`h="${escapeXmlAttr(s.height)}"`);
+    if (s.emoji) attrs.push(`emoji="${escapeXmlAttr(s.emoji)}"`);
+    if (s.set_name) attrs.push(`set_name="${escapeXmlAttr(s.set_name)}"`);
+    if (s.file_size) attrs.push(`size="${escapeXmlAttr(s.file_size)}"`);
+    return `<media ${attrs.join(' ')}/>`;
+  }
+  if ('animation' in message && message.animation) {
+    const a = message.animation;
+    const attrs = [`type="animation"`, `file_id="${escapeXmlAttr(a.file_id)}"`];
+    if (a.mime_type) attrs.push(`mime="${escapeXmlAttr(a.mime_type)}"`);
+    if (a.file_unique_id)
+      attrs.push(`file_unique_id="${escapeXmlAttr(a.file_unique_id)}"`);
+    if (a.width) attrs.push(`w="${escapeXmlAttr(a.width)}"`);
+    if (a.height) attrs.push(`h="${escapeXmlAttr(a.height)}"`);
+    if (a.duration) attrs.push(`duration="${escapeXmlAttr(a.duration)}"`);
+    if (a.file_size) attrs.push(`size="${escapeXmlAttr(a.file_size)}"`);
+    if (a.file_name) attrs.push(`name="${escapeXmlAttr(a.file_name)}"`);
+    return `<media ${attrs.join(' ')}/>`;
+  }
+  if ('video_note' in message && message.video_note) {
+    const vn = message.video_note;
+    const attrs = [
+      `type="video_note"`,
+      `file_id="${escapeXmlAttr(vn.file_id)}"`,
+    ];
+    // video_note has no mime_type field in Bot API — intentionally absent here.
+    if (vn.file_unique_id)
+      attrs.push(`file_unique_id="${escapeXmlAttr(vn.file_unique_id)}"`);
+    if (vn.length) attrs.push(`length="${escapeXmlAttr(vn.length)}"`);
+    if (vn.duration) attrs.push(`duration="${escapeXmlAttr(vn.duration)}"`);
+    if (vn.file_size) attrs.push(`size="${escapeXmlAttr(vn.file_size)}"`);
+    appendTranscriptAttrs(attrs, extras);
+    return `<media ${attrs.join(' ')}/>`;
+  }
+  return null;
+}
+
+/** Append transcript_status (always when extras.transcript set) and transcript
+ *  text (only when status === 'ok' AND text is non-empty). Text passes through
+ *  safeTruncate(2000) so a 🐬 at the boundary isn't split into an orphan high
+ *  surrogate that crashes Claude API JSON-serialization downstream. */
+function appendTranscriptAttrs(
+  attrs: string[],
+  extras: BuildMetaBlockExtras | undefined,
+): void {
+  if (!extras?.transcript) return;
+  const t = extras.transcript;
+  attrs.push(`transcript_status="${escapeXmlAttr(t.status)}"`);
+  if (t.status === 'ok' && t.text) {
+    attrs.push(`transcript="${escapeXmlAttr(safeTruncate(t.text, 2000))}"`);
+  }
 }
 
 /**
