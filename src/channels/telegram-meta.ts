@@ -1,14 +1,63 @@
 import type {
+  Animation,
+  Audio,
   Contact,
+  Document,
   LinkPreviewOptions,
+  Location,
   Message,
   MessageEntity,
   MessageOrigin,
+  PhotoSize,
   Poll,
+  Sticker,
   Story,
   User,
+  Venue,
+  Video,
+  VideoNote,
+  Voice,
 } from 'grammy/types';
 import { safeTruncate } from '../safe-truncate.js';
+
+/**
+ * Max code points for reply snippet text. Telegram truncates aggressively;
+ * 500 keeps the snippet readable in agent context without consuming budget.
+ */
+const REPLY_SNIPPET_MAX_CODEPOINTS = 500;
+
+/**
+ * Max code points for voice / video_note transcripts. Truncating by code points
+ * (not UTF-16 units) avoids splitting surrogate pairs — an orphan high surrogate
+ * crashes Claude API JSON serialization with `no low surrogate in string`.
+ */
+const TRANSCRIPT_MAX_CODEPOINTS = 2000;
+
+/**
+ * Subset of Message/ExternalReplyInfo media fields. Both shapes have these as
+ * optional fields with identical leaf types, so a single union lets buildMediaTag
+ * accept either input without runtime change.
+ */
+type MediaHolder = {
+  photo?: PhotoSize[];
+  video?: Video;
+  voice?: Voice;
+  audio?: Audio;
+  document?: Document;
+  sticker?: Sticker;
+  animation?: Animation;
+  video_note?: VideoNote;
+};
+
+/**
+ * Subset of Message/ExternalReplyInfo location fields. Venue takes precedence
+ * over plain location (carries title + address). Both shapes have these as
+ * optional fields with identical leaf types.
+ */
+type LocationHolder = {
+  location?: Location;
+  venue?: Venue;
+};
 
 export function escapeXmlAttr(v: unknown): string {
   return String(v ?? '')
@@ -291,14 +340,16 @@ function buildInChatReplyTag(
       : undefined) ??
     '';
   if (snippetSource) {
-    attrs.push(`snippet="${escapeXmlAttr(safeTruncate(snippetSource, 500))}"`);
+    attrs.push(
+      `snippet="${escapeXmlAttr(safeTruncate(snippetSource, REPLY_SNIPPET_MAX_CODEPOINTS))}"`,
+    );
   }
   return `<reply ${attrs.join(' ')}/>`;
 }
 
 /** Render external <reply external="1" .../> from message.external_reply.
- *  Task 8b-1 scope: opening tag + origin attributes only (self-closed).
- *  Tasks 8b-2/3 will extend to wrap nested media/contact/location/etc. payload. */
+ *  Emits origin attributes + nested payload tags (media/contact/location/poll/story/link_preview).
+ *  When no payload fields are set, emits self-closed form. */
 function buildExternalReplyTag(
   reply: NonNullable<Message['external_reply']>,
 ): string {
@@ -366,7 +417,29 @@ function buildExternalReplyTag(
       break;
     }
   }
-  return `<reply ${attrs.join(' ')}/>`;
+
+  // Nested payload tags — spec line 196 (origin attrs + ALL payload tags).
+  // Voice/video_note transcripts are not currently surfaced for external replies
+  // (the transcription pipeline only fires on the inbound message), so the
+  // second arg to buildMediaTag is undefined.
+  const childParts: string[] = [];
+  const mediaTag = buildMediaTag(reply, undefined);
+  if (mediaTag) childParts.push(mediaTag);
+  if (reply.contact) childParts.push(buildContactTag(reply.contact));
+  const locationTag = buildLocationTag(reply);
+  if (locationTag) childParts.push(locationTag);
+  if (reply.poll) childParts.push(buildPollTag(reply.poll));
+  if (reply.story) childParts.push(buildStoryTag(reply.story));
+  if (reply.link_preview_options) {
+    const lp = buildLinkPreviewTag(reply.link_preview_options);
+    if (lp) childParts.push(lp);
+  }
+
+  if (childParts.length === 0) {
+    // Preserve self-closed form when no payload — backward compat with Task 8b-1.
+    return `<reply ${attrs.join(' ')}/>`;
+  }
+  return `<reply ${attrs.join(' ')}>${childParts.join('')}</reply>`;
 }
 
 /**
@@ -388,12 +461,12 @@ function buildExternalReplyTag(
  * survive the boundary cut (orphan high surrogates poison Claude API requests).
  */
 function buildMediaTag(
-  message: Message,
+  holder: MediaHolder,
   extras: BuildMetaBlockExtras | undefined,
 ): string | null {
-  if ('photo' in message && message.photo && message.photo.length > 0) {
+  if ('photo' in holder && holder.photo && holder.photo.length > 0) {
     // PhotoSize[] is sorted ascending; the largest is what view_media will fetch.
-    const largest = message.photo[message.photo.length - 1];
+    const largest = holder.photo[holder.photo.length - 1];
     const attrs = [
       `type="photo"`,
       `file_id="${escapeXmlAttr(largest.file_id)}"`,
@@ -407,8 +480,8 @@ function buildMediaTag(
       attrs.push(`size="${escapeXmlAttr(largest.file_size)}"`);
     return `<media ${attrs.join(' ')}/>`;
   }
-  if ('video' in message && message.video) {
-    const v = message.video;
+  if ('video' in holder && holder.video) {
+    const v = holder.video;
     const attrs = [`type="video"`, `file_id="${escapeXmlAttr(v.file_id)}"`];
     if (v.mime_type) attrs.push(`mime="${escapeXmlAttr(v.mime_type)}"`);
     if (v.file_unique_id)
@@ -420,8 +493,8 @@ function buildMediaTag(
     if (v.file_name) attrs.push(`name="${escapeXmlAttr(v.file_name)}"`);
     return `<media ${attrs.join(' ')}/>`;
   }
-  if ('voice' in message && message.voice) {
-    const v = message.voice;
+  if ('voice' in holder && holder.voice) {
+    const v = holder.voice;
     const attrs = [`type="voice"`, `file_id="${escapeXmlAttr(v.file_id)}"`];
     if (v.mime_type) attrs.push(`mime="${escapeXmlAttr(v.mime_type)}"`);
     if (v.file_unique_id)
@@ -431,8 +504,8 @@ function buildMediaTag(
     appendTranscriptAttrs(attrs, extras);
     return `<media ${attrs.join(' ')}/>`;
   }
-  if ('audio' in message && message.audio) {
-    const a = message.audio;
+  if ('audio' in holder && holder.audio) {
+    const a = holder.audio;
     const attrs = [`type="audio"`, `file_id="${escapeXmlAttr(a.file_id)}"`];
     if (a.mime_type) attrs.push(`mime="${escapeXmlAttr(a.mime_type)}"`);
     if (a.file_unique_id)
@@ -443,8 +516,8 @@ function buildMediaTag(
     if (a.performer) attrs.push(`performer="${escapeXmlAttr(a.performer)}"`);
     return `<media ${attrs.join(' ')}/>`;
   }
-  if ('document' in message && message.document) {
-    const d = message.document;
+  if ('document' in holder && holder.document) {
+    const d = holder.document;
     const attrs = [`type="document"`, `file_id="${escapeXmlAttr(d.file_id)}"`];
     if (d.mime_type) attrs.push(`mime="${escapeXmlAttr(d.mime_type)}"`);
     if (d.file_unique_id)
@@ -453,8 +526,8 @@ function buildMediaTag(
     if (d.file_size) attrs.push(`size="${escapeXmlAttr(d.file_size)}"`);
     return `<media ${attrs.join(' ')}/>`;
   }
-  if ('sticker' in message && message.sticker) {
-    const s = message.sticker;
+  if ('sticker' in holder && holder.sticker) {
+    const s = holder.sticker;
     // Mime cascade — DO NOT trust s.mime_type / sticker doesn't reliably set it.
     // Priority is fixed per spec; first truthy flag wins.
     const mime = s.is_animated
@@ -477,8 +550,8 @@ function buildMediaTag(
     if (s.file_size) attrs.push(`size="${escapeXmlAttr(s.file_size)}"`);
     return `<media ${attrs.join(' ')}/>`;
   }
-  if ('animation' in message && message.animation) {
-    const a = message.animation;
+  if ('animation' in holder && holder.animation) {
+    const a = holder.animation;
     const attrs = [`type="animation"`, `file_id="${escapeXmlAttr(a.file_id)}"`];
     if (a.mime_type) attrs.push(`mime="${escapeXmlAttr(a.mime_type)}"`);
     if (a.file_unique_id)
@@ -490,8 +563,8 @@ function buildMediaTag(
     if (a.file_name) attrs.push(`name="${escapeXmlAttr(a.file_name)}"`);
     return `<media ${attrs.join(' ')}/>`;
   }
-  if ('video_note' in message && message.video_note) {
-    const vn = message.video_note;
+  if ('video_note' in holder && holder.video_note) {
+    const vn = holder.video_note;
     const attrs = [
       `type="video_note"`,
       `file_id="${escapeXmlAttr(vn.file_id)}"`,
@@ -520,7 +593,9 @@ function appendTranscriptAttrs(
   const t = extras.transcript;
   attrs.push(`transcript_status="${escapeXmlAttr(t.status)}"`);
   if (t.status === 'ok' && t.text) {
-    attrs.push(`transcript="${escapeXmlAttr(safeTruncate(t.text, 2000))}"`);
+    attrs.push(
+      `transcript="${escapeXmlAttr(safeTruncate(t.text, TRANSCRIPT_MAX_CODEPOINTS))}"`,
+    );
   }
 }
 
@@ -610,11 +685,12 @@ function buildContactTag(contact: Contact): string {
   return `<contact ${attrs.join(' ')}/>`;
 }
 
-/** Render <location/> from message.venue (preferred — title+address present) or
- *  message.location (lat/lon only). Returns null when neither is set. */
-function buildLocationTag(message: Message): string | null {
-  if ('venue' in message && message.venue) {
-    const v = message.venue;
+/** Render <location/> from holder.venue (preferred — title+address present) or
+ *  holder.location (lat/lon only). Returns null when neither is set. Accepts
+ *  either Message or ExternalReplyInfo via LocationHolder union. */
+function buildLocationTag(holder: LocationHolder): string | null {
+  if ('venue' in holder && holder.venue) {
+    const v = holder.venue;
     const attrs = [
       `lat="${escapeXmlAttr(v.location.latitude)}"`,
       `lon="${escapeXmlAttr(v.location.longitude)}"`,
@@ -623,8 +699,8 @@ function buildLocationTag(message: Message): string | null {
     ];
     return `<location ${attrs.join(' ')}/>`;
   }
-  if ('location' in message && message.location) {
-    const l = message.location;
+  if ('location' in holder && holder.location) {
+    const l = holder.location;
     const attrs = [
       `lat="${escapeXmlAttr(l.latitude)}"`,
       `lon="${escapeXmlAttr(l.longitude)}"`,

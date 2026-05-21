@@ -320,6 +320,290 @@ describe('buildMetaBlock — <reply>', () => {
     expect(meta).toContain('external="1"');
     await smokeParseXml(meta);
   });
+});
+
+describe('buildMetaBlock — <reply external_reply> nested payload', () => {
+  it('external_reply with media: emits <reply external="1" ...><media .../></reply>', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      external_reply: {
+        origin: {
+          type: 'user' as const,
+          date: 1747731600,
+          sender_user: { id: 99, is_bot: false, first_name: 'V' },
+        },
+        photo: [
+          {
+            file_id: 'extphoto',
+            file_unique_id: 'ep1',
+            width: 100,
+            height: 100,
+          },
+        ],
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<reply external="1"');
+    expect(meta).toContain('kind="user"');
+    expect(meta).toContain('id="99"');
+    expect(meta).toContain('<media type="photo"');
+    expect(meta).toContain('file_id="extphoto"');
+    expect(meta).toContain('</reply>');
+    await smokeParseXml(meta);
+  });
+
+  it('external_reply with video: emits nested <media type="video">', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      external_reply: {
+        origin: {
+          type: 'user' as const,
+          date: 1747731600,
+          sender_user: { id: 99, is_bot: false, first_name: 'V' },
+        },
+        video: {
+          file_id: 'extvid',
+          file_unique_id: 'ev1',
+          width: 1920,
+          height: 1080,
+          duration: 30,
+          mime_type: 'video/mp4',
+        },
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<reply external="1"');
+    expect(meta).toContain('<media type="video"');
+    expect(meta).toContain('file_id="extvid"');
+    expect(meta).toContain('mime="video/mp4"');
+    expect(meta).toContain('</reply>');
+    await smokeParseXml(meta);
+  });
+
+  it('external_reply with sticker: emits nested <media type="sticker"> with mime cascade', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      external_reply: {
+        origin: {
+          type: 'user' as const,
+          date: 1747731600,
+          sender_user: { id: 99, is_bot: false, first_name: 'V' },
+        },
+        sticker: {
+          file_id: 'extsticker',
+          file_unique_id: 'es1',
+          width: 512,
+          height: 512,
+          type: 'regular' as const,
+          is_animated: false,
+          is_video: false,
+        },
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<reply external="1"');
+    expect(meta).toContain('<media type="sticker"');
+    expect(meta).toContain('file_id="extsticker"');
+    expect(meta).toContain('mime="image/webp"');
+    expect(meta).toContain('sticker_kind="regular"');
+    expect(meta).toContain('</reply>');
+    await smokeParseXml(meta);
+  });
+
+  it('external_reply with contact: emits nested <contact>', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      external_reply: {
+        origin: {
+          type: 'user' as const,
+          date: 1747731600,
+          sender_user: { id: 99, is_bot: false, first_name: 'V' },
+        },
+        contact: {
+          phone_number: '+79991234567',
+          first_name: 'Иван',
+          user_id: 888,
+        },
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<reply external="1"');
+    expect(meta).toContain('<contact');
+    expect(meta).toContain('phone="+79991234567"');
+    expect(meta).toContain('name="Иван"');
+    expect(meta).toContain('user_id="888"');
+    expect(meta).toContain('</reply>');
+    await smokeParseXml(meta);
+  });
+
+  it('external_reply with location (venue): emits nested <location> with title+address', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      external_reply: {
+        origin: {
+          type: 'user' as const,
+          date: 1747731600,
+          sender_user: { id: 99, is_bot: false, first_name: 'V' },
+        },
+        location: { latitude: 55.75, longitude: 37.61 },
+        venue: {
+          location: { latitude: 55.75, longitude: 37.61 },
+          title: 'Кафе',
+          address: 'ул. Ленина 1',
+        },
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<reply external="1"');
+    expect(meta).toContain('<location');
+    expect(meta).toContain('lat="55.75"');
+    expect(meta).toContain('lon="37.61"');
+    expect(meta).toContain('title="Кафе"');
+    expect(meta).toContain('address="ул. Ленина 1"');
+    expect(meta).toContain('</reply>');
+    // Venue precedence — only one <location> tag emitted
+    const locTags = (meta.match(/<location\b/g) || []).length;
+    expect(locTags).toBe(1);
+    await smokeParseXml(meta);
+  });
+
+  it('external_reply with plain location (no venue): emits nested <location> without title', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      external_reply: {
+        origin: {
+          type: 'user' as const,
+          date: 1747731600,
+          sender_user: { id: 99, is_bot: false, first_name: 'V' },
+        },
+        location: { latitude: 55.75, longitude: 37.61 },
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<reply external="1"');
+    expect(meta).toContain('<location');
+    expect(meta).toContain('lat="55.75"');
+    expect(meta).toContain('lon="37.61"');
+    expect(meta).not.toContain('title=');
+    expect(meta).not.toContain('address=');
+    expect(meta).toContain('</reply>');
+    await smokeParseXml(meta);
+  });
+
+  it('external_reply with poll: emits nested <poll>', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      external_reply: {
+        origin: {
+          type: 'user' as const,
+          date: 1747731600,
+          sender_user: { id: 99, is_bot: false, first_name: 'V' },
+        },
+        poll: {
+          id: 'p1',
+          question: 'Где встретимся?',
+          options: [{ text: 'Кафе', voter_count: 3 }],
+          total_voter_count: 3,
+          is_closed: false,
+          is_anonymous: true,
+          type: 'regular' as const,
+          allows_multiple_answers: false,
+        },
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<reply external="1"');
+    expect(meta).toContain('<poll');
+    expect(meta).toContain('question="Где встретимся?"');
+    expect(meta).toContain('type="regular"');
+    expect(meta).toContain('</reply>');
+    await smokeParseXml(meta);
+  });
+
+  it('external_reply with story: emits nested <story>', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      external_reply: {
+        origin: {
+          type: 'user' as const,
+          date: 1747731600,
+          sender_user: { id: 99, is_bot: false, first_name: 'V' },
+        },
+        story: {
+          chat: { id: -1001, type: 'channel' as const, title: 'C' },
+          id: 77,
+        },
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<reply external="1"');
+    expect(meta).toContain('<story');
+    expect(meta).toContain('chat_id="-1001"');
+    expect(meta).toContain('story_id="77"');
+    expect(meta).toContain('</reply>');
+    await smokeParseXml(meta);
+  });
+
+  it('external_reply with link_preview_options: emits nested <link_preview>', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      external_reply: {
+        origin: {
+          type: 'user' as const,
+          date: 1747731600,
+          sender_user: { id: 99, is_bot: false, first_name: 'V' },
+        },
+        link_preview_options: {
+          url: 'https://example.com',
+          prefer_large_media: true,
+        },
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<reply external="1"');
+    expect(meta).toContain('<link_preview');
+    expect(meta).toContain('url="https://example.com"');
+    expect(meta).toContain('large="1"');
+    expect(meta).toContain('</reply>');
+    await smokeParseXml(meta);
+  });
+
+  it('external_reply with NO payload fields: emits self-closed <reply external="1" .../>', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      external_reply: {
+        origin: {
+          type: 'user' as const,
+          date: 1747731600,
+          sender_user: { id: 99, is_bot: false, first_name: 'V' },
+        },
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toMatch(/<reply external="1"[^>]*\/>/);
+    expect(meta).not.toContain('</reply>');
+    await smokeParseXml(meta);
+  });
   it('in-chat reply: snippet truncation preserves surrogate pairs (no orphan high surrogate)', async () => {
     const longText = 'a'.repeat(499) + '🐬'; // 501 code units; char 500 = U+D83D (high surrogate)
     const msg = {
@@ -1371,6 +1655,18 @@ describe('buildMetaBlock — <link_preview>', () => {
     };
     const meta = buildMetaBlock(msg as any);
     expect(meta).not.toContain('<link_preview');
+    await smokeParseXml(meta);
+  });
+  it('link_preview: emits bare <link_preview/> when only is_disabled=false (predicate fires, no truthy attrs)', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      link_preview_options: { is_disabled: false },
+    };
+    const meta = buildMetaBlock(msg as any);
+    // Predicate fires because is_disabled !== undefined; but no attribute is truthy → bare tag
+    expect(meta).toContain('<link_preview/>');
     await smokeParseXml(meta);
   });
 });
