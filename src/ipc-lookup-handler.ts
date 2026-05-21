@@ -265,7 +265,10 @@ export function processAnnotateContact(
 ): AnnotateResponse {
   const identifier = resolveIdentifier(payload);
   if (!identifier.ident && !identifier.username && identifier.tg_id == null) {
-    return annotateError('NOT_FOUND', 'annotate_contact: no identifier provided');
+    return annotateError(
+      'NOT_FOUND',
+      'annotate_contact: no identifier provided',
+    );
   }
 
   const scopeRow = getContactScopeByIdentity(identifier);
