@@ -1127,3 +1127,311 @@ describe('buildMetaBlock — voice/video_note transcript', () => {
     await smokeParseXml(meta);
   });
 });
+
+describe('buildMetaBlock — <contact>', () => {
+  it('emits phone, name (first+last), user_id, vcard_raw when all set', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      contact: {
+        phone_number: '+79991234567',
+        first_name: 'Иван',
+        last_name: 'Иванов',
+        user_id: 888,
+        vcard: 'BEGIN:VCARD\nVERSION:3.0\nEND:VCARD',
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<contact');
+    expect(meta).toContain('phone="+79991234567"');
+    expect(meta).toContain('name="Иван Иванов"');
+    expect(meta).toContain('user_id="888"');
+    expect(meta).toContain('vcard_raw="BEGIN:VCARD');
+    await smokeParseXml(meta);
+  });
+  it('emits only phone + name when optional fields omitted', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      contact: {
+        phone_number: '+79991234567',
+        first_name: 'Иван',
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<contact');
+    expect(meta).toContain('phone="+79991234567"');
+    expect(meta).toContain('name="Иван"');
+    expect(meta).not.toContain('user_id=');
+    expect(meta).not.toContain('vcard_raw=');
+    await smokeParseXml(meta);
+  });
+});
+
+describe('buildMetaBlock — <location>', () => {
+  it('emits lat/lon from message.location (no venue → no title/address)', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      location: { latitude: 55.75, longitude: 37.61 },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<location');
+    expect(meta).toContain('lat="55.75"');
+    expect(meta).toContain('lon="37.61"');
+    expect(meta).not.toContain('title=');
+    expect(meta).not.toContain('address=');
+    await smokeParseXml(meta);
+  });
+  it('venue: emits lat/lon/title/address (precedence over plain location)', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      location: { latitude: 55.75, longitude: 37.61 },
+      venue: {
+        location: { latitude: 55.75, longitude: 37.61 },
+        title: 'Кафе',
+        address: 'ул. Ленина 1',
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    const locTags = (meta.match(/<location\b/g) || []).length;
+    expect(locTags).toBe(1); // venue wins, only one <location> emitted
+    expect(meta).toContain('lat="55.75"');
+    expect(meta).toContain('lon="37.61"');
+    expect(meta).toContain('title="Кафе"');
+    expect(meta).toContain('address="ул. Ленина 1"');
+    await smokeParseXml(meta);
+  });
+});
+
+describe('buildMetaBlock — <poll>', () => {
+  it('emits question + type, drops options', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      poll: {
+        id: 'p1',
+        question: 'Где встретимся?',
+        options: [
+          { text: 'Кафе', voter_count: 3 },
+          { text: 'Парк', voter_count: 5 },
+        ],
+        total_voter_count: 8,
+        is_closed: false,
+        is_anonymous: true,
+        type: 'regular' as const,
+        allows_multiple_answers: false,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<poll');
+    expect(meta).toContain('question="Где встретимся?"');
+    expect(meta).toContain('type="regular"');
+    expect(meta).not.toContain('Кафе');
+    expect(meta).not.toContain('Парк');
+    await smokeParseXml(meta);
+  });
+});
+
+describe('buildMetaBlock — <story>', () => {
+  it('emits chat_id + story_id from message.story', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      story: {
+        chat: { id: -1001, type: 'channel' as const, title: 'C' },
+        id: 77,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<story');
+    expect(meta).toContain('chat_id="-1001"');
+    expect(meta).toContain('story_id="77"');
+    await smokeParseXml(meta);
+  });
+});
+
+describe('buildMetaBlock — <via_bot>', () => {
+  it('emits id/un/name when via_bot fully populated', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      via_bot: {
+        id: 123456,
+        is_bot: true,
+        first_name: 'GIF',
+        last_name: 'Bot',
+        username: 'gif',
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<via_bot');
+    expect(meta).toContain('id="123456"');
+    expect(meta).toContain('un="gif"');
+    expect(meta).toContain('name="GIF Bot"');
+    // is_bot is redundant on via_bot (always true by definition) — must not be emitted on <via_bot>
+    expect(meta).not.toMatch(/<via_bot[^>]*\bis_bot=/);
+    await smokeParseXml(meta);
+  });
+  it('omits un attribute when via_bot has no username', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      via_bot: {
+        id: 123456,
+        is_bot: true,
+        first_name: 'Anon',
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<via_bot');
+    expect(meta).toContain('id="123456"');
+    expect(meta).toContain('name="Anon"');
+    expect(meta).not.toMatch(/<via_bot[^>]*\bun=/);
+    await smokeParseXml(meta);
+  });
+});
+
+describe('buildMetaBlock — <link_preview>', () => {
+  it('emits url + disabled when both set', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      text: 'check https://example.com',
+      link_preview_options: {
+        url: 'https://example.com',
+        is_disabled: true,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<link_preview');
+    expect(meta).toContain('url="https://example.com"');
+    expect(meta).toContain('disabled="1"');
+    await smokeParseXml(meta);
+  });
+  it('emits small + large when prefer_small_media + prefer_large_media set', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      text: 'check https://example.com',
+      link_preview_options: {
+        prefer_small_media: true,
+        prefer_large_media: true,
+        show_above_text: true,
+      },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toContain('<link_preview');
+    expect(meta).toContain('small="1"');
+    expect(meta).toContain('large="1"');
+    expect(meta).toContain('above_text="1"');
+    await smokeParseXml(meta);
+  });
+  it('NEGATIVE: link_preview_options undefined → no <link_preview> tag', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      text: 'hello',
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).not.toContain('<link_preview');
+    await smokeParseXml(meta);
+  });
+  it('NEGATIVE: link_preview_options = {} (no fields set) → no <link_preview> tag', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      text: 'hello',
+      link_preview_options: {},
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).not.toContain('<link_preview');
+    await smokeParseXml(meta);
+  });
+});
+
+describe('buildMetaBlock — <m auto_fwd="1"> attribute', () => {
+  it('emits auto_fwd="1" when is_automatic_forward=true', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      is_automatic_forward: true,
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toMatch(/<m\b[^>]*\bauto_fwd="1"/);
+    await smokeParseXml(meta);
+  });
+  it('NEGATIVE: auto_fwd attribute absent when is_automatic_forward unset', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).not.toContain('auto_fwd=');
+    await smokeParseXml(meta);
+  });
+});
+
+describe('buildMetaBlock — <m> attribute regressions (Task 8a already-implemented)', () => {
+  it('emits edited="ISO" attribute when edit_date set', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      edit_date: 1747731700,
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toMatch(/<m\b[^>]*\bedited="20\d\d-\d\d-\d\dT/);
+    await smokeParseXml(meta);
+  });
+  it('emits media_group_id attribute when media_group_id set', async () => {
+    const msg = {
+      message_id: 1,
+      date: 1747731600,
+      chat: { id: 1, type: 'private' as const, first_name: 'X' },
+      from: { id: 1, is_bot: false, first_name: 'X' },
+      media_group_id: 'album-abc-123',
+      photo: [
+        {
+          file_id: 'p1',
+          file_unique_id: 'pu1',
+          width: 100,
+          height: 100,
+        },
+      ],
+    };
+    const meta = buildMetaBlock(msg as any);
+    expect(meta).toMatch(/<m\b[^>]*\bmedia_group_id="album-abc-123"/);
+    await smokeParseXml(meta);
+  });
+});

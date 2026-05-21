@@ -1,4 +1,13 @@
-import type { Message, MessageEntity, MessageOrigin } from 'grammy/types';
+import type {
+  Contact,
+  LinkPreviewOptions,
+  Message,
+  MessageEntity,
+  MessageOrigin,
+  Poll,
+  Story,
+  User,
+} from 'grammy/types';
 import { safeTruncate } from '../safe-truncate.js';
 
 export function escapeXmlAttr(v: unknown): string {
@@ -33,13 +42,26 @@ export interface BuildMetaBlockExtras {
  * Build the structured <m>...</m> XML block from a Telegram Message.
  * Returns the raw block (no enclosing root). Caller stores in messages.meta column.
  *
- * Task 8a scope: minimal skeleton — <m id date media_group_id edited>, <from> vs
- * <sender_chat> mutex. Full Bot API 7.0+ tag coverage lands in Tasks 8b-1/2/3.
+ * Full Bot API 7.0+ tag coverage as of Task 8b-3:
+ *   <m id date [media_group_id] [edited] [auto_fwd]>
+ *     <from>|<sender_chat>   (mutex per spec line 193-194)
+ *     [<fwd>]                (forward_origin discriminated union)
+ *     [<reply external="0|1">]   (in-chat OR external_reply, in-chat wins)
+ *     [<reply_to_story>]
+ *     [<quote>]
+ *     [<entities>...]
+ *     [<media>]              (photo/video/voice/audio/document/sticker/animation/video_note mutex)
+ *     [<contact>]
+ *     [<location>]           (venue precedence over plain location)
+ *     [<poll>]               (question + type only; options dropped per spec)
+ *     [<story>]              (sent-story; distinct from reply_to_story above)
+ *     [<via_bot>]
+ *     [<link_preview>]       (emitted only when ≥1 LinkPreviewOptions field explicitly set)
+ *   </m>
  *
  * Invariant: EVERY attribute value passes through escapeXmlAttr — even numeric and
- * enum-safe values today, because Task 8b copy-paste will extend this pattern to
- * user-controlled strings (<media>, <location>, <contact>, <entities>) where any
- * unescaped interpolation would be an XML-injection foothold. escapeXmlAttr is a
+ * enum-safe values, because user-controlled strings (<media>, <location>, <contact>,
+ * <entities>) demand universal escaping to prevent XML injection. escapeXmlAttr is a
  * no-op on digits and ISO date strings, so the universal wrap is free.
  *
  * Note on <from name="..."> attribute: concatenates first_name + ' ' + last_name
@@ -62,6 +84,9 @@ export function buildMetaBlock(
     mAttrs.push(
       `edited="${escapeXmlAttr(new Date(message.edit_date * 1000).toISOString())}"`,
     );
+  }
+  if ('is_automatic_forward' in message && message.is_automatic_forward) {
+    mAttrs.push(`auto_fwd="${escapeXmlAttr(1)}"`);
   }
   parts.push(`<m ${mAttrs.join(' ')}>`);
 
@@ -144,6 +169,36 @@ export function buildMetaBlock(
   // (mutex — Telegram sets at most one of these per message).
   const mediaTag = buildMediaTag(message, extras);
   if (mediaTag) parts.push(mediaTag);
+
+  // <contact>: phone contact attachment
+  if ('contact' in message && message.contact) {
+    parts.push(buildContactTag(message.contact));
+  }
+
+  // <location>: venue wins over plain location (venue carries title + address)
+  const locationTag = buildLocationTag(message);
+  if (locationTag) parts.push(locationTag);
+
+  // <poll>: question + type only, options dropped
+  if ('poll' in message && message.poll) {
+    parts.push(buildPollTag(message.poll));
+  }
+
+  // <story>: a sent/shared story (NOT reply_to_story — that's already above)
+  if ('story' in message && message.story) {
+    parts.push(buildStoryTag(message.story));
+  }
+
+  // <via_bot>: inline-mode bot the message was sent through
+  if ('via_bot' in message && message.via_bot) {
+    parts.push(buildViaBotTag(message.via_bot));
+  }
+
+  // <link_preview>: emitted ONLY when ≥1 field explicitly set on link_preview_options
+  if ('link_preview_options' in message && message.link_preview_options) {
+    const lp = buildLinkPreviewTag(message.link_preview_options);
+    if (lp) parts.push(lp);
+  }
 
   parts.push(`</m>`);
   return parts.join('');
@@ -538,4 +593,99 @@ function renderEntity(e: MessageEntity, text: string): string {
     default:
       return '';
   }
+}
+
+/** Render <contact phone="..." name="..." user_id="..." vcard_raw="..."/>.
+ *  Only phone + name are guaranteed; user_id and vcard are optional per Bot API. */
+function buildContactTag(contact: Contact): string {
+  const attrs: string[] = [`phone="${escapeXmlAttr(contact.phone_number)}"`];
+  if (contact.first_name) {
+    attrs.push(
+      `name="${escapeXmlAttr(contact.first_name)}${contact.last_name ? ' ' + escapeXmlAttr(contact.last_name) : ''}"`,
+    );
+  }
+  if (contact.user_id)
+    attrs.push(`user_id="${escapeXmlAttr(contact.user_id)}"`);
+  if (contact.vcard) attrs.push(`vcard_raw="${escapeXmlAttr(contact.vcard)}"`);
+  return `<contact ${attrs.join(' ')}/>`;
+}
+
+/** Render <location/> from message.venue (preferred — title+address present) or
+ *  message.location (lat/lon only). Returns null when neither is set. */
+function buildLocationTag(message: Message): string | null {
+  if ('venue' in message && message.venue) {
+    const v = message.venue;
+    const attrs = [
+      `lat="${escapeXmlAttr(v.location.latitude)}"`,
+      `lon="${escapeXmlAttr(v.location.longitude)}"`,
+      `title="${escapeXmlAttr(v.title)}"`,
+      `address="${escapeXmlAttr(v.address)}"`,
+    ];
+    return `<location ${attrs.join(' ')}/>`;
+  }
+  if ('location' in message && message.location) {
+    const l = message.location;
+    const attrs = [
+      `lat="${escapeXmlAttr(l.latitude)}"`,
+      `lon="${escapeXmlAttr(l.longitude)}"`,
+    ];
+    return `<location ${attrs.join(' ')}/>`;
+  }
+  return null;
+}
+
+/** Render <poll question="..." type="regular|quiz"/>. Options are intentionally
+ *  dropped per spec — only metadata survives. */
+function buildPollTag(poll: Poll): string {
+  const attrs = [
+    `question="${escapeXmlAttr(poll.question)}"`,
+    `type="${escapeXmlAttr(poll.type)}"`,
+  ];
+  return `<poll ${attrs.join(' ')}/>`;
+}
+
+/** Render <story chat_id="..." story_id="..."/> from message.story. */
+function buildStoryTag(story: Story): string {
+  return `<story chat_id="${escapeXmlAttr(story.chat.id)}" story_id="${escapeXmlAttr(story.id)}"/>`;
+}
+
+/** Render <via_bot id="..." un="..." name="..."/>. Skips is_bot (always true by
+ *  definition for via_bot — redundant). */
+function buildViaBotTag(via_bot: User): string {
+  const attrs: string[] = [`id="${escapeXmlAttr(via_bot.id)}"`];
+  if (via_bot.username) attrs.push(`un="${escapeXmlAttr(via_bot.username)}"`);
+  if (via_bot.first_name)
+    attrs.push(
+      `name="${escapeXmlAttr(via_bot.first_name)}${via_bot.last_name ? ' ' + escapeXmlAttr(via_bot.last_name) : ''}"`,
+    );
+  return `<via_bot ${attrs.join(' ')}/>`;
+}
+
+/** Render <link_preview .../> from message.link_preview_options. Returns null
+ *  when none of {is_disabled, url, prefer_small_media, prefer_large_media,
+ *  show_above_text} is explicitly set — spec line 207 round-10 disambiguation.
+ *  An empty {} (e.g. default preview metadata stripped by Telegram) MUST NOT
+ *  emit a tag. */
+function buildLinkPreviewTag(opt: LinkPreviewOptions): string | null {
+  const hasAnyField =
+    opt.is_disabled !== undefined ||
+    opt.url !== undefined ||
+    opt.prefer_small_media !== undefined ||
+    opt.prefer_large_media !== undefined ||
+    opt.show_above_text !== undefined;
+  if (!hasAnyField) return null;
+  const attrs: string[] = [];
+  if (opt.url) attrs.push(`url="${escapeXmlAttr(opt.url)}"`);
+  if (opt.is_disabled) attrs.push(`disabled="${escapeXmlAttr(1)}"`);
+  if (opt.show_above_text) attrs.push(`above_text="${escapeXmlAttr(1)}"`);
+  if (opt.prefer_small_media) attrs.push(`small="${escapeXmlAttr(1)}"`);
+  if (opt.prefer_large_media) attrs.push(`large="${escapeXmlAttr(1)}"`);
+  // Predicate above guarantees ≥1 field set, but all five could be `false` /
+  // empty-string — in that case the predicate fires but no boolean attribute
+  // value triggers an `if (x)` push. Emit a tag without attributes still — it
+  // signals "preview metadata present but all-false", which is informationally
+  // distinct from no metadata at all.
+  return attrs.length > 0
+    ? `<link_preview ${attrs.join(' ')}/>`
+    : `<link_preview/>`;
 }
