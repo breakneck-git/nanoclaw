@@ -22,23 +22,40 @@ export function escapeXmlText(v: unknown): string {
  *
  * Task 8a scope: minimal skeleton — <m id date media_group_id edited>, <from> vs
  * <sender_chat> mutex. Full Bot API 7.0+ tag coverage lands in Tasks 8b-1/2/3.
+ *
+ * Invariant: EVERY attribute value passes through escapeXmlAttr — even numeric and
+ * enum-safe values today, because Task 8b copy-paste will extend this pattern to
+ * user-controlled strings (<media>, <location>, <contact>, <entities>) where any
+ * unescaped interpolation would be an XML-injection foothold. escapeXmlAttr is a
+ * no-op on digits and ISO date strings, so the universal wrap is free.
+ *
+ * Note on <from name="..."> attribute: concatenates first_name + ' ' + last_name
+ * when both present (matches typical agent prompt format). If last_name absent,
+ * name = first_name alone.
  */
 export function buildMetaBlock(message: Message): string {
   const parts: string[] = [];
-  const mAttrs: string[] = [`id="${message.message_id}"`];
-  mAttrs.push(`date="${new Date(message.date * 1000).toISOString()}"`);
+  const mAttrs: string[] = [`id="${escapeXmlAttr(message.message_id)}"`];
+  mAttrs.push(
+    `date="${escapeXmlAttr(new Date(message.date * 1000).toISOString())}"`,
+  );
   if ('media_group_id' in message && message.media_group_id) {
     mAttrs.push(`media_group_id="${escapeXmlAttr(message.media_group_id)}"`);
   }
   if ('edit_date' in message && message.edit_date) {
-    mAttrs.push(`edited="${new Date(message.edit_date * 1000).toISOString()}"`);
+    mAttrs.push(
+      `edited="${escapeXmlAttr(new Date(message.edit_date * 1000).toISOString())}"`,
+    );
   }
   parts.push(`<m ${mAttrs.join(' ')}>`);
 
   // <from> vs <sender_chat> mutex per spec line 193-194
   if ('sender_chat' in message && message.sender_chat) {
     const sc = message.sender_chat;
-    const scAttrs = [`id="${sc.id}"`, `kind="${sc.type}"`];
+    const scAttrs = [
+      `id="${escapeXmlAttr(sc.id)}"`,
+      `kind="${escapeXmlAttr(sc.type)}"`,
+    ];
     if ('title' in sc && sc.title)
       scAttrs.push(`title="${escapeXmlAttr(sc.title)}"`);
     if ('username' in sc && sc.username)
@@ -46,13 +63,16 @@ export function buildMetaBlock(message: Message): string {
     parts.push(`<sender_chat ${scAttrs.join(' ')}/>`);
   } else if (message.from) {
     const f = message.from;
-    const fAttrs = [`id="${f.id}"`, `is_bot="${f.is_bot ? 1 : 0}"`];
+    const fAttrs = [
+      `id="${escapeXmlAttr(f.id)}"`,
+      `is_bot="${escapeXmlAttr(f.is_bot ? 1 : 0)}"`,
+    ];
     if (f.username) fAttrs.push(`un="${escapeXmlAttr(f.username)}"`);
     if (f.first_name)
       fAttrs.push(
         `name="${escapeXmlAttr(f.first_name)}${f.last_name ? ' ' + escapeXmlAttr(f.last_name) : ''}"`,
       );
-    if (f.is_premium) fAttrs.push(`premium="1"`);
+    if (f.is_premium) fAttrs.push(`premium="${escapeXmlAttr(1)}"`);
     if (f.language_code)
       fAttrs.push(`lang="${escapeXmlAttr(f.language_code)}"`);
     parts.push(`<from ${fAttrs.join(' ')}/>`);
