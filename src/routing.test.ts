@@ -1,7 +1,10 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-import { _initTestDatabase, storeChatMetadata } from './db.js';
+import { _initTestDatabase, db, storeChatMetadata } from './db.js';
 import { getAvailableGroups, _setRegisteredGroups } from './index.js';
+import { routeOutbound } from './router.js';
+import { logger } from './logger.js';
+import type { Channel } from './types.js';
 
 beforeEach(() => {
   _initTestDatabase();
@@ -166,5 +169,132 @@ describe('getAvailableGroups', () => {
   it('returns empty array when no chats exist', () => {
     const groups = getAvailableGroups();
     expect(groups).toHaveLength(0);
+  });
+});
+
+// --- routeOutbound — SEND/STORE isolation (Task 13) ---
+
+function makeChannel(overrides: Partial<Channel> = {}): Channel {
+  return {
+    name: 'test',
+    connect: vi.fn(),
+    sendMessage: vi.fn().mockResolvedValue({ messageId: 'tg-default' }),
+    isConnected: vi.fn().mockReturnValue(true),
+    ownsJid: vi.fn().mockReturnValue(true),
+    disconnect: vi.fn(),
+    botSenderId: vi.fn().mockReturnValue('bot-default'),
+    ...overrides,
+  } as Channel;
+}
+
+describe('routeOutbound — SEND/STORE isolation', () => {
+  it('SEND success → STORE called with messageId from sendMessage', async () => {
+    const channel = makeChannel({
+      sendMessage: vi.fn().mockResolvedValue({ messageId: 'tg-123' }),
+      botSenderId: vi.fn().mockReturnValue('bot42'),
+    });
+
+    await routeOutbound([channel], 'tg:1', 'hello');
+
+    expect(channel.sendMessage).toHaveBeenCalledWith(
+      'tg:1',
+      'hello',
+      undefined,
+    );
+    const row = db
+      .prepare(`SELECT * FROM messages WHERE chat_jid = ?`)
+      .get('tg:1') as {
+      id: string;
+      sender: string;
+      content: string;
+      is_bot_message: number;
+      meta: string | null;
+    };
+    expect(row).toBeDefined();
+    expect(row.id).toBe('tg-123');
+    expect(row.sender).toBe('bot42');
+    expect(row.content).toBe('hello');
+    expect(row.is_bot_message).toBe(1);
+    expect(row.meta).toBeNull();
+  });
+
+  it('SEND throws → routeOutbound throws → STORE NOT called', async () => {
+    const channel = makeChannel({
+      sendMessage: vi.fn().mockRejectedValue(new Error('send failed')),
+      botSenderId: vi.fn().mockReturnValue('bot42'),
+    });
+
+    await expect(routeOutbound([channel], 'tg:1', 'hello')).rejects.toThrow(
+      'send failed',
+    );
+
+    const row = db
+      .prepare(`SELECT * FROM messages WHERE chat_jid = ?`)
+      .get('tg:1');
+    expect(row).toBeUndefined();
+  });
+
+  it('SEND succeeds but STORE throws → does NOT propagate (logged only)', async () => {
+    const channel = makeChannel({
+      sendMessage: vi.fn().mockResolvedValue({ messageId: 'tg-xyz' }),
+      botSenderId: vi.fn().mockReturnValue('bot42'),
+    });
+
+    // Drop the messages table so the internal INSERT throws. STORE failure
+    // must NOT propagate; routeOutbound must still resolve void.
+    db.prepare('DROP TABLE messages').run();
+    const errorSpy = vi.spyOn(logger, 'error').mockImplementation(() => {});
+
+    await expect(
+      routeOutbound([channel], 'tg:1', 'hello'),
+    ).resolves.toBeUndefined();
+    expect(errorSpy).toHaveBeenCalled();
+
+    errorSpy.mockRestore();
+  });
+
+  it('Channel without botSenderId method → senderId falls back to "bot"', async () => {
+    // Build a channel object literal w/o botSenderId — exercises the
+    // `channel.botSenderId?.()` optional-call path.
+    const channel: Channel = {
+      name: 'test',
+      connect: vi.fn(),
+      sendMessage: vi.fn().mockResolvedValue({ messageId: 'tg-1' }),
+      isConnected: vi.fn().mockReturnValue(true),
+      ownsJid: vi.fn().mockReturnValue(true),
+      disconnect: vi.fn(),
+      // No botSenderId method
+    };
+
+    await routeOutbound([channel], 'tg:1', 'hello');
+
+    const row = db
+      .prepare(`SELECT * FROM messages WHERE chat_jid = ?`)
+      .get('tg:1') as { id: string; sender: string };
+    expect(row.id).toBe('tg-1');
+    // storeOutboundMessage falls back to literal 'bot' when senderId is undefined.
+    expect(row.sender).toBe('bot');
+  });
+
+  it('No matching channel → throws "No channel for JID"', async () => {
+    await expect(routeOutbound([], 'tg:1', 'hello')).rejects.toThrow(
+      /No channel/,
+    );
+  });
+
+  it('sendMessage returns void (no messageId) → synthetic id assigned', async () => {
+    const channel = makeChannel({
+      sendMessage: vi.fn().mockResolvedValue(undefined),
+      botSenderId: vi.fn().mockReturnValue('bot42'),
+    });
+
+    await routeOutbound([channel], 'tg:1', 'hello');
+
+    const row = db
+      .prepare(`SELECT * FROM messages WHERE chat_jid = ?`)
+      .get('tg:1') as { id: string; sender: string; meta: string | null };
+    expect(row.id).toMatch(/^out-/);
+    expect(row.sender).toBe('bot42');
+    expect(row.meta).toBe('<m kind="outbound-synthetic"/>');
   });
 });
