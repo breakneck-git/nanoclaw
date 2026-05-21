@@ -116,7 +116,7 @@ export class GmailChannel implements Channel {
     jid: string,
     text: string,
     _opts?: { threadId?: string },
-  ): Promise<void> {
+  ): Promise<{ messageId?: string } | void> {
     if (!this.gmail) {
       logger.warn('Gmail not initialized');
       return;
@@ -159,18 +159,38 @@ export class GmailChannel implements Channel {
       .replace(/=+$/, '');
 
     try {
-      await this.gmail.users.messages.send({
+      const res = await this.gmail.users.messages.send({
         userId: 'me',
         requestBody: {
           raw: encodedMessage,
           threadId,
         },
       });
+      // googleapis Schema$Message.id: string | null | undefined.
+      // CRITICAL: `?? undefined` does NOT fire on '' (nullish coalescing
+      // skips empty string). An empty-string id would survive into
+      // messages.id PRIMARY KEY and the NEXT empty-id send would
+      // INSERT OR REPLACE the prior row. Use a truthy fallback so ''
+      // also falls through to the synthetic-id path.
+      const rawId = res.data?.id;
+      const id = rawId && rawId.length > 0 ? rawId : undefined;
       logger.info({ to: safeSender, threadId }, 'Gmail reply sent');
+      return { messageId: id };
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Gmail reply');
       throw err;
     }
+  }
+
+  /**
+   * Returns the bot's own Gmail address (the authenticated user's email), or
+   * undefined if not yet connected. Mirrors the optional `Channel.botSenderId()`
+   * contract so the orchestrator can mark outbound rows with the bot's identity.
+   * The `userEmail` field is populated by `connect` from `users.getProfile`;
+   * before that it defaults to `''` which we collapse to `undefined`.
+   */
+  botSenderId(): string | undefined {
+    return this.userEmail || undefined;
   }
 
   isConnected(): boolean {

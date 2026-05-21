@@ -73,4 +73,73 @@ describe('GmailChannel', () => {
       expect(ch.name).toBe('gmail');
     });
   });
+
+  describe('sendMessage id fallback', () => {
+    // googleapis Schema$Message.id is `string | null | undefined`, but the
+    // type system claim doesn't prevent ''. `?? undefined` would NOT fire on
+    // empty string — an empty-id reply would survive into messages.id PRIMARY
+    // KEY and the NEXT empty-id send would INSERT OR REPLACE the prior row.
+    // The fix is `rawId && rawId.length > 0 ? rawId : undefined` so '' also
+    // falls through to the synthetic-id path.
+
+    interface SendableChannel {
+      gmail: { users: { messages: { send: ReturnType<typeof vi.fn> } } };
+      threadMeta: Map<string, unknown>;
+      userEmail: string;
+    }
+
+    function rigSendable(
+      ch: GmailChannel,
+      sendReturn: { data: { id: string | null | undefined } },
+    ): ReturnType<typeof vi.fn> {
+      const sendMock = vi.fn().mockResolvedValue(sendReturn);
+      const priv = ch as unknown as SendableChannel;
+      priv.gmail = {
+        users: { messages: { send: sendMock } },
+      };
+      priv.userEmail = 'bot@example.com';
+      priv.threadMeta.set('thread-abc', {
+        sender: 'alice@example.com',
+        senderName: 'Alice',
+        subject: 'Hi',
+        messageId: '<orig@gmail>',
+      });
+      return sendMock;
+    }
+
+    it('valid id: returns messageId', async () => {
+      const ch = new GmailChannel(makeOpts());
+      rigSendable(ch, { data: { id: 'gmail-id-123' } });
+      const out = await ch.sendMessage('gmail:thread-abc', 'hello');
+      expect(out).toEqual({ messageId: 'gmail-id-123' });
+    });
+
+    it('null id: returns undefined', async () => {
+      const ch = new GmailChannel(makeOpts());
+      rigSendable(ch, { data: { id: null } });
+      const out = await ch.sendMessage('gmail:thread-abc', 'hello');
+      expect(out).toEqual({ messageId: undefined });
+    });
+
+    it("empty-string id '' (round-10 regression case): returns undefined via truthy check", async () => {
+      const ch = new GmailChannel(makeOpts());
+      rigSendable(ch, { data: { id: '' } });
+      const out = await ch.sendMessage('gmail:thread-abc', 'hello');
+      expect(out).toEqual({ messageId: undefined });
+    });
+  });
+
+  describe('botSenderId', () => {
+    it('returns configured userEmail when set', () => {
+      const ch = new GmailChannel(makeOpts());
+      (ch as unknown as { userEmail: string }).userEmail = 'alice@example.com';
+      expect(ch.botSenderId()).toBe('alice@example.com');
+    });
+
+    it('returns undefined when not connected', () => {
+      const ch = new GmailChannel(makeOpts());
+      // userEmail defaults to '' before connect
+      expect(ch.botSenderId()).toBeUndefined();
+    });
+  });
 });
