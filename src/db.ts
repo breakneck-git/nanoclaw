@@ -122,6 +122,8 @@ function createSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS contacts_scope_username ON contacts(scope, username);
     CREATE INDEX IF NOT EXISTS contacts_scope_tg_id    ON contacts(scope, tg_id);
+    CREATE INDEX IF NOT EXISTS contacts_tg_id          ON contacts(tg_id);
+    CREATE INDEX IF NOT EXISTS contacts_username       ON contacts(username);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -633,9 +635,12 @@ export interface LookupRow {
  * Cyrillic-safe case-insensitive matching; metacharacters are escaped via
  * `buildQueryParam` so a user typing `50%` matches only literal `50%`.
  *
- * Optional filters use `(? IS NULL OR <pred>)` pairs to keep the SQL static
- * regardless of which filters the caller provides — the same binding is
- * passed twice so SQLite can short-circuit the predicate when null.
+ * SQL is built dynamically: predicates are appended only when their filter
+ * is active. The previous `(? IS NULL OR col = ?)` form always SCANned
+ * because SQLite can't promote a null-guarded predicate to an index probe.
+ * The `|| null` falsy-coalesce also normalizes empty-string filter values
+ * to "no filter" (an empty senderId / tgMessageId would otherwise match
+ * zero rows on an exact-equality predicate).
  *
  * `includeBot` is bound as 0|1 (better-sqlite3 rejects JS booleans). `limit`
  * is clamped to `[1, 200]` per the spec — callers may pass any value, the
@@ -654,47 +659,60 @@ export function lookupMessages(opts: {
   if (opts.groupJids.length === 0) return [];
 
   const placeholders = opts.groupJids.map(() => '?').join(', ');
+  const whereClauses: string[] = [
+    `chat_jid IN (${placeholders})`,
+    // Strict === true so non-boolean truthy values (e.g. string "false" via IPC) → bot rows excluded.
+    opts.includeBot === true ? '1=1' : 'is_bot_message = 0',
+  ];
+  const binds: unknown[] = [...opts.groupJids];
+
+  // `|| null` normalizes both undefined and '' to null → "filter inactive".
+  const tgMessageId = opts.tgMessageId || null;
+  if (tgMessageId !== null) {
+    whereClauses.push('id = ?');
+    binds.push(tgMessageId);
+  }
+
+  const senderId = opts.senderId || null;
+  if (senderId !== null) {
+    whereClauses.push('sender = ?');
+    binds.push(senderId);
+  }
+
+  const since = opts.since || null;
+  if (since !== null) {
+    whereClauses.push('timestamp >= ?');
+    binds.push(since);
+  }
+
+  const until = opts.until || null;
+  if (until !== null) {
+    whereClauses.push('timestamp <= ?');
+    binds.push(until);
+  }
+
+  const queryParam = buildQueryParam(opts.query);
+  if (queryParam !== null) {
+    whereClauses.push(
+      "lower_unicode(content) LIKE lower_unicode(?) ESCAPE '\\'",
+    );
+    binds.push(queryParam);
+  }
+
+  // Defend against non-finite (NaN, Infinity, string from IPC JSON) — default to 50.
+  const rawLimit = Number.isFinite(opts.limit) ? opts.limit : 50;
+  const clampedLimit = Math.min(Math.max(rawLimit, 1), 200);
+  binds.push(clampedLimit);
+
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, meta
     FROM messages
-    WHERE chat_jid IN (${placeholders})
-      AND (? OR is_bot_message = 0)
-      AND (? IS NULL OR id = ?)
-      AND (? IS NULL OR sender = ?)
-      AND (? IS NULL OR timestamp >= ?)
-      AND (? IS NULL OR timestamp <= ?)
-      AND (? IS NULL OR lower_unicode(content) LIKE lower_unicode(?) ESCAPE '\\')
+    WHERE ${whereClauses.join(' AND ')}
     ORDER BY timestamp DESC
     LIMIT ?
   `;
 
-  const tgMessageId = opts.tgMessageId ?? null;
-  const senderId = opts.senderId ?? null;
-  const since = opts.since ?? null;
-  const until = opts.until ?? null;
-  const queryParam = buildQueryParam(opts.query);
-  // Defend against non-finite (NaN, Infinity, string from IPC JSON) — default to 50.
-  const clampedLimit = Math.min(
-    Math.max(Number.isFinite(opts.limit) ? opts.limit : 50, 1),
-    200,
-  );
-
-  return db.prepare(sql).all(
-    ...opts.groupJids,
-    // Strict === true so non-boolean truthy values (e.g. string "false" via IPC) → 0.
-    opts.includeBot === true ? 1 : 0,
-    tgMessageId,
-    tgMessageId,
-    senderId,
-    senderId,
-    since,
-    since,
-    until,
-    until,
-    queryParam,
-    queryParam,
-    clampedLimit,
-  ) as LookupRow[];
+  return db.prepare(sql).all(...binds) as LookupRow[];
 }
 
 export function createTask(

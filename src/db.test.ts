@@ -304,6 +304,37 @@ describe('getNewMessages', () => {
     expect(messages).toHaveLength(0);
     expect(newTimestamp).toBe('');
   });
+
+  it('filters pre-migration bot messages via content-prefix backstop', () => {
+    storeMessage({
+      id: 'a',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'hi',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    // Row written before is_bot_message column existed; is_bot_message=0 but content has bot prefix:
+    storeMessage({
+      id: 'b',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'Andy: old reply',
+      timestamp: '2026-05-20T10:00:01Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    const { messages: rows } = getNewMessages(
+      ['tg:1'],
+      '2026-05-20T09:00:00Z',
+      'Andy',
+      50,
+    );
+    expect(rows.map((r) => r.id)).toEqual(['a']); // 'b' filtered by NOT LIKE 'Andy:%'
+  });
 });
 
 // --- storeChatMetadata ---
@@ -582,6 +613,38 @@ describe('promoteContactIdent', () => {
 
   it('does NOT crash when un-row absent (no-op early return)', () => {
     expect(() => promoteContactIdent('g', 'nobody', '999')).not.toThrow();
+  });
+
+  it('unions tags from both id-row and un-row', () => {
+    db.prepare(
+      `INSERT INTO contacts (ident, scope, tg_id, username, kind, is_bot, first_seen, last_seen, seen_count, source, enriched, tags)
+              VALUES ('g|id:42', 'g', '42', NULL, 'user', 0, '2026-05-20T10:00:00Z', '2026-05-20T10:00:00Z', 1, 'sender', 0, 'a,b')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO contacts (ident, scope, tg_id, username, kind, is_bot, first_seen, last_seen, seen_count, source, enriched, tags)
+              VALUES ('g|un:vasya', 'g', NULL, 'vasya', 'user', 0, '2026-05-20T10:00:00Z', '2026-05-20T10:00:00Z', 1, 'mention', 0, 'b,c')`,
+    ).run();
+    promoteContactIdent('g', 'vasya', '42');
+    const row = db
+      .prepare(`SELECT tags FROM contacts WHERE ident = ?`)
+      .get('g|id:42') as { tags: string };
+    expect(row.tags.split(',').sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('adopts un-row notes when id-row notes is NULL', () => {
+    db.prepare(
+      `INSERT INTO contacts (ident, scope, tg_id, username, kind, is_bot, first_seen, last_seen, seen_count, source, enriched, notes)
+              VALUES ('g|id:42', 'g', '42', NULL, 'user', 0, '2026-05-20T10:00:00Z', '2026-05-20T10:00:00Z', 1, 'sender', 0, NULL)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO contacts (ident, scope, tg_id, username, kind, is_bot, first_seen, last_seen, seen_count, source, enriched, notes)
+              VALUES ('g|un:vasya', 'g', NULL, 'vasya', 'user', 0, '2026-05-20T10:00:00Z', '2026-05-20T10:00:00Z', 1, 'mention', 0, 'from-un')`,
+    ).run();
+    promoteContactIdent('g', 'vasya', '42');
+    const row = db
+      .prepare(`SELECT notes FROM contacts WHERE ident = ?`)
+      .get('g|id:42') as { notes: string };
+    expect(row.notes).toBe('from-un');
   });
 });
 
@@ -965,6 +1028,170 @@ describe('lookupMessages', () => {
     expect(rows.length).toBe(1); // string 'false' is NOT === true → bot row excluded
     expect(rows[0].id).toBe('u1');
   });
+
+  it('senderId filter selects only matching sender', () => {
+    storeMessage({
+      id: 'a',
+      chat_jid: 'tg:1',
+      sender: 'alice',
+      sender_name: 'A',
+      content: 'hi',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    storeMessage({
+      id: 'b',
+      chat_jid: 'tg:1',
+      sender: 'bob',
+      sender_name: 'B',
+      content: 'hi',
+      timestamp: '2026-05-20T10:00:01Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    const rows = lookupMessages({
+      groupJids: ['tg:1'],
+      senderId: 'alice',
+      includeBot: false,
+      limit: 50,
+    });
+    expect(rows.length).toBe(1);
+    expect(rows[0].sender).toBe('alice');
+  });
+
+  it('since filter excludes rows with timestamp < since (inclusive boundary)', () => {
+    storeMessage({
+      id: 'a',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'old',
+      timestamp: '2026-05-20T09:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    storeMessage({
+      id: 'b',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'boundary',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    storeMessage({
+      id: 'c',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'new',
+      timestamp: '2026-05-20T11:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    const rows = lookupMessages({
+      groupJids: ['tg:1'],
+      since: '2026-05-20T10:00:00Z',
+      includeBot: false,
+      limit: 50,
+    });
+    expect(rows.map((r) => r.id).sort()).toEqual(['b', 'c']); // inclusive boundary
+  });
+
+  it('until filter excludes rows with timestamp > until (inclusive boundary)', () => {
+    storeMessage({
+      id: 'a',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'old',
+      timestamp: '2026-05-20T09:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    storeMessage({
+      id: 'b',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'boundary',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    storeMessage({
+      id: 'c',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'new',
+      timestamp: '2026-05-20T11:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    const rows = lookupMessages({
+      groupJids: ['tg:1'],
+      until: '2026-05-20T10:00:00Z',
+      includeBot: false,
+      limit: 50,
+    });
+    expect(rows.map((r) => r.id).sort()).toEqual(['a', 'b']);
+  });
+
+  it('tgMessageId filter returns only that specific message', () => {
+    storeMessage({
+      id: 'target',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'find me',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    storeMessage({
+      id: 'other',
+      chat_jid: 'tg:1',
+      sender: 'u',
+      sender_name: 'U',
+      content: 'skip me',
+      timestamp: '2026-05-20T10:00:01Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    const rows = lookupMessages({
+      groupJids: ['tg:1'],
+      tgMessageId: 'target',
+      includeBot: false,
+      limit: 50,
+    });
+    expect(rows.length).toBe(1);
+    expect(rows[0].id).toBe('target');
+  });
+
+  it('empty-string filter values are normalized to null (no degraded match)', () => {
+    storeMessage({
+      id: 'a',
+      chat_jid: 'tg:1',
+      sender: 'alice',
+      sender_name: 'A',
+      content: 'hi',
+      timestamp: '2026-05-20T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    // Empty senderId should NOT filter to sender='' (which would match zero rows); should be treated as "no filter"
+    const rows = lookupMessages({
+      groupJids: ['tg:1'],
+      senderId: '',
+      includeBot: false,
+      limit: 50,
+    });
+    expect(rows.length).toBe(1);
+    expect(rows[0].id).toBe('a');
+  });
 });
 
 describe('buildQueryParam', () => {
@@ -1036,12 +1263,7 @@ describe('messages.meta projection', () => {
       is_bot_message: false,
       meta: '<m id="3"/>',
     });
-    const rows = getMessagesSince(
-      'tg:1',
-      '2026-05-20T09:00:00Z',
-      'Andy',
-      50,
-    );
+    const rows = getMessagesSince('tg:1', '2026-05-20T09:00:00Z', 'Andy', 50);
     expect(rows[0].meta).toBe('<m id="3"/>');
   });
 });
