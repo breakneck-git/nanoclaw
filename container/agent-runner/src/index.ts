@@ -22,11 +22,6 @@ import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-a
 import { fileURLToPath } from 'url';
 import { safeTruncate } from './safe-truncate.js';
 
-interface ImageAttachment {
-  data: string;
-  mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
-}
-
 interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -36,7 +31,6 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
-  images?: ImageAttachment[];
 }
 
 interface ContainerOutput {
@@ -85,23 +79,6 @@ class MessageStream {
     this.queue.push({
       type: 'user',
       message: { role: 'user', content: text },
-      parent_tool_use_id: null,
-      session_id: '',
-    });
-    this.waiting?.();
-  }
-
-  pushWithImages(text: string, images: ImageAttachment[]): void {
-    const content: SDKContentBlock[] = [
-      ...images.map((img) => ({
-        type: 'image' as const,
-        source: { type: 'base64' as const, media_type: img.mediaType, data: img.data },
-      })),
-      { type: 'text' as const, text },
-    ];
-    this.queue.push({
-      type: 'user',
-      message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: '',
     });
@@ -393,11 +370,7 @@ async function runQuery(
   resumeAt?: string,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
-  if (containerInput.images && containerInput.images.length > 0) {
-    stream.pushWithImages(prompt, containerInput.images);
-  } else {
-    stream.push(prompt);
-  }
+  stream.push(prompt);
 
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;

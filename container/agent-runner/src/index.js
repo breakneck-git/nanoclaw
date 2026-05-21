@@ -38,22 +38,6 @@ class MessageStream {
         });
         this.waiting?.();
     }
-    pushWithImages(text, images) {
-        const content = [
-            ...images.map((img) => ({
-                type: 'image',
-                source: { type: 'base64', media_type: img.mediaType, data: img.data },
-            })),
-            { type: 'text', text },
-        ];
-        this.queue.push({
-            type: 'user',
-            message: { role: 'user', content },
-            parent_tool_use_id: null,
-            session_id: '',
-        });
-        this.waiting?.();
-    }
     end() {
         this.done = true;
         this.waiting?.();
@@ -286,12 +270,7 @@ function waitForIpcMessage() {
  */
 async function runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt) {
     const stream = new MessageStream();
-    if (containerInput.images && containerInput.images.length > 0) {
-        stream.pushWithImages(prompt, containerInput.images);
-    }
-    else {
-        stream.push(prompt);
-    }
+    stream.push(prompt);
     // Poll IPC for follow-up messages and _close sentinel during the query
     let ipcPolling = true;
     let closedDuringQuery = false;

@@ -1,7 +1,6 @@
 import https from 'https';
 import http from 'http';
 import FormData from 'form-data';
-import { downloadImage, processImage } from '../image.js';
 import { Api, Bot, type Context } from 'grammy';
 import type { Message } from 'grammy/types';
 
@@ -808,34 +807,9 @@ export class TelegramChannel implements Channel {
         isGroupChat,
       );
 
-      // Pick the largest available photo size
-      const photos = ctx.message.photo;
-      const fileId = photos?.[photos.length - 1]?.file_id;
-
-      let images:
-        | import('../container-runner.js').ImageAttachment[]
-        | undefined;
-      if (fileId) {
-        try {
-          // Get download URL from Telegram
-          const fileInfo = await ctx.api.getFile(fileId);
-          const url = `https://api.telegram.org/file/bot${this.botToken}/${fileInfo.file_path}`;
-          const buffer = await downloadImage(url);
-          if (buffer) {
-            const img = await processImage(buffer);
-            if (img) {
-              images = [img];
-              logger.info(
-                { chatJid, senderName },
-                'Photo processed for agent vision',
-              );
-            }
-          }
-        } catch (err) {
-          logger.warn({ chatJid, err }, 'Failed to process photo');
-        }
-      }
-
+      // Photo metadata (file_id, etc.) is emitted via buildMetaBlock as
+      // <media type="photo" file_id="..."/>. Agent calls view_media on demand
+      // when it needs to actually see the image — no eager base64 inlining.
       this.deliverInbound(ctx, chatJid, group, {
         id: ctx.message.message_id.toString(),
         chat_jid: chatJid,
@@ -844,7 +818,6 @@ export class TelegramChannel implements Channel {
         content: `${fwd}${reply}[Photo]${caption}`,
         timestamp,
         is_from_me: false,
-        images,
       });
     });
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));

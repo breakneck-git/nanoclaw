@@ -38,13 +38,6 @@ import { RegisteredGroup } from './types.js';
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
-export interface ImageAttachment {
-  /** Base64-encoded image data */
-  data: string;
-  /** MIME type, e.g. 'image/jpeg' */
-  mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
-}
-
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -54,8 +47,6 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
-  /** Image attachments to pass to the agent as multimodal content */
-  images?: ImageAttachment[];
 }
 
 export interface ContainerOutput {

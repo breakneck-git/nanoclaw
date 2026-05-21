@@ -86,13 +86,6 @@ const lastThreadId: Record<string, string | undefined> = {};
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
-// Temporary store for image attachments — keyed by message ID.
-// Images are held until the message batch is processed by the agent, then cleared.
-const pendingImages = new Map<
-  string,
-  import('./container-runner.js').ImageAttachment[]
->();
-
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
   const agentTs = getRouterState('last_agent_timestamp');
@@ -241,20 +234,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
-  // Collect images from pending messages. Keep them in the map until the
-  // agent run succeeds — on error the cursor rolls back and we replay the
-  // same messages, which must still have their images.
-  const batchImages: import('./container-runner.js').ImageAttachment[] = [];
-  const imageKeys: string[] = [];
-  for (const msg of missedMessages) {
-    const key = `${chatJid}:${msg.id}`;
-    const imgs = pendingImages.get(key);
-    if (imgs) {
-      batchImages.push(...imgs);
-      imageKeys.push(key);
-    }
-  }
-
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
@@ -330,7 +309,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         hadError = true;
       }
     },
-    batchImages.length > 0 ? batchImages : undefined,
   );
 
   await channel.setTyping?.(chatJid, false);
@@ -344,11 +322,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         { group: group.name },
         'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
       );
-      for (const key of imageKeys) pendingImages.delete(key);
       return true;
     }
     // Roll back cursor so retries can re-process these messages.
-    // Leave pendingImages intact so the retry still has the images.
     lastAgentTimestamp[chatJid] = previousCursor;
     saveState();
     logger.warn(
@@ -358,7 +334,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return false;
   }
 
-  for (const key of imageKeys) pendingImages.delete(key);
   return true;
 }
 
@@ -367,7 +342,6 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
-  images?: import('./container-runner.js').ImageAttachment[],
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
@@ -418,7 +392,6 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
-        images,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -527,16 +500,7 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
-          // If any pending messages have images, don't pipe via IPC (text-only path).
-          // Close the active container so a fresh one starts with full image data.
-          // Key shape must match the writer at the onMessage handler below
-          // (`${chat_jid}:${id}`) — Telegram and Gmail use channel-scoped IDs
-          // that collide across chats if we only key by msg.id.
-          const hasImages = messagesToSend.some((m) =>
-            pendingImages.has(`${m.chat_jid}:${m.id}`),
-          );
-
-          if (!hasImages && queue.sendMessage(chatJid, formatted)) {
+          if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
@@ -551,16 +515,7 @@ async function startMessageLoop(): Promise<void> {
                 logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
               );
           } else {
-            if (hasImages) {
-              // Signal the running container to exit so a new one can start
-              // with the full ContainerInput including image data.
-              queue.closeStdin(chatJid);
-              logger.debug(
-                { chatJid },
-                'Image message: closing active container for fresh start with images',
-              );
-            }
-            // No active container (or closing for images) — enqueue for a new one
+            // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
           }
         }
@@ -717,12 +672,6 @@ async function main(): Promise<void> {
         }
       }
       storeMessage(msg);
-      // Save images in memory until the message batch is processed.
-      // Key by chatJid:msg.id because per-channel message IDs (e.g. Telegram)
-      // are only unique within a chat, not globally.
-      if (msg.images && msg.images.length > 0) {
-        pendingImages.set(`${msg.chat_jid}:${msg.id}`, msg.images);
-      }
     },
     onChatMetadata: (
       chatJid: string,

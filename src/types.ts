@@ -52,8 +52,6 @@ export interface NewMessage {
   is_from_me?: boolean;
   is_bot_message?: boolean;
   thread_id?: string;
-  /** Image attachments (base64-encoded) to pass to the agent as multimodal content */
-  images?: import('./container-runner.js').ImageAttachment[];
   /** Channel-specific structured metadata (JSON-serialized) for rich message capture. */
   meta?: string;
 }
