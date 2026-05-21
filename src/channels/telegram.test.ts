@@ -479,10 +479,7 @@ describe('deliverInbound — exception isolation', () => {
   // pipeline or meta builder — a regression that would silently drop
   // inbound messages whenever the contact pipeline throws.
   const telegramSrc = readFileSync(
-    path.resolve(
-      path.dirname(fileURLToPath(import.meta.url)),
-      './telegram.ts',
-    ),
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), './telegram.ts'),
     'utf-8',
   );
 
