@@ -66,6 +66,10 @@ const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
+// Compiled-output directory for the runner — used to locate sibling scripts
+// (ipc-mcp-stdio.js, lazy-mcp-proxy.js) that get spawned as child processes.
+const RUNNER_DIST_DIR = path.dirname(fileURLToPath(import.meta.url));
+
 /**
  * Push-based async iterable for streaming user messages to the SDK.
  * Keeps the iterable alive until end() is called, preventing isSingleUserTurn.
@@ -487,20 +491,33 @@ async function runQuery(
             GOOGLE_CALENDAR_MCP_TOKEN_PATH: '/home/node/.gmail-mcp/google-calendar-tokens.json',
           },
         },
+        // google-maps and google-drive are routed through the lazy MCP proxy:
+        // the real child process is only forked on first tools/call. See
+        // container/agent-runner/src/lazy-mcp-proxy.ts for details. The
+        // tool-list cache lives under /workspace/ipc/.mcp-cache and survives
+        // container restarts via the host-mounted IPC volume.
         'google-maps': {
-          command: 'mcp-server-google-maps',
-          args: [],
-          env: {
-            GOOGLE_MAPS_API_KEY: process.env.GOOGLE_MAPS_API_KEY || '',
-          },
+          command: 'node',
+          args: [
+            path.join(RUNNER_DIST_DIR, 'lazy-mcp-proxy.js'),
+            '--name', 'google-maps',
+            '--command', 'mcp-server-google-maps',
+            '--env-json', JSON.stringify({
+              GOOGLE_MAPS_API_KEY: process.env.GOOGLE_MAPS_API_KEY || '',
+            }),
+          ],
         },
         'google-drive': {
-          command: 'google-drive-mcp',
-          args: [],
-          env: {
-            GOOGLE_DRIVE_OAUTH_CREDENTIALS: '/home/node/.gmail-mcp/gcp-oauth.keys.json',
-            GOOGLE_DRIVE_MCP_TOKEN_PATH: '/home/node/.gmail-mcp/google-drive-tokens.json',
-          },
+          command: 'node',
+          args: [
+            path.join(RUNNER_DIST_DIR, 'lazy-mcp-proxy.js'),
+            '--name', 'google-drive',
+            '--command', 'google-drive-mcp',
+            '--env-json', JSON.stringify({
+              GOOGLE_DRIVE_OAUTH_CREDENTIALS: '/home/node/.gmail-mcp/gcp-oauth.keys.json',
+              GOOGLE_DRIVE_MCP_TOKEN_PATH: '/home/node/.gmail-mcp/google-drive-tokens.json',
+            }),
+          ],
         },
       },
       hooks: {
@@ -613,8 +630,7 @@ async function main(): Promise<void> {
   // No real secrets exist in the container environment.
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
 
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
+  const mcpServerPath = path.join(RUNNER_DIST_DIR, 'ipc-mcp-stdio.js');
 
   let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
