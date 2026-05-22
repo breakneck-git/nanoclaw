@@ -426,14 +426,23 @@ export async function runContainerAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
+  const tMark = (label: string): void => {
+    logger.debug(
+      { group: group.name, label, elapsedMs: Date.now() - startTime },
+      'startup-timing',
+    );
+  };
+  tMark('enter-runContainerAgent');
 
   // Refresh expired Google tokens before starting the container
   await refreshGoogleTokens();
+  tMark('after-refreshGoogleTokens');
 
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
   const mounts = buildVolumeMounts(group, input.isMain);
+  tMark('after-buildVolumeMounts');
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const { args: containerArgs, envFilePath } = buildContainerArgs(
@@ -441,6 +450,7 @@ export async function runContainerAgent(
     containerName,
     input.isMain,
   );
+  tMark('after-buildContainerArgs');
 
   let envFileCleaned = false;
   const cleanupEnvFile = () => {
@@ -487,6 +497,7 @@ export async function runContainerAgent(
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+    tMark('after-spawn');
 
     onProcess(container, containerName);
 
@@ -494,6 +505,7 @@ export async function runContainerAgent(
     let stderr = '';
     let stdoutTruncated = false;
     let stderrTruncated = false;
+    let firstStdoutLogged = false;
 
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
@@ -505,6 +517,10 @@ export async function runContainerAgent(
 
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
+      if (!firstStdoutLogged) {
+        firstStdoutLogged = true;
+        tMark('first-stdout-chunk');
+      }
 
       // Always accumulate for logging
       if (!stdoutTruncated) {
