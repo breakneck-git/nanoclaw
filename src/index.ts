@@ -1,9 +1,12 @@
 import fs from 'fs';
 import path from 'path';
 
+import type { Bot } from 'grammy';
+
 import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
+  DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
@@ -46,6 +49,11 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
+import { handleViewMediaRequest } from './ipc-media-handler.js';
+import {
+  processAnnotateContact,
+  processLookupMessages,
+} from './ipc-lookup-handler.js';
 import {
   findChannel,
   formatMessages,
@@ -726,6 +734,7 @@ async function main(): Promise<void> {
       }
     },
   });
+  const ipcBaseDir = path.join(DATA_DIR, 'ipc');
   startIpcWatcher({
     sendMessage: (jid, text) => {
       return routeOutbound(channels, jid, text, {
@@ -758,6 +767,39 @@ async function main(): Promise<void> {
       for (const group of Object.values(registeredGroups)) {
         writeTasksSnapshot(group.folder, group.isMain === true, taskRows);
       }
+    },
+    // view_media — needs grammy Bot from Telegram channel. Only Telegram-
+    // sourced media is supported right now; if no Telegram channel is wired
+    // we surface UPSTREAM_ERROR so the watcher still emits a structured
+    // response instead of leaving the request to TIMEOUT.
+    viewMedia: async (payload, requestingGroupJids) => {
+      const telegramChannel = channels.find(
+        (c) => c.constructor.name === 'TelegramChannel',
+      );
+      const bot = (telegramChannel as unknown as { bot?: Bot } | undefined)
+        ?.bot;
+      if (!bot) {
+        return {
+          isError: true,
+          _meta: { error_code: 'UPSTREAM_ERROR', retryable: false },
+          content: [
+            {
+              type: 'text',
+              text: 'UPSTREAM_ERROR: no Telegram channel connected',
+            },
+          ],
+        };
+      }
+      return handleViewMediaRequest(payload, requestingGroupJids, bot);
+    },
+    // lookup_messages — pure DB query, no channel dependency.
+    lookupMessages: async (payload, requestingGroupJids) => {
+      return processLookupMessages(payload, requestingGroupJids);
+    },
+    // annotate_contact — pure DB write, but needs ipcBaseDir to trigger the
+    // debounced contacts.json snapshot refresh.
+    annotateContact: async (payload, group) => {
+      return processAnnotateContact(ipcBaseDir, payload, group);
     },
   });
   queue.setProcessMessagesFn(processGroupMessages);
