@@ -817,10 +817,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
             }
             const reqId = payload.reqId || file.replace(/\.json$/, '');
             try {
-              const response = await deps.saveCredential(
-                payload,
-                sourceGroup,
-              );
+              const response = await deps.saveCredential(payload, sourceGroup);
               writeCredentialResponseAtomic(
                 ipcBaseDir,
                 sourceGroup,
@@ -835,11 +832,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
               // retry / get feedback in the same session.
               if (!response.isError) {
                 try {
-                  const inputDir = path.join(
-                    ipcBaseDir,
-                    sourceGroup,
-                    'input',
-                  );
+                  const inputDir = path.join(ipcBaseDir, sourceGroup, 'input');
                   fs.mkdirSync(inputDir, { recursive: true });
                   fs.writeFileSync(path.join(inputDir, '_close'), '');
                   logger.info(
@@ -864,21 +857,16 @@ export function startIpcWatcher(deps: IpcDeps): void {
                 { file, sourceGroup, err },
                 'save_credential handler threw — writing UPSTREAM_ERROR',
               );
-              writeCredentialResponseAtomic(
-                ipcBaseDir,
-                sourceGroup,
-                reqId,
-                {
-                  isError: true,
-                  _meta: { error_code: 'UPSTREAM_ERROR', retryable: true },
-                  content: [
-                    {
-                      type: 'text',
-                      text: `UPSTREAM_ERROR: handler threw — ${(err as Error).message}`,
-                    },
-                  ],
-                },
-              );
+              writeCredentialResponseAtomic(ipcBaseDir, sourceGroup, reqId, {
+                isError: true,
+                _meta: { error_code: 'UPSTREAM_ERROR', retryable: true },
+                content: [
+                  {
+                    type: 'text',
+                    text: `UPSTREAM_ERROR: handler threw — ${(err as Error).message}`,
+                  },
+                ],
+              });
               try {
                 fs.unlinkSync(processingPath);
               } catch {

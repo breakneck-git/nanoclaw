@@ -299,12 +299,16 @@ describe('buildVolumeMounts per-group credential isolation', () => {
   // present, we toggle existsSync to return true for that path.
   const home = os.homedir();
   const mainGmailHostPath = path.join(home, '.gmail-mcp');
-  const mainCalendarHostPath = path.join(home, '.config', 'google-calendar-mcp');
+  const mainCalendarHostPath = path.join(
+    home,
+    '.config',
+    'google-calendar-mcp',
+  );
 
   it('main group: gmail-mcp mount points to HOME (backward compat preserved)', () => {
     // Make HOME's .gmail-mcp "exist" so the existing branch fires.
-    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) =>
-      String(p) === mainGmailHostPath,
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: fs.PathLike) => String(p) === mainGmailHostPath,
     );
 
     const mounts = buildVolumeMounts(
@@ -419,9 +423,9 @@ describe('buildVolumeMounts per-group credential isolation', () => {
   it('non-main group: NEVER mounts main user HOME .gmail-mcp (no fallback to cross-user creds)', () => {
     // Toggle existsSync so HOME's .gmail-mcp APPEARS to exist (the dangerous
     // case — old code would silently fall through and mount it for everyone).
-    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) =>
-      String(p) === mainGmailHostPath ||
-      String(p) === mainCalendarHostPath,
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: fs.PathLike) =>
+        String(p) === mainGmailHostPath || String(p) === mainCalendarHostPath,
     );
 
     const mounts = buildVolumeMounts(
@@ -437,8 +441,7 @@ describe('buildVolumeMounts per-group credential isolation', () => {
     // Defense against regression: no mount points at HOME for non-main groups.
     const homeMounts = mounts.filter(
       (m) =>
-        m.hostPath === mainGmailHostPath ||
-        m.hostPath === mainCalendarHostPath,
+        m.hostPath === mainGmailHostPath || m.hostPath === mainCalendarHostPath,
     );
     expect(homeMounts).toHaveLength(0);
   });
@@ -484,12 +487,14 @@ describe('buildContainerArgs per-group env file (Part B)', () => {
     vi.mocked(fs.existsSync).mockImplementation(
       (p: fs.PathLike) => String(p) === perGroupEnvPath,
     );
-    vi.mocked(fs.readFileSync).mockImplementation((p: fs.PathOrFileDescriptor) => {
-      if (String(p) === perGroupEnvPath) {
-        return 'NOTION_API_KEY=her_secret\n';
-      }
-      return '';
-    });
+    vi.mocked(fs.readFileSync).mockImplementation(
+      (p: fs.PathOrFileDescriptor) => {
+        if (String(p) === perGroupEnvPath) {
+          return 'NOTION_API_KEY=her_secret\n';
+        }
+        return '';
+      },
+    );
     const writeSpy = vi.mocked(fs.writeFileSync);
     writeSpy.mockClear();
 
@@ -503,13 +508,15 @@ describe('buildContainerArgs per-group env file (Part B)', () => {
 
     // The env-file is written by buildContainerArgs via writeFileSync. Find
     // the call whose content contains NOTION_API_KEY=her_secret.
-    const envFileWrite = writeSpy.mock.calls.find(([, data]) =>
-      typeof data === 'string' && data.includes('NOTION_API_KEY=her_secret'),
+    const envFileWrite = writeSpy.mock.calls.find(
+      ([, data]) =>
+        typeof data === 'string' && data.includes('NOTION_API_KEY=her_secret'),
     );
     expect(envFileWrite).toBeDefined();
     // And the global value must NOT be the one written.
-    const wroteGlobal = writeSpy.mock.calls.some(([, data]) =>
-      typeof data === 'string' && data.includes('NOTION_API_KEY=global_val'),
+    const wroteGlobal = writeSpy.mock.calls.some(
+      ([, data]) =>
+        typeof data === 'string' && data.includes('NOTION_API_KEY=global_val'),
     );
     expect(wroteGlobal).toBe(false);
   });
@@ -528,8 +535,9 @@ describe('buildContainerArgs per-group env file (Part B)', () => {
       'telegram_dana',
     );
 
-    const envFileWrite = writeSpy.mock.calls.find(([, data]) =>
-      typeof data === 'string' && data.includes('NOTION_API_KEY=global_val'),
+    const envFileWrite = writeSpy.mock.calls.find(
+      ([, data]) =>
+        typeof data === 'string' && data.includes('NOTION_API_KEY=global_val'),
     );
     expect(envFileWrite).toBeDefined();
   });
@@ -546,12 +554,14 @@ describe('buildContainerArgs per-group env file (Part B)', () => {
     vi.mocked(fs.existsSync).mockImplementation(
       (p: fs.PathLike) => String(p) === perGroupEnvPath,
     );
-    vi.mocked(fs.readFileSync).mockImplementation((p: fs.PathOrFileDescriptor) => {
-      if (String(p) === perGroupEnvPath) {
-        return 'NOTION_API_KEY=should_not_be_used\n';
-      }
-      return '';
-    });
+    vi.mocked(fs.readFileSync).mockImplementation(
+      (p: fs.PathOrFileDescriptor) => {
+        if (String(p) === perGroupEnvPath) {
+          return 'NOTION_API_KEY=should_not_be_used\n';
+        }
+        return '';
+      },
+    );
     const writeSpy = vi.mocked(fs.writeFileSync);
     writeSpy.mockClear();
 
@@ -564,13 +574,15 @@ describe('buildContainerArgs per-group env file (Part B)', () => {
     );
 
     // Main writes the GLOBAL value, never the per-group one.
-    const wroteGlobal = writeSpy.mock.calls.some(([, data]) =>
-      typeof data === 'string' && data.includes('NOTION_API_KEY=global_val'),
+    const wroteGlobal = writeSpy.mock.calls.some(
+      ([, data]) =>
+        typeof data === 'string' && data.includes('NOTION_API_KEY=global_val'),
     );
     expect(wroteGlobal).toBe(true);
-    const wrotePerGroup = writeSpy.mock.calls.some(([, data]) =>
-      typeof data === 'string' &&
-      data.includes('NOTION_API_KEY=should_not_be_used'),
+    const wrotePerGroup = writeSpy.mock.calls.some(
+      ([, data]) =>
+        typeof data === 'string' &&
+        data.includes('NOTION_API_KEY=should_not_be_used'),
     );
     expect(wrotePerGroup).toBe(false);
   });

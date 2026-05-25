@@ -234,9 +234,7 @@ describe('processSaveCredential', () => {
       expect(tmpWrite).toBeDefined();
       // renameSync moved it to the final path
       const finalRename = renameSpy.mock.calls.find(([, to]) =>
-        String(to).endsWith(
-          path.join('env', 'telegram_dana.env'),
-        ),
+        String(to).endsWith(path.join('env', 'telegram_dana.env')),
       );
       expect(finalRename).toBeDefined();
     } finally {
@@ -247,9 +245,7 @@ describe('processSaveCredential', () => {
 
   it('auto-creates data/env/ when it does not exist', () => {
     // Fresh dir: no env/ subdir
-    expect(
-      fs.existsSync(path.join(tmpDataDir, 'env')),
-    ).toBe(false);
+    expect(fs.existsSync(path.join(tmpDataDir, 'env'))).toBe(false);
 
     processSaveCredential({
       reqId: 'r12',
@@ -268,14 +264,12 @@ describe('handleSaveCredentialRequest (file-driven)', () => {
   beforeEach(() => {
     tmpDataDir = freshDataDir();
     ipcRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'credential-ipc-'));
-    fs.mkdirSync(
-      path.join(ipcRoot, 'telegram_dana', 'credential-requests'),
-      { recursive: true },
-    );
-    fs.mkdirSync(
-      path.join(ipcRoot, 'telegram_dana', 'credential-responses'),
-      { recursive: true },
-    );
+    fs.mkdirSync(path.join(ipcRoot, 'telegram_dana', 'credential-requests'), {
+      recursive: true,
+    });
+    fs.mkdirSync(path.join(ipcRoot, 'telegram_dana', 'credential-responses'), {
+      recursive: true,
+    });
     vi.clearAllMocks();
   });
 

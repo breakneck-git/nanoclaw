@@ -47,9 +47,7 @@ import path from 'path';
 
 import { DATA_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
-import {
-  writeIpcResponseAtomic,
-} from './ipc.js';
+import { writeIpcResponseAtomic } from './ipc.js';
 import { logger } from './logger.js';
 
 // ---------------------------------------------------------------------------
