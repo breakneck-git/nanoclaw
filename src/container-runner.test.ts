@@ -225,12 +225,9 @@ describe('container-runner timeout behavior', () => {
 // ---------------------------------------------------------------------------
 describe('buildContainerArgs NANOCLAW_ENABLE_MCP env injection', () => {
   it('pushes NANOCLAW_ENABLE_MCP=<csv> when group.enabledMcp is a populated array', () => {
-    const { args } = buildContainerArgs(
-      [],
-      'nc-test',
-      false,
-      { enabledMcp: ['nanoclaw'] },
-    );
+    const { args } = buildContainerArgs([], 'nc-test', false, {
+      enabledMcp: ['nanoclaw'],
+    });
     // The -e flag is followed by its value as a separate argv token — the
     // expected pair is `-e NANOCLAW_ENABLE_MCP=nanoclaw`. We assert both
     // the presence of the pair and the absence of accidental duplication
@@ -245,12 +242,9 @@ describe('buildContainerArgs NANOCLAW_ENABLE_MCP env injection', () => {
   });
 
   it('serializes a multi-entry whitelist as a comma-separated csv', () => {
-    const { args } = buildContainerArgs(
-      [],
-      'nc-test',
-      false,
-      { enabledMcp: ['nanoclaw', 'gmail', 'notion'] },
-    );
+    const { args } = buildContainerArgs([], 'nc-test', false, {
+      enabledMcp: ['nanoclaw', 'gmail', 'notion'],
+    });
     expect(args).toContain('NANOCLAW_ENABLE_MCP=nanoclaw,gmail,notion');
   });
 
@@ -258,12 +252,9 @@ describe('buildContainerArgs NANOCLAW_ENABLE_MCP env injection', () => {
     // Empty array → empty value. The container interprets this as "no extra
     // MCP servers besides the always-included `nanoclaw`". Distinct from the
     // undefined case below (legacy / all enabled).
-    const { args } = buildContainerArgs(
-      [],
-      'nc-test',
-      false,
-      { enabledMcp: [] },
-    );
+    const { args } = buildContainerArgs([], 'nc-test', false, {
+      enabledMcp: [],
+    });
     expect(args).toContain('NANOCLAW_ENABLE_MCP=');
   });
 

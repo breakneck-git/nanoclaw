@@ -177,9 +177,7 @@ function createSchema(database: Database.Database): void {
   // Idempotent: a duplicate ADD COLUMN throws "duplicate column name" which
   // we swallow, mirroring the surrounding migrations.
   try {
-    database.exec(
-      `ALTER TABLE registered_groups ADD COLUMN enabled_mcp TEXT`,
-    );
+    database.exec(`ALTER TABLE registered_groups ADD COLUMN enabled_mcp TEXT`);
   } catch {
     /* column already exists */
   }

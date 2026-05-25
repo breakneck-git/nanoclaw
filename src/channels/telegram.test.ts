@@ -504,9 +504,7 @@ describe('deliverInbound — exception isolation', () => {
     // dropped sender's display name/phone never lands in the contacts
     // table. Source inspection: shouldDropMessage / isSenderAllowed must
     // appear, AND must precede the processContactsFromContext call.
-    const body = telegramSrc.match(
-      /private deliverInbound[\s\S]+?(?=\n  \w)/,
-    );
+    const body = telegramSrc.match(/private deliverInbound[\s\S]+?(?=\n  \w)/);
     expect(body).not.toBeNull();
     const text = body![0];
     const dropIdx = text.indexOf('shouldDropMessage');
