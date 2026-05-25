@@ -88,10 +88,14 @@ vi.mock('child_process', async () => {
 
 import {
   buildContainerArgs,
+  buildVolumeMounts,
   runContainerAgent,
   ContainerOutput,
 } from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
+import os from 'os';
+import path from 'path';
+import fs from 'fs';
 
 const testGroup: RegisteredGroup = {
   name: 'Test Group',
@@ -268,5 +272,306 @@ describe('buildContainerArgs NANOCLAW_ENABLE_MCP env injection', () => {
   it('OMITS the env var when group arg is omitted entirely (back-compat)', () => {
     const { args } = buildContainerArgs([], 'nc-test', false);
     expect(args.some((a) => a.startsWith('NANOCLAW_ENABLE_MCP='))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildVolumeMounts — per-group credential isolation (Part A of per-group
+// credentials MVP).
+//
+// Background: gmail-mcp and google-calendar-mcp OAuth token files used to be
+// mounted from $HOME for every group. That meant Dana's container (and any
+// other non-main group) got read/write access to the main user's tokens —
+// either could refresh, rotate, or read them. Cross-contamination risk.
+//
+// New rule:
+//   - Main group  → mount from $HOME (unchanged, preserves backward compat).
+//   - Other groups → mount from groups/<folder>/.gmail-mcp/ and
+//                    groups/<folder>/.config/google-calendar-mcp/.
+//   - Per-group dirs are auto-created when missing so the mount always
+//     succeeds; the MCP server itself populates them when the user goes
+//     through OAuth in that container (separate follow-up task).
+// ---------------------------------------------------------------------------
+describe('buildVolumeMounts per-group credential isolation', () => {
+  // The default `fs.existsSync(() => false)` mock makes every "if dir exists"
+  // branch take the "doesn't exist" path. The gmail-mcp branch is gated by
+  // `fs.existsSync(gmailDir)`, so for tests that need to assert the mount is
+  // present, we toggle existsSync to return true for that path.
+  const home = os.homedir();
+  const mainGmailHostPath = path.join(home, '.gmail-mcp');
+  const mainCalendarHostPath = path.join(home, '.config', 'google-calendar-mcp');
+
+  it('main group: gmail-mcp mount points to HOME (backward compat preserved)', () => {
+    // Make HOME's .gmail-mcp "exist" so the existing branch fires.
+    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) =>
+      String(p) === mainGmailHostPath,
+    );
+
+    const mounts = buildVolumeMounts(
+      {
+        name: 'Main',
+        folder: 'telegram_main',
+        trigger: '@Andy',
+        added_at: new Date().toISOString(),
+        isMain: true,
+      },
+      true,
+    );
+
+    const gmailMount = mounts.find(
+      (m) => m.containerPath === '/home/node/.gmail-mcp',
+    );
+    expect(gmailMount).toBeDefined();
+    expect(gmailMount!.hostPath).toBe(mainGmailHostPath);
+  });
+
+  it('main group: google-calendar mount points to HOME (backward compat preserved)', () => {
+    vi.mocked(fs.existsSync).mockImplementation(() => false);
+
+    const mounts = buildVolumeMounts(
+      {
+        name: 'Main',
+        folder: 'telegram_main',
+        trigger: '@Andy',
+        added_at: new Date().toISOString(),
+        isMain: true,
+      },
+      true,
+    );
+
+    const calMount = mounts.find(
+      (m) => m.containerPath === '/home/node/.config/google-calendar-mcp',
+    );
+    expect(calMount).toBeDefined();
+    expect(calMount!.hostPath).toBe(mainCalendarHostPath);
+  });
+
+  it('non-main group: gmail-mcp mount points to groups/<folder>/.gmail-mcp, NOT HOME', () => {
+    vi.mocked(fs.existsSync).mockImplementation(() => false);
+
+    const mounts = buildVolumeMounts(
+      {
+        name: 'Dana',
+        folder: 'telegram_dana',
+        trigger: '@Andy',
+        added_at: new Date().toISOString(),
+      },
+      false,
+    );
+
+    const gmailMount = mounts.find(
+      (m) => m.containerPath === '/home/node/.gmail-mcp',
+    );
+    expect(gmailMount).toBeDefined();
+    // Per-group, not HOME — this is the security fix.
+    expect(gmailMount!.hostPath).not.toBe(mainGmailHostPath);
+    expect(gmailMount!.hostPath).toContain('telegram_dana');
+    expect(gmailMount!.hostPath).toContain('.gmail-mcp');
+  });
+
+  it('non-main group: google-calendar mount points to groups/<folder>/.config/google-calendar-mcp, NOT HOME', () => {
+    vi.mocked(fs.existsSync).mockImplementation(() => false);
+
+    const mounts = buildVolumeMounts(
+      {
+        name: 'Dana',
+        folder: 'telegram_dana',
+        trigger: '@Andy',
+        added_at: new Date().toISOString(),
+      },
+      false,
+    );
+
+    const calMount = mounts.find(
+      (m) => m.containerPath === '/home/node/.config/google-calendar-mcp',
+    );
+    expect(calMount).toBeDefined();
+    expect(calMount!.hostPath).not.toBe(mainCalendarHostPath);
+    expect(calMount!.hostPath).toContain('telegram_dana');
+    expect(calMount!.hostPath).toContain('google-calendar-mcp');
+  });
+
+  it('non-main group: auto-creates per-group .gmail-mcp directory when missing (so mount succeeds)', () => {
+    vi.mocked(fs.existsSync).mockImplementation(() => false);
+    const mkdirSpy = vi.mocked(fs.mkdirSync);
+    mkdirSpy.mockClear();
+
+    buildVolumeMounts(
+      {
+        name: 'Dana',
+        folder: 'telegram_dana',
+        trigger: '@Andy',
+        added_at: new Date().toISOString(),
+      },
+      false,
+    );
+
+    // mkdirSync should be called for the per-group .gmail-mcp path with
+    // recursive:true. We don't pin the exact path string (resolveGroupFolderPath
+    // builds it from GROUPS_DIR + folder), only the suffix.
+    const gmailMkdir = mkdirSpy.mock.calls.find(([p]) =>
+      String(p).endsWith(path.join('telegram_dana', '.gmail-mcp')),
+    );
+    expect(gmailMkdir).toBeDefined();
+    expect(gmailMkdir![1]).toEqual({ recursive: true });
+  });
+
+  it('non-main group: NEVER mounts main user HOME .gmail-mcp (no fallback to cross-user creds)', () => {
+    // Toggle existsSync so HOME's .gmail-mcp APPEARS to exist (the dangerous
+    // case — old code would silently fall through and mount it for everyone).
+    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) =>
+      String(p) === mainGmailHostPath ||
+      String(p) === mainCalendarHostPath,
+    );
+
+    const mounts = buildVolumeMounts(
+      {
+        name: 'Dana',
+        folder: 'telegram_dana',
+        trigger: '@Andy',
+        added_at: new Date().toISOString(),
+      },
+      false,
+    );
+
+    // Defense against regression: no mount points at HOME for non-main groups.
+    const homeMounts = mounts.filter(
+      (m) =>
+        m.hostPath === mainGmailHostPath ||
+        m.hostPath === mainCalendarHostPath,
+    );
+    expect(homeMounts).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildContainerArgs per-group env file (Part B).
+//
+// Non-main groups can override NOTION_API_KEY / GOOGLE_MAPS_API_KEY via a
+// per-group env file at data/env/<folder>.env. The save_credential MCP tool
+// writes that file when the user pastes a credential into chat. Main group
+// continues to read only the global .env / process.env — never per-group.
+// ---------------------------------------------------------------------------
+describe('buildContainerArgs per-group env file (Part B)', () => {
+  // Set NODE-level env vars to control "global" values during these tests.
+  const ORIGINAL_NOTION = process.env.NOTION_API_KEY;
+  const ORIGINAL_MAPS = process.env.GOOGLE_MAPS_API_KEY;
+
+  beforeEach(() => {
+    delete process.env.NOTION_API_KEY;
+    delete process.env.GOOGLE_MAPS_API_KEY;
+    vi.mocked(fs.existsSync).mockImplementation(() => false);
+    vi.mocked(fs.readFileSync).mockImplementation(() => '');
+  });
+
+  afterEach(() => {
+    if (ORIGINAL_NOTION !== undefined) {
+      process.env.NOTION_API_KEY = ORIGINAL_NOTION;
+    }
+    if (ORIGINAL_MAPS !== undefined) {
+      process.env.GOOGLE_MAPS_API_KEY = ORIGINAL_MAPS;
+    }
+  });
+
+  it('non-main group: per-group env file overrides global NOTION_API_KEY', () => {
+    // Global says "global_val"; per-group file says "her_secret". Per-group wins.
+    process.env.NOTION_API_KEY = 'global_val';
+    const perGroupEnvPath = path.join(
+      '/tmp/nanoclaw-test-data',
+      'env',
+      'telegram_dana.env',
+    );
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: fs.PathLike) => String(p) === perGroupEnvPath,
+    );
+    vi.mocked(fs.readFileSync).mockImplementation((p: fs.PathOrFileDescriptor) => {
+      if (String(p) === perGroupEnvPath) {
+        return 'NOTION_API_KEY=her_secret\n';
+      }
+      return '';
+    });
+    const writeSpy = vi.mocked(fs.writeFileSync);
+    writeSpy.mockClear();
+
+    buildContainerArgs(
+      [],
+      'nc-dana',
+      false,
+      { enabledMcp: ['nanoclaw', 'notion'] },
+      'telegram_dana',
+    );
+
+    // The env-file is written by buildContainerArgs via writeFileSync. Find
+    // the call whose content contains NOTION_API_KEY=her_secret.
+    const envFileWrite = writeSpy.mock.calls.find(([, data]) =>
+      typeof data === 'string' && data.includes('NOTION_API_KEY=her_secret'),
+    );
+    expect(envFileWrite).toBeDefined();
+    // And the global value must NOT be the one written.
+    const wroteGlobal = writeSpy.mock.calls.some(([, data]) =>
+      typeof data === 'string' && data.includes('NOTION_API_KEY=global_val'),
+    );
+    expect(wroteGlobal).toBe(false);
+  });
+
+  it('non-main group without per-group env file: falls back to global', () => {
+    process.env.NOTION_API_KEY = 'global_val';
+    vi.mocked(fs.existsSync).mockImplementation(() => false);
+    const writeSpy = vi.mocked(fs.writeFileSync);
+    writeSpy.mockClear();
+
+    buildContainerArgs(
+      [],
+      'nc-dana',
+      false,
+      { enabledMcp: ['nanoclaw', 'notion'] },
+      'telegram_dana',
+    );
+
+    const envFileWrite = writeSpy.mock.calls.find(([, data]) =>
+      typeof data === 'string' && data.includes('NOTION_API_KEY=global_val'),
+    );
+    expect(envFileWrite).toBeDefined();
+  });
+
+  it('main group: per-group env file is NEVER loaded (only global)', () => {
+    process.env.NOTION_API_KEY = 'global_val';
+    const perGroupEnvPath = path.join(
+      '/tmp/nanoclaw-test-data',
+      'env',
+      'telegram_main.env',
+    );
+    // Per-group file "exists" with a different value — main must still use
+    // the global one.
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: fs.PathLike) => String(p) === perGroupEnvPath,
+    );
+    vi.mocked(fs.readFileSync).mockImplementation((p: fs.PathOrFileDescriptor) => {
+      if (String(p) === perGroupEnvPath) {
+        return 'NOTION_API_KEY=should_not_be_used\n';
+      }
+      return '';
+    });
+    const writeSpy = vi.mocked(fs.writeFileSync);
+    writeSpy.mockClear();
+
+    buildContainerArgs(
+      [],
+      'nc-main',
+      true,
+      { enabledMcp: undefined },
+      'telegram_main',
+    );
+
+    // Main writes the GLOBAL value, never the per-group one.
+    const wroteGlobal = writeSpy.mock.calls.some(([, data]) =>
+      typeof data === 'string' && data.includes('NOTION_API_KEY=global_val'),
+    );
+    expect(wroteGlobal).toBe(true);
+    const wrotePerGroup = writeSpy.mock.calls.some(([, data]) =>
+      typeof data === 'string' &&
+      data.includes('NOTION_API_KEY=should_not_be_used'),
+    );
+    expect(wrotePerGroup).toBe(false);
   });
 });

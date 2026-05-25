@@ -27,7 +27,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
-import { readEnvFile } from './env.js';
+import { readEnvFile, readPerGroupEnvFile } from './env.js';
 import { refreshGoogleTokens } from './google-token-refresh.js';
 import { validateAdditionalMounts } from './mount-security.js';
 
@@ -62,7 +62,13 @@ export interface VolumeMount {
   readonly: boolean;
 }
 
-function buildVolumeMounts(
+/**
+ * @internal — exported for unit tests. Builds the volume-mount list for the
+ * container. The interesting per-group security seam is the
+ * gmail-mcp / google-calendar token directories: see the inline comment in
+ * the "Gmail credentials directory" branch below.
+ */
+export function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
 ): VolumeMount[] {
@@ -170,25 +176,71 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Gmail credentials directory (for Gmail MCP inside the container)
+  // Gmail + Google-Calendar credentials directories.
+  //
+  // SECURITY — per-group token isolation (per-group credentials MVP):
+  // The gmail-mcp and google-calendar-mcp tools store OAuth tokens on disk
+  // and may refresh/rotate them at runtime. Mounting the SAME directory into
+  // every container would let any restricted user (e.g. Dana) read or rotate
+  // the main user's tokens — a cross-user credential leak.
+  //
+  // Rule:
+  //   - Main group (isMain=true)  → mount from $HOME, unchanged. Preserves
+  //                                  backward compatibility for the operator's
+  //                                  own setup.
+  //   - Non-main groups           → mount from groups/<folder>/.gmail-mcp/
+  //                                  and groups/<folder>/.config/google-
+  //                                  calendar-mcp/. NEVER fall back to $HOME
+  //                                  even if the per-group dir doesn't exist
+  //                                  yet — we create an empty one so the
+  //                                  mount succeeds and the MCP server can
+  //                                  populate it via its own OAuth flow
+  //                                  (separate follow-up task).
   const homeDir = os.homedir();
-  const gmailDir = path.join(homeDir, '.gmail-mcp');
-  if (fs.existsSync(gmailDir)) {
+  if (isMain) {
+    const gmailDir = path.join(homeDir, '.gmail-mcp');
+    if (fs.existsSync(gmailDir)) {
+      mounts.push({
+        hostPath: gmailDir,
+        containerPath: '/home/node/.gmail-mcp',
+        readonly: false, // MCP may need to refresh OAuth tokens
+      });
+    }
+
+    // Google Calendar MCP stores OAuth tokens in ~/.config/google-calendar-mcp/tokens.json
+    const calendarTokenDir = path.join(
+      homeDir,
+      '.config',
+      'google-calendar-mcp',
+    );
+    fs.mkdirSync(calendarTokenDir, { recursive: true });
     mounts.push({
-      hostPath: gmailDir,
+      hostPath: calendarTokenDir,
+      containerPath: '/home/node/.config/google-calendar-mcp',
+      readonly: false,
+    });
+  } else {
+    // Per-group token dirs — auto-create so the bind mount always succeeds.
+    const perGroupGmailDir = path.join(groupDir, '.gmail-mcp');
+    fs.mkdirSync(perGroupGmailDir, { recursive: true });
+    mounts.push({
+      hostPath: perGroupGmailDir,
       containerPath: '/home/node/.gmail-mcp',
-      readonly: false, // MCP may need to refresh OAuth tokens
+      readonly: false,
+    });
+
+    const perGroupCalendarDir = path.join(
+      groupDir,
+      '.config',
+      'google-calendar-mcp',
+    );
+    fs.mkdirSync(perGroupCalendarDir, { recursive: true });
+    mounts.push({
+      hostPath: perGroupCalendarDir,
+      containerPath: '/home/node/.config/google-calendar-mcp',
+      readonly: false,
     });
   }
-
-  // Google Calendar MCP stores OAuth tokens in ~/.config/google-calendar-mcp/tokens.json
-  const calendarTokenDir = path.join(homeDir, '.config', 'google-calendar-mcp');
-  fs.mkdirSync(calendarTokenDir, { recursive: true });
-  mounts.push({
-    hostPath: calendarTokenDir,
-    containerPath: '/home/node/.config/google-calendar-mcp',
-    readonly: false,
-  });
 
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
@@ -213,6 +265,15 @@ function buildVolumeMounts(
     recursive: true,
   });
   fs.mkdirSync(path.join(groupIpcDir, 'contact-write-responses'), {
+    recursive: true,
+  });
+  // Per-group credentials MVP: save_credential MCP tool request/response.
+  // Separate namespace from contact-write so payload validation and security
+  // posture stay independent.
+  fs.mkdirSync(path.join(groupIpcDir, 'credential-requests'), {
+    recursive: true,
+  });
+  fs.mkdirSync(path.join(groupIpcDir, 'credential-responses'), {
     recursive: true,
   });
   fs.mkdirSync(path.join(groupIpcDir, 'errors'), { recursive: true });
@@ -363,6 +424,7 @@ export function buildContainerArgs(
   containerName: string,
   isMain: boolean,
   group?: Pick<RegisteredGroup, 'enabledMcp'>,
+  groupFolder?: string,
 ): { args: string[]; envFilePath: string | null } {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
@@ -401,9 +463,21 @@ export function buildContainerArgs(
 
   // Third-party MCP secrets go into an --env-file so they don't leak via `ps aux`.
   // Caller is responsible for unlinking the file after the container exits.
-  const notionKey = process.env.NOTION_API_KEY || secretsEnv.NOTION_API_KEY;
-  const googleMapsKey =
+  //
+  // Per-group credentials MVP: for non-main groups, read
+  // data/env/<folder>.env and let its values OVERRIDE the global env. Main
+  // group always uses global values only — per-group overrides are an
+  // isolation feature for restricted users (e.g. Dana) who must use THEIR
+  // OWN Notion / Maps keys, not the operator's.
+  let notionKey = process.env.NOTION_API_KEY || secretsEnv.NOTION_API_KEY;
+  let googleMapsKey =
     process.env.GOOGLE_MAPS_API_KEY || secretsEnv.GOOGLE_MAPS_API_KEY;
+  if (!isMain && groupFolder) {
+    const perGroup = readPerGroupEnvFile(groupFolder);
+    if (perGroup.NOTION_API_KEY) notionKey = perGroup.NOTION_API_KEY;
+    if (perGroup.GOOGLE_MAPS_API_KEY)
+      googleMapsKey = perGroup.GOOGLE_MAPS_API_KEY;
+  }
   let envFilePath: string | null = null;
   const envFileLines: string[] = [];
   if (notionKey) envFileLines.push(`NOTION_API_KEY=${notionKey}`);
@@ -481,6 +555,7 @@ export async function runContainerAgent(
     containerName,
     input.isMain,
     group,
+    group.folder,
   );
   tMark('after-buildContainerArgs');
 

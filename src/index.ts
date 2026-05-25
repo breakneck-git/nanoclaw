@@ -50,6 +50,7 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { handleViewMediaRequest } from './ipc-media-handler.js';
+import { processSaveCredential } from './ipc-credential-handler.js';
 import {
   processAnnotateContact,
   processLookupMessages,
@@ -811,6 +812,25 @@ async function main(): Promise<void> {
     // debounced contacts.json snapshot refresh.
     annotateContact: async (payload, group) => {
       return processAnnotateContact(ipcBaseDir, payload, group);
+    },
+    // save_credential — per-group credentials MVP. Watcher enforces
+    // CROSS_GROUP_REJECTED if payload.groupFolder mismatches dispatch group;
+    // processSaveCredential is the pure processor (validates, writes
+    // data/env/<folder>.env with mode 0600, NEVER logs the value).
+    saveCredential: async (payload, group) => {
+      if (payload.groupFolder !== group) {
+        return {
+          isError: true,
+          _meta: { error_code: 'CROSS_GROUP_REJECTED', retryable: false },
+          content: [
+            {
+              type: 'text',
+              text: `CROSS_GROUP_REJECTED: payload.groupFolder='${payload.groupFolder}' does not match dispatch group='${group}'`,
+            },
+          ],
+        };
+      }
+      return processSaveCredential(payload);
     },
   });
   queue.setProcessMessagesFn(processGroupMessages);

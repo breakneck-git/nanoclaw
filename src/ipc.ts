@@ -14,6 +14,10 @@ import {
 } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import {
+  SaveCredentialPayload,
+  SaveCredentialResponse,
+} from './ipc-credential-handler.js';
+import {
   AnnotateContactPayload,
   AnnotateResponse,
   handleAnnotateContactRequest,
@@ -89,6 +93,21 @@ export interface IpcDeps {
     payload: AnnotateContactPayload,
     group: string,
   ) => Promise<AnnotateResponse>;
+  /**
+   * Optional: dispatch a save_credential IPC request. Provided when the
+   * orchestrator wants to expose the per-group credentials MVP to agents.
+   * The callback enforces CROSS_GROUP_REJECTED (payload.groupFolder must
+   * match the dispatch group derived from the IPC path) and writes the
+   * per-group env file at data/env/<folder>.env with mode 0600.
+   *
+   * After a successful save, the watcher writes the `_close` sentinel into
+   * the group's IPC `input/` dir so the active container exits ASAP — the
+   * next user message spawns a fresh container with the new env applied.
+   */
+  saveCredential?: (
+    payload: SaveCredentialPayload,
+    group: string,
+  ) => Promise<SaveCredentialResponse>;
 }
 
 let ipcWatcherRunning = false;
@@ -175,6 +194,25 @@ export function writeContactWriteResponseAtomic(
     ipcRootDir,
     group,
     'contact-write-responses',
+    reqId,
+    payload,
+  );
+}
+
+/**
+ * Convenience: atomic write to `credential-responses/<reqId>.json`.
+ * Used by the per-group credentials MVP (`save_credential` MCP tool).
+ */
+export function writeCredentialResponseAtomic(
+  ipcRootDir: string,
+  group: string,
+  reqId: string,
+  payload: unknown,
+): void {
+  writeIpcResponseAtomic(
+    ipcRootDir,
+    group,
+    'credential-responses',
     reqId,
     payload,
   );
@@ -722,6 +760,137 @@ export function startIpcWatcher(deps: IpcDeps): void {
         logger.error(
           { err, sourceGroup },
           'Error reading IPC contact-write-requests directory',
+        );
+      }
+
+      // Process credential-requests from this group's IPC directory
+      // (per-group credentials MVP — `save_credential` MCP tool).
+      // Same .processing interlock pattern as the other request dirs.
+      //
+      // SECURITY: the credential VALUE is in the request payload — once we've
+      // dispatched and the response is written, the .processing file is
+      // unlinked promptly. The sweep additionally cleans up any stragglers
+      // older than 180s. Logs in this branch deliberately omit the value
+      // (see processSaveCredential for the same discipline).
+      //
+      // RESTART TRIGGER: after a successful save, write `_close` into the
+      // group's `input/` so the active container exits within IPC_POLL_MS
+      // and the next user message spawns a fresh container with the new env.
+      try {
+        const credentialReqDir = path.join(
+          ipcBaseDir,
+          sourceGroup,
+          'credential-requests',
+        );
+        if (deps.saveCredential && fs.existsSync(credentialReqDir)) {
+          const credFiles = fs
+            .readdirSync(credentialReqDir)
+            .filter((f) => f.endsWith('.json'));
+          for (const file of credFiles) {
+            const filePath = path.join(credentialReqDir, file);
+            const processingPath = `${filePath}.processing`;
+            try {
+              fs.renameSync(filePath, processingPath);
+            } catch {
+              continue;
+            }
+            let payload: SaveCredentialPayload | null = null;
+            try {
+              const raw = fs.readFileSync(processingPath, 'utf-8');
+              payload = JSON.parse(raw) as SaveCredentialPayload;
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'save_credential parse failed — quarantining',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              try {
+                fs.mkdirSync(errorDir, { recursive: true });
+                fs.renameSync(
+                  processingPath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              } catch {
+                /* best effort */
+              }
+              continue;
+            }
+            const reqId = payload.reqId || file.replace(/\.json$/, '');
+            try {
+              const response = await deps.saveCredential(
+                payload,
+                sourceGroup,
+              );
+              writeCredentialResponseAtomic(
+                ipcBaseDir,
+                sourceGroup,
+                reqId,
+                response,
+              );
+
+              // Restart trigger: on success, drop the _close sentinel into
+              // the group's input/ dir. The container picks it up on the
+              // next IPC_POLL_MS (500ms) and exits gracefully. Don't trigger
+              // on errors — leave the container running so the user can
+              // retry / get feedback in the same session.
+              if (!response.isError) {
+                try {
+                  const inputDir = path.join(
+                    ipcBaseDir,
+                    sourceGroup,
+                    'input',
+                  );
+                  fs.mkdirSync(inputDir, { recursive: true });
+                  fs.writeFileSync(path.join(inputDir, '_close'), '');
+                  logger.info(
+                    { sourceGroup },
+                    'save_credential: _close sentinel dropped to refresh container env',
+                  );
+                } catch (closeErr) {
+                  logger.warn(
+                    { sourceGroup, err: closeErr },
+                    'save_credential: failed to drop _close sentinel (container will refresh on idle timeout)',
+                  );
+                }
+              }
+
+              try {
+                fs.unlinkSync(processingPath);
+              } catch {
+                /* best effort */
+              }
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'save_credential handler threw — writing UPSTREAM_ERROR',
+              );
+              writeCredentialResponseAtomic(
+                ipcBaseDir,
+                sourceGroup,
+                reqId,
+                {
+                  isError: true,
+                  _meta: { error_code: 'UPSTREAM_ERROR', retryable: true },
+                  content: [
+                    {
+                      type: 'text',
+                      text: `UPSTREAM_ERROR: handler threw — ${(err as Error).message}`,
+                    },
+                  ],
+                },
+              );
+              try {
+                fs.unlinkSync(processingPath);
+              } catch {
+                /* best effort */
+              }
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, sourceGroup },
+          'Error reading IPC credential-requests directory',
         );
       }
 

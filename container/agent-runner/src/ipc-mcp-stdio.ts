@@ -23,6 +23,11 @@ const LOOKUP_REQ_DIR = path.join(IPC_DIR, 'lookup-requests');
 const LOOKUP_RESP_DIR = path.join(IPC_DIR, 'lookup-responses');
 const CONTACT_WRITE_REQ_DIR = path.join(IPC_DIR, 'contact-write-requests');
 const CONTACT_WRITE_RESP_DIR = path.join(IPC_DIR, 'contact-write-responses');
+// Per-group credentials MVP: save_credential request/response namespace.
+// Kept separate from contact-write-* so payload validation and security
+// posture stay independent.
+const CREDENTIAL_REQ_DIR = path.join(IPC_DIR, 'credential-requests');
+const CREDENTIAL_RESP_DIR = path.join(IPC_DIR, 'credential-responses');
 const CONTACTS_JSON_PATH = path.join(IPC_DIR, 'contacts.json');
 
 // Context from environment variables (set by the agent runner)
@@ -670,6 +675,48 @@ server.tool(
       `${reqId}.json`,
     );
     return pollResponseFile(CONTACT_WRITE_RESP_DIR, reqId, 120000, 100);
+  },
+);
+
+server.tool(
+  'save_credential',
+  `Persist a user-provided API key for an external service so the agent can use it on the next container start. Use ONLY when the user explicitly pastes a credential into chat (e.g. "вот мой Notion токен: secret_xxxxx" or "мой Google Maps ключ: AIza..."). Supported services: 'notion' (sets NOTION_API_KEY) and 'google-maps' (sets GOOGLE_MAPS_API_KEY).
+
+The credential is stored in this group's private env file (data/env/<folder>.env, mode 0600 on host) — never logged, never sent anywhere except this host. After a successful save, the container will exit and restart automatically; the new value is active on the next message. Tell the user to wait a few seconds before testing.
+
+DO NOT use for OAuth-based services (gmail, calendar, drive). Those need a separate Device Code Flow tool (coming later). DO NOT echo the credential back to the user — confirm by service name only ("Saved your Notion token, give it ~5 seconds and try again"). On error, the response text starts with the error code (e.g. UNSUPPORTED_SERVICE, INVALID_VALUE, CROSS_GROUP_REJECTED, UPSTREAM_ERROR) — relay the code and a short human message, never the value.`,
+  {
+    service: z
+      .enum(['notion', 'google-maps'])
+      .describe(
+        "Which service this credential is for. 'notion' stores under NOTION_API_KEY, 'google-maps' under GOOGLE_MAPS_API_KEY.",
+      ),
+    value: z
+      .string()
+      .min(1)
+      .describe(
+        'The API key / token string (will be stored verbatim, mode 0600 on host). Must not contain newlines or control characters.',
+      ),
+  },
+  async (args) => {
+    const reqId = generateReqId();
+    writeIpcFile(
+      CREDENTIAL_REQ_DIR,
+      {
+        type: 'save_credential',
+        reqId,
+        service: args.service,
+        // The value is included in the request file (mode 0600 inherited from
+        // the IPC mount permissions on host). The host watcher reads, writes
+        // the env file, and unlinks the request promptly. The credential is
+        // NEVER logged on either side (see ipc-credential-handler.ts).
+        value: args.value,
+        chatJid,
+        groupFolder,
+      },
+      `${reqId}.json`,
+    );
+    return pollResponseFile(CREDENTIAL_RESP_DIR, reqId, 30000, 100);
   },
 );
 
