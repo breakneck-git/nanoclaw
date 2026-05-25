@@ -525,6 +525,109 @@ describe('registered group isMain', () => {
   });
 });
 
+describe('registered group enabledMcp', () => {
+  it('round-trips a populated CSV whitelist', () => {
+    setRegisteredGroup('tg:restricted', {
+      name: 'Restricted User',
+      folder: 'telegram_restricted',
+      trigger: '@Andy',
+      added_at: '2026-05-25T00:00:00.000Z',
+      enabledMcp: ['nanoclaw'],
+    });
+    const group = getAllRegisteredGroups()['tg:restricted'];
+    expect(group.enabledMcp).toEqual(['nanoclaw']);
+  });
+
+  it('round-trips an empty array (lockdown — only mcp__nanoclaw__*)', () => {
+    setRegisteredGroup('tg:1', {
+      name: 'Locked',
+      folder: 'telegram_locked',
+      trigger: '@Andy',
+      added_at: '2026-05-25T00:00:00.000Z',
+      enabledMcp: [],
+    });
+    const group = getAllRegisteredGroups()['tg:1'];
+    expect(group.enabledMcp).toEqual([]);
+  });
+
+  it('legacy rows (undefined enabledMcp) keep returning undefined', () => {
+    setRegisteredGroup('tg:legacy', {
+      name: 'Legacy',
+      folder: 'telegram_legacy',
+      trigger: '@Andy',
+      added_at: '2026-05-25T00:00:00.000Z',
+    });
+    const group = getAllRegisteredGroups()['tg:legacy'];
+    expect(group.enabledMcp).toBeUndefined();
+  });
+
+  it('multi-entry whitelist preserves order and trims whitespace defensively', () => {
+    // Bypass setRegisteredGroup so we can verify parseEnabledMcp tolerates
+    // stray whitespace if a manual SQL write ever lands one in the column.
+    setRegisteredGroup('tg:multi', {
+      name: 'Multi',
+      folder: 'telegram_multi',
+      trigger: '@Andy',
+      added_at: '2026-05-25T00:00:00.000Z',
+    });
+    db.prepare(
+      `UPDATE registered_groups SET enabled_mcp = ? WHERE jid = ?`,
+    ).run('nanoclaw, gmail ,notion', 'tg:multi');
+    const group = getAllRegisteredGroups()['tg:multi'];
+    expect(group.enabledMcp).toEqual(['nanoclaw', 'gmail', 'notion']);
+  });
+});
+
+describe('getContactsForGroup scope isolation', () => {
+  // Tests use generic tg_id placeholders ('1' for main, '2' for restricted)
+  // to keep real per-install identifiers out of the test corpus. Same
+  // behavior; smaller footprint.
+
+  it('returns only contacts in the requested scope when includeUnion=false', () => {
+    upsertContact(
+      'telegram_main',
+      { kind: 'user', first_name: 'MainContact' },
+      { identity: { tg_id: '1' }, source: 'sender' },
+    );
+    upsertContact(
+      'telegram_other',
+      { kind: 'user', first_name: 'OtherContact' },
+      { identity: { tg_id: '2' }, source: 'sender' },
+    );
+    const otherRows = getContactsForGroup({
+      scope: 'telegram_other',
+      includeUnion: false,
+    });
+    expect(otherRows).toHaveLength(1);
+    expect(otherRows[0].first_name).toBe('OtherContact');
+    expect(otherRows[0].tg_id).toBe('2');
+    // Defense in depth: the main contact must NOT leak through.
+    expect(otherRows.some((r) => r.tg_id === '1')).toBe(false);
+  });
+
+  it('non-main scope ignores includeUnion=true (only includes own scope)', () => {
+    // The includeUnion union view is ONLY available to scope='main'. A
+    // non-main scope must not be able to widen its visibility by passing
+    // includeUnion=true.
+    upsertContact(
+      'telegram_main',
+      { kind: 'user', first_name: 'MainOnly' },
+      { identity: { tg_id: '1' }, source: 'sender' },
+    );
+    upsertContact(
+      'telegram_other',
+      { kind: 'user', first_name: 'OtherOnly' },
+      { identity: { tg_id: '2' }, source: 'sender' },
+    );
+    const rows = getContactsForGroup({
+      scope: 'telegram_other',
+      includeUnion: true,
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].tg_id).toBe('2');
+  });
+});
+
 // --- contacts table ---
 
 describe('contacts table', () => {

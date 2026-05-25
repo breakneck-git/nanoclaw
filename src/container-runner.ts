@@ -56,7 +56,7 @@ export interface ContainerOutput {
   error?: string;
 }
 
-interface VolumeMount {
+export interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
@@ -93,6 +93,15 @@ function buildVolumeMounts(
     });
   } else {
     // Other groups only get their own folder
+    //
+    // Non-main groups (including restricted users like Dana) DO NOT receive:
+    //   - the project root mount (no access to src/, store/messages.db,
+    //     .env, or any host code/secrets);
+    //   - any IPC namespace other than their own (`groupIpcDir` below is
+    //     resolved from THIS group's folder, so the path is unique);
+    //   - any other group's `groups/<name>/` directory.
+    // The aggregated DB views are only reachable via the IPC handlers, which
+    // enforce CROSS_GROUP_REJECTED on every cross-scope read/write.
     mounts.push({
       hostPath: groupDir,
       containerPath: '/workspace/group',
@@ -341,15 +350,37 @@ function buildVolumeMounts(
   return mounts;
 }
 
-function buildContainerArgs(
+/**
+ * @internal — exported for unit tests. Builds the `docker run` argv we hand
+ * to `spawn`, plus the temp env-file path the caller must clean up. The
+ * `group` arg is only used to look at `group.enabledMcp`; everything else
+ * (folder, name) is already baked into `mounts` + `containerName` by the
+ * caller. Pass `undefined` (or omit) to skip the MCP whitelist env var
+ * — that's the legacy contract: "no whitelist → register every server".
+ */
+export function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   isMain: boolean,
+  group?: Pick<RegisteredGroup, 'enabledMcp'>,
 ): { args: string[]; envFilePath: string | null } {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Per-group MCP whitelist. When unset (legacy / main group / older
+  // registrations), the container falls back to "all MCP servers enabled" —
+  // matching pre-migration behavior. When set, the container only registers
+  // the listed servers plus `nanoclaw` (which is hard-required by the agent
+  // loop and added unconditionally inside the container).
+  //
+  // The empty-array case (`[]`) is honored explicitly: it serializes to the
+  // empty string and the container code treats it as "no MCP server other
+  // than nanoclaw" — useful for the strictest isolated groups.
+  if (group?.enabledMcp !== undefined) {
+    args.push('-e', `NANOCLAW_ENABLE_MCP=${group.enabledMcp.join(',')}`);
+  }
 
   // Route API traffic through the credential proxy (containers never see real secrets)
   args.push(
@@ -449,6 +480,7 @@ export async function runContainerAgent(
     mounts,
     containerName,
     input.isMain,
+    group,
   );
   tMark('after-buildContainerArgs');
 

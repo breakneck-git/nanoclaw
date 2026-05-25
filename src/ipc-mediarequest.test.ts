@@ -121,6 +121,34 @@ describe('view_media authorization (CROSS_GROUP_REJECTED)', () => {
     // Critical: getFile must NOT be called once authorization fails.
     expect(bot.api.getFile).not.toHaveBeenCalled();
   });
+
+  it('restricted-user scenario: restricted container cannot view media from main user message', async () => {
+    // Main user receives an attachment in their chat.
+    storeMessage({
+      id: 'main-attach',
+      chat_jid: 'tg:MAIN',
+      sender: 'main-uid',
+      sender_name: 'Main',
+      content: '',
+      timestamp: '2026-05-25T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+      meta: '<m id="main-attach"><media file_id="MAIN_FILE" mime="image/jpeg" size="1234"/></m>',
+    });
+    // Restricted user's container asks for that file_id by guessing the
+    // tg_message_id (the only metadata they could plausibly forge).
+    const bot = mockBot();
+    const result = await handleViewMediaRequest(
+      makePayload({ file_id: 'MAIN_FILE', tg_message_id: 'main-attach' }),
+      ['tg:RESTRICTED'], // restricted user's jid set ONLY
+      bot as any,
+    );
+    expect(result.isError).toBe(true);
+    expect(result._meta.error_code).toBe('CROSS_GROUP_REJECTED');
+    // Hardened: getFile must NEVER be reached — that would have hit Telegram
+    // for main user's content with the bot token even on the reject path.
+    expect(bot.api.getFile).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------

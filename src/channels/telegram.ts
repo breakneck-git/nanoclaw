@@ -15,6 +15,11 @@ import {
   RegisteredGroup,
 } from '../types.js';
 import { upsertContact, promoteContactIdent } from '../db.js';
+import {
+  isSenderAllowed,
+  loadSenderAllowlist,
+  shouldDropMessage,
+} from '../sender-allowlist.js';
 import { queueEnrich } from './telegram-enrich.js';
 import { buildMetaBlock, type BuildMetaBlockExtras } from './telegram-meta.js';
 
@@ -589,6 +594,35 @@ export class TelegramChannel implements Channel {
     newMsg: import('../types.js').NewMessage,
     extras?: BuildMetaBlockExtras,
   ): void {
+    // Sender allowlist pre-gate: when the per-chat (or default) entry is
+    // mode='drop' and the sender is not in the allow list, drop EVERYTHING:
+    //   - no contact upsert (otherwise a random sender's display name + phone
+    //     leaks into the contacts table even when the message is dropped);
+    //   - no meta build / onMessage call;
+    //   - no DB write.
+    //
+    // Bot-originated messages (`is_from_me`) bypass this gate; the orchestrator
+    // emits them and there's no external sender to authorize.
+    //
+    // The downstream `onMessage` callback in src/index.ts ALSO enforces the
+    // same gate (defense in depth) — but doing it here additionally prevents
+    // the contact-pipeline side effect that runs above the onMessage call.
+    if (!newMsg.is_from_me && !newMsg.is_bot_message) {
+      const cfg = loadSenderAllowlist();
+      if (
+        shouldDropMessage(chatJid, cfg) &&
+        !isSenderAllowed(chatJid, newMsg.sender, cfg)
+      ) {
+        if (cfg.logDenied) {
+          logger.debug(
+            { chatJid, sender: newMsg.sender },
+            'telegram: deliverInbound dropping message (sender-allowlist drop mode)',
+          );
+        }
+        return;
+      }
+    }
+
     const scope = this.scopeForGroup(group);
     // The contact pipeline is best-effort observability — its failure
     // (SQLITE_BUSY, schema mismatch, NOT NULL constraint) must never drop

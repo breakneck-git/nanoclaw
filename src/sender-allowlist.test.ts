@@ -214,3 +214,68 @@ describe('isTriggerAllowed', () => {
     // Logger.debug is called — we just verify no crash; logger is a real pino instance
   });
 });
+
+describe('fail-closed multi-tenant production config shape', () => {
+  // Synthetic stand-ins for the real-world config: one main user with three
+  // accounts (A, B, C) and one restricted user (R). The real per-install IDs
+  // live in ~/.config/nanoclaw/sender-allowlist.json (NOT in the repo). The
+  // test is structural: it locks in fail-closed default + per-chat trigger
+  // gating + cross-chat isolation, which is the shape that survives any
+  // change of identifiers.
+  function buildMultiTenantConfig(): string {
+    const p = cfgPath('multi-tenant.json');
+    fs.writeFileSync(
+      p,
+      JSON.stringify({
+        default: { allow: [], mode: 'drop' },
+        chats: {
+          'tg:MAIN_A': { allow: ['MAIN_A'], mode: 'trigger' },
+          'tg:MAIN_B': { allow: ['MAIN_B'], mode: 'trigger' },
+          'tg:MAIN_C': { allow: ['MAIN_C'], mode: 'trigger' },
+          'tg:RESTRICTED': { allow: ['RESTRICTED'], mode: 'trigger' },
+        },
+        logDenied: true,
+      }),
+    );
+    return p;
+  }
+
+  it('random chat (no entry) falls back to drop mode and denies all senders', () => {
+    const cfg = loadSenderAllowlist(buildMultiTenantConfig());
+    // A random person DMing the bot — chat not listed → default applies.
+    expect(shouldDropMessage('tg:RANDOM_PERSON', cfg)).toBe(true);
+    expect(isSenderAllowed('tg:RANDOM_PERSON', 'anyone', cfg)).toBe(false);
+    expect(isSenderAllowed('tg:RANDOM_PERSON', 'MAIN_A', cfg)).toBe(false);
+  });
+
+  it("restricted user's chat allows ONLY her sender id, no main user account ids", () => {
+    const cfg = loadSenderAllowlist(buildMultiTenantConfig());
+    expect(isSenderAllowed('tg:RESTRICTED', 'RESTRICTED', cfg)).toBe(true);
+    // Critical: main user's three sender ids must NOT be authorized.
+    expect(isSenderAllowed('tg:RESTRICTED', 'MAIN_A', cfg)).toBe(false);
+    expect(isSenderAllowed('tg:RESTRICTED', 'MAIN_B', cfg)).toBe(false);
+    expect(isSenderAllowed('tg:RESTRICTED', 'MAIN_C', cfg)).toBe(false);
+    // And the restricted chat is in trigger mode (messages persist; only
+    // agent invocation gated).
+    expect(shouldDropMessage('tg:RESTRICTED', cfg)).toBe(false);
+  });
+
+  it("main user's three chats authorize each of his sender ids independently", () => {
+    const cfg = loadSenderAllowlist(buildMultiTenantConfig());
+    expect(isSenderAllowed('tg:MAIN_A', 'MAIN_A', cfg)).toBe(true);
+    expect(isSenderAllowed('tg:MAIN_B', 'MAIN_B', cfg)).toBe(true);
+    expect(isSenderAllowed('tg:MAIN_C', 'MAIN_C', cfg)).toBe(true);
+    // Cross-account: posting in account A's chat as account B is not allowed
+    // by the per-chat allow list — proves no sender is implicitly trusted
+    // across chats.
+    expect(isSenderAllowed('tg:MAIN_A', 'MAIN_B', cfg)).toBe(false);
+    expect(isSenderAllowed('tg:MAIN_A', 'RESTRICTED', cfg)).toBe(false);
+  });
+
+  it("restricted user's sender cannot trigger main user's chats", () => {
+    const cfg = loadSenderAllowlist(buildMultiTenantConfig());
+    expect(isSenderAllowed('tg:MAIN_A', 'RESTRICTED', cfg)).toBe(false);
+    expect(isSenderAllowed('tg:MAIN_B', 'RESTRICTED', cfg)).toBe(false);
+    expect(isSenderAllowed('tg:MAIN_C', 'RESTRICTED', cfg)).toBe(false);
+  });
+});

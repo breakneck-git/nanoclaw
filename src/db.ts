@@ -168,6 +168,22 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Add enabled_mcp column if it doesn't exist (per-group MCP whitelist).
+  // Stored as a CSV string (TEXT, nullable). NULL means "no restriction" —
+  // the container registers every MCP server it knows about, matching the
+  // legacy pre-migration behavior so existing rows (main group, older
+  // registrations) keep working without an explicit migration.
+  //
+  // Idempotent: a duplicate ADD COLUMN throws "duplicate column name" which
+  // we swallow, mirroring the surrounding migrations.
+  try {
+    database.exec(
+      `ALTER TABLE registered_groups ADD COLUMN enabled_mcp TEXT`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
   // Add channel and is_group columns if they don't exist (migration for existing DBs)
   try {
     database.exec(`ALTER TABLE chats ADD COLUMN channel TEXT`);
@@ -1243,6 +1259,30 @@ export function getAllSessions(): Record<string, string> {
 
 // --- Registered group accessors ---
 
+/**
+ * Parse the CSV stored in `registered_groups.enabled_mcp` back into a
+ * `string[]`. Defensive against legacy NULLs (returns `undefined` = "all MCP
+ * enabled"), empty strings (also undefined — distinguishable from the empty
+ * array because the empty array means "only mcp__nanoclaw__*", a deliberate
+ * lockdown), and accidental whitespace-only entries (filtered out).
+ *
+ * The empty-string vs NULL distinction is important: if you ever want a group
+ * with zero MCP servers besides nanoclaw, you must INSERT the literal string
+ * `''` *not via this writer* — `setRegisteredGroup` materializes an empty
+ * array as `''` so the round-trip is `[]` → `''` → `[]` (lockdown preserved).
+ */
+function parseEnabledMcp(raw: string | null): string[] | undefined {
+  if (raw === null) return undefined;
+  const parts = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  // A NULL-vs-empty distinction matters: `null` means "no restriction",
+  // `''` (legacy/explicit) means "explicit empty whitelist".
+  if (raw === '') return [];
+  return parts;
+}
+
 export function getRegisteredGroup(
   jid: string,
 ): (RegisteredGroup & { jid: string }) | undefined {
@@ -1258,6 +1298,7 @@ export function getRegisteredGroup(
         container_config: string | null;
         requires_trigger: number | null;
         is_main: number | null;
+        enabled_mcp: string | null;
       }
     | undefined;
   if (!row) return undefined;
@@ -1280,6 +1321,7 @@ export function getRegisteredGroup(
     requiresTrigger:
       row.requires_trigger === null ? undefined : row.requires_trigger === 1,
     isMain: row.is_main === 1 ? true : undefined,
+    enabledMcp: parseEnabledMcp(row.enabled_mcp ?? null),
   };
 }
 
@@ -1287,9 +1329,14 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   if (!isValidGroupFolder(group.folder)) {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
+  // Serialize enabledMcp: undefined → NULL ("no restriction"), [] → ''
+  // (explicit lockdown — only mcp__nanoclaw__* registered), populated
+  // array → CSV. Mirrors parseEnabledMcp's three-state contract.
+  const enabledMcpCsv =
+    group.enabledMcp === undefined ? null : group.enabledMcp.join(',');
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main, enabled_mcp)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -1299,6 +1346,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.containerConfig ? JSON.stringify(group.containerConfig) : null,
     group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
     group.isMain ? 1 : 0,
+    enabledMcpCsv,
   );
 }
 
@@ -1312,6 +1360,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     container_config: string | null;
     requires_trigger: number | null;
     is_main: number | null;
+    enabled_mcp: string | null;
   }>;
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
@@ -1333,6 +1382,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       requiresTrigger:
         row.requires_trigger === null ? undefined : row.requires_trigger === 1,
       isMain: row.is_main === 1 ? true : undefined,
+      enabledMcp: parseEnabledMcp(row.enabled_mcp ?? null),
     };
   }
   return result;

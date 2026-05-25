@@ -18,9 +18,10 @@ import fs from 'fs';
 import readline from 'readline';
 import path from 'path';
 import { execFile } from 'child_process';
-import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import { query, HookCallback, McpServerConfig, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 import { safeTruncate } from './safe-truncate.js';
+import { filterAllowedToolPatterns, filterMcpServers } from './mcp-whitelist.js';
 
 interface ContainerInput {
   prompt: string;
@@ -440,86 +441,99 @@ async function runQuery(
       systemPrompt: globalClaudeMd
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
         : undefined,
-      allowedTools: [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*',
-        'mcp__gmail__*',
-        'mcp__notion__*',
-        'mcp__google-calendar__*',
-        'mcp__google-maps__*',
-        'mcp__google-drive__*',
-      ],
+      allowedTools: filterAllowedToolPatterns(
+        [
+          'Bash',
+          'Read', 'Write', 'Edit', 'Glob', 'Grep',
+          'WebSearch', 'WebFetch',
+          'Task', 'TaskOutput', 'TaskStop',
+          'TeamCreate', 'TeamDelete', 'SendMessage',
+          'TodoWrite', 'ToolSearch', 'Skill',
+          'NotebookEdit',
+          'mcp__nanoclaw__*',
+          'mcp__gmail__*',
+          'mcp__notion__*',
+          'mcp__google-calendar__*',
+          'mcp__google-maps__*',
+          'mcp__google-drive__*',
+        ],
+        process.env.NANOCLAW_ENABLE_MCP,
+      ),
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+      // Per-group MCP whitelist via NANOCLAW_ENABLE_MCP (CSV).
+      // - undefined → all servers registered (legacy / main group).
+      // - ''        → only `nanoclaw` (always included; agent dead without it).
+      // - csv       → `nanoclaw` + listed names.
+      // The full map is declared inline below; filterMcpServers prunes it. See
+      // mcp-whitelist.ts for the contract and mcp-whitelist.test.ts for the
+      // covered cases (including the Dana lockdown scenario).
+      mcpServers: filterMcpServers<McpServerConfig>(
+        {
+          nanoclaw: {
+            command: 'node',
+            args: [mcpServerPath],
+            env: {
+              NANOCLAW_CHAT_JID: containerInput.chatJid,
+              NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+              NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            },
+          },
+          gmail: {
+            command: 'gmail-mcp',
+            args: [],
+          },
+          notion: {
+            command: 'notion-mcp-server',
+            args: [],
+            env: {
+              OPENAPI_MCP_HEADERS: JSON.stringify({
+                Authorization: `Bearer ${process.env.NOTION_API_KEY || ''}`,
+                'Notion-Version': '2022-06-28',
+              }),
+            },
+          },
+          'google-calendar': {
+            command: 'google-calendar-mcp',
+            args: [],
+            env: {
+              GOOGLE_OAUTH_CREDENTIALS: '/home/node/.gmail-mcp/gcp-oauth.keys.json',
+              GOOGLE_CALENDAR_MCP_TOKEN_PATH: '/home/node/.gmail-mcp/google-calendar-tokens.json',
+            },
+          },
+          // google-maps and google-drive are routed through the lazy MCP proxy:
+          // the real child process is only forked on first tools/call. See
+          // container/agent-runner/src/lazy-mcp-proxy.ts for details. The
+          // tool-list cache lives under /workspace/ipc/.mcp-cache and survives
+          // container restarts via the host-mounted IPC volume.
+          'google-maps': {
+            command: 'node',
+            args: [
+              path.join(RUNNER_DIST_DIR, 'lazy-mcp-proxy.js'),
+              '--name', 'google-maps',
+              '--command', 'mcp-server-google-maps',
+              '--env-json', JSON.stringify({
+                GOOGLE_MAPS_API_KEY: process.env.GOOGLE_MAPS_API_KEY || '',
+              }),
+            ],
+          },
+          'google-drive': {
+            command: 'node',
+            args: [
+              path.join(RUNNER_DIST_DIR, 'lazy-mcp-proxy.js'),
+              '--name', 'google-drive',
+              '--command', 'google-drive-mcp',
+              '--env-json', JSON.stringify({
+                GOOGLE_DRIVE_OAUTH_CREDENTIALS: '/home/node/.gmail-mcp/gcp-oauth.keys.json',
+                GOOGLE_DRIVE_MCP_TOKEN_PATH: '/home/node/.gmail-mcp/google-drive-tokens.json',
+              }),
+            ],
           },
         },
-        gmail: {
-          command: 'gmail-mcp',
-          args: [],
-        },
-        notion: {
-          command: 'notion-mcp-server',
-          args: [],
-          env: {
-            OPENAPI_MCP_HEADERS: JSON.stringify({
-              Authorization: `Bearer ${process.env.NOTION_API_KEY || ''}`,
-              'Notion-Version': '2022-06-28',
-            }),
-          },
-        },
-        'google-calendar': {
-          command: 'google-calendar-mcp',
-          args: [],
-          env: {
-            GOOGLE_OAUTH_CREDENTIALS: '/home/node/.gmail-mcp/gcp-oauth.keys.json',
-            GOOGLE_CALENDAR_MCP_TOKEN_PATH: '/home/node/.gmail-mcp/google-calendar-tokens.json',
-          },
-        },
-        // google-maps and google-drive are routed through the lazy MCP proxy:
-        // the real child process is only forked on first tools/call. See
-        // container/agent-runner/src/lazy-mcp-proxy.ts for details. The
-        // tool-list cache lives under /workspace/ipc/.mcp-cache and survives
-        // container restarts via the host-mounted IPC volume.
-        'google-maps': {
-          command: 'node',
-          args: [
-            path.join(RUNNER_DIST_DIR, 'lazy-mcp-proxy.js'),
-            '--name', 'google-maps',
-            '--command', 'mcp-server-google-maps',
-            '--env-json', JSON.stringify({
-              GOOGLE_MAPS_API_KEY: process.env.GOOGLE_MAPS_API_KEY || '',
-            }),
-          ],
-        },
-        'google-drive': {
-          command: 'node',
-          args: [
-            path.join(RUNNER_DIST_DIR, 'lazy-mcp-proxy.js'),
-            '--name', 'google-drive',
-            '--command', 'google-drive-mcp',
-            '--env-json', JSON.stringify({
-              GOOGLE_DRIVE_OAUTH_CREDENTIALS: '/home/node/.gmail-mcp/gcp-oauth.keys.json',
-              GOOGLE_DRIVE_MCP_TOKEN_PATH: '/home/node/.gmail-mcp/google-drive-tokens.json',
-            }),
-          ],
-        },
-      },
+        process.env.NANOCLAW_ENABLE_MCP,
+      ),
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
       },

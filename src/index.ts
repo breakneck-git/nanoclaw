@@ -658,8 +658,19 @@ async function main(): Promise<void> {
         return;
       }
 
-      // Sender allowlist drop mode: discard messages from denied senders before storing
-      if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
+      // Sender allowlist drop mode: discard messages from denied senders
+      // before storing. Applied to BOTH registered and unregistered chats so
+      // a random person discovering the bot in DM (default entry =
+      // { allow: [], mode: 'drop' }) gets silently ignored — their content
+      // never lands in the DB. Without this gate on unregistered chats,
+      // the default 'drop' mode is a no-op for the very case it's designed
+      // for (random PII leak).
+      //
+      // Outbound bot messages (`is_from_me` / `is_bot_message`) and our own
+      // recovered echoes are exempt — those are emitted by the orchestrator
+      // and have no sender to authorize. Storing them keeps the
+      // conversation transcript continuous.
+      if (!msg.is_from_me && !msg.is_bot_message) {
         const cfg = loadSenderAllowlist();
         if (
           shouldDropMessage(chatJid, cfg) &&

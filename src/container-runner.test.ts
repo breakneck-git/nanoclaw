@@ -86,7 +86,11 @@ vi.mock('child_process', async () => {
   };
 });
 
-import { runContainerAgent, ContainerOutput } from './container-runner.js';
+import {
+  buildContainerArgs,
+  runContainerAgent,
+  ContainerOutput,
+} from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
 
 const testGroup: RegisteredGroup = {
@@ -206,5 +210,72 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildContainerArgs — NANOCLAW_ENABLE_MCP env injection
+//
+// The test exercises the host-side translation of `group.enabledMcp` into the
+// `docker run -e NANOCLAW_ENABLE_MCP=...` argv pair. The container side
+// applies the filter to mcpServers at startup (covered by the container test
+// in container/agent-runner/src/mcp-whitelist.test.ts). Together they form
+// the per-group MCP isolation seam used to keep restricted users (e.g. Dana)
+// out of the main user's MCP plugins.
+// ---------------------------------------------------------------------------
+describe('buildContainerArgs NANOCLAW_ENABLE_MCP env injection', () => {
+  it('pushes NANOCLAW_ENABLE_MCP=<csv> when group.enabledMcp is a populated array', () => {
+    const { args } = buildContainerArgs(
+      [],
+      'nc-test',
+      false,
+      { enabledMcp: ['nanoclaw'] },
+    );
+    // The -e flag is followed by its value as a separate argv token — the
+    // expected pair is `-e NANOCLAW_ENABLE_MCP=nanoclaw`. We assert both
+    // the presence of the pair and the absence of accidental duplication
+    // (a previous bug had the migration writer producing two entries).
+    const idx = args.indexOf('NANOCLAW_ENABLE_MCP=nanoclaw');
+    expect(idx).toBeGreaterThan(0);
+    expect(args[idx - 1]).toBe('-e');
+    const occurrences = args.filter((a) =>
+      a.startsWith('NANOCLAW_ENABLE_MCP='),
+    );
+    expect(occurrences).toHaveLength(1);
+  });
+
+  it('serializes a multi-entry whitelist as a comma-separated csv', () => {
+    const { args } = buildContainerArgs(
+      [],
+      'nc-test',
+      false,
+      { enabledMcp: ['nanoclaw', 'gmail', 'notion'] },
+    );
+    expect(args).toContain('NANOCLAW_ENABLE_MCP=nanoclaw,gmail,notion');
+  });
+
+  it('honors empty-array as explicit lockdown (only mcp__nanoclaw__* eligible)', () => {
+    // Empty array → empty value. The container interprets this as "no extra
+    // MCP servers besides the always-included `nanoclaw`". Distinct from the
+    // undefined case below (legacy / all enabled).
+    const { args } = buildContainerArgs(
+      [],
+      'nc-test',
+      false,
+      { enabledMcp: [] },
+    );
+    expect(args).toContain('NANOCLAW_ENABLE_MCP=');
+  });
+
+  it('OMITS the env var when group.enabledMcp is undefined (legacy / main group)', () => {
+    const { args } = buildContainerArgs([], 'nc-test', true, {
+      enabledMcp: undefined,
+    });
+    expect(args.some((a) => a.startsWith('NANOCLAW_ENABLE_MCP='))).toBe(false);
+  });
+
+  it('OMITS the env var when group arg is omitted entirely (back-compat)', () => {
+    const { args } = buildContainerArgs([], 'nc-test', false);
+    expect(args.some((a) => a.startsWith('NANOCLAW_ENABLE_MCP='))).toBe(false);
   });
 });

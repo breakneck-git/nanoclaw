@@ -498,6 +498,27 @@ describe('deliverInbound — exception isolation', () => {
     );
     expect(match).not.toBeNull();
   });
+
+  it('deliverInbound gates on sender-allowlist BEFORE processContactsFromContext', () => {
+    // The allowlist drop gate must run before the contact pipeline so a
+    // dropped sender's display name/phone never lands in the contacts
+    // table. Source inspection: shouldDropMessage / isSenderAllowed must
+    // appear, AND must precede the processContactsFromContext call.
+    const body = telegramSrc.match(
+      /private deliverInbound[\s\S]+?(?=\n  \w)/,
+    );
+    expect(body).not.toBeNull();
+    const text = body![0];
+    const dropIdx = text.indexOf('shouldDropMessage');
+    const allowIdx = text.indexOf('isSenderAllowed');
+    const contactsIdx = text.indexOf('processContactsFromContext');
+    expect(dropIdx).toBeGreaterThan(-1);
+    expect(allowIdx).toBeGreaterThan(-1);
+    expect(contactsIdx).toBeGreaterThan(-1);
+    // Both gates appear BEFORE the contact pipeline call.
+    expect(dropIdx).toBeLessThan(contactsIdx);
+    expect(allowIdx).toBeLessThan(contactsIdx);
+  });
 });
 
 describe('sendTelegramMessage narrowed catch', () => {

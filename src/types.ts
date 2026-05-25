@@ -40,6 +40,15 @@ export interface RegisteredGroup {
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
+  /**
+   * Optional per-group MCP server whitelist. When set, the container only
+   * registers the listed MCP servers (plus `nanoclaw`, always included).
+   * When undefined (legacy), all MCP servers are registered — preserves the
+   * existing behavior for the main group and any pre-migration rows.
+   *
+   * Stored on disk as a CSV in `registered_groups.enabled_mcp`.
+   */
+  enabledMcp?: string[];
 }
 
 export interface NewMessage {

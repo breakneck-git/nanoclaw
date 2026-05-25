@@ -283,6 +283,62 @@ describe('lookup_messages host handler', () => {
     // Request file unlinked after processing
     expect(fs.existsSync(reqPath)).toBe(false);
   });
+
+  it("restricted-group scope isolation: lookup returns only own messages, never main user's", async () => {
+    // Seed main user message
+    storeMessage({
+      id: 'main-msg',
+      chat_jid: 'tg:MAIN',
+      sender: 'main-uid',
+      sender_name: 'Main',
+      content: 'secret-main-content',
+      timestamp: '2026-05-25T10:00:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    // Seed restricted-user message
+    storeMessage({
+      id: 'other-msg',
+      chat_jid: 'tg:OTHER',
+      sender: 'other-uid',
+      sender_name: 'Other',
+      content: 'other-only-content',
+      timestamp: '2026-05-25T10:01:00Z',
+      is_from_me: false,
+      is_bot_message: false,
+    });
+
+    // Simulate the watcher dispatch: it passes the restricted user's jid set
+    // as the requestingGroupJids argument (resolved from registeredGroups by
+    // folder). Even though the payload mentions both jids, the watcher
+    // overrides with the authoritative list — that's the security boundary.
+    const reqPath = path.join(
+      ipcRoot,
+      'g',
+      'lookup-requests',
+      'other-req.json',
+    );
+    fs.writeFileSync(
+      reqPath,
+      JSON.stringify({
+        // The agent could maliciously include another group's jid here;
+        // the host watcher MUST ignore it and use requestingGroupJids only.
+        groupJids: ['tg:MAIN', 'tg:OTHER'],
+        includeBot: false,
+        limit: 50,
+      }),
+    );
+    await handleLookupMessagesRequest(ipcRoot, 'g', 'other-req', ['tg:OTHER']);
+
+    const resp = JSON.parse(
+      fs.readFileSync(
+        path.join(ipcRoot, 'g', 'lookup-responses', 'other-req.json'),
+        'utf-8',
+      ),
+    );
+    expect(resp.content[0].text).toContain('other-only-content');
+    expect(resp.content[0].text).not.toContain('secret-main-content');
+  });
 });
 
 describe('annotate_contact host handler', () => {
