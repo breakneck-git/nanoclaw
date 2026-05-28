@@ -115,7 +115,10 @@ export class StreamingMessage {
       this.pendingFlush = this.pendingFlush
         .then(() => this.flush())
         .catch((err) => {
-          logger.warn({ err: String(err) }, 'StreamingMessage: pendingFlush rejected');
+          logger.warn(
+            { err: String(err) },
+            'StreamingMessage: pendingFlush rejected',
+          );
         });
     }, delay);
   }

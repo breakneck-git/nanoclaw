@@ -247,9 +247,9 @@ describe('routeOutbound — SEND/STORE isolation', () => {
     db.prepare('DROP TABLE messages').run();
     const errorSpy = vi.spyOn(logger, 'error').mockImplementation(() => {});
 
-    await expect(
-      routeOutbound([channel], 'tg:1', 'hello'),
-    ).resolves.toEqual({ messageId: 'tg-xyz' });
+    await expect(routeOutbound([channel], 'tg:1', 'hello')).resolves.toEqual({
+      messageId: 'tg-xyz',
+    });
     expect(errorSpy).toHaveBeenCalled();
 
     errorSpy.mockRestore();

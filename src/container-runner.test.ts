@@ -126,8 +126,7 @@ function emitPartialMarker(
   payload: { text?: unknown } | string,
 ) {
   // Caller may pass a string to inject malformed JSON.
-  const body =
-    typeof payload === 'string' ? payload : JSON.stringify(payload);
+  const body = typeof payload === 'string' ? payload : JSON.stringify(payload);
   proc.stdout.push(
     `${OUTPUT_PARTIAL_START_MARKER}\n${body}\n${OUTPUT_PARTIAL_END_MARKER}\n`,
   );

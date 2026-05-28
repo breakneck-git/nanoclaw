@@ -1251,8 +1251,7 @@ export class TelegramChannel implements Channel {
       await this.bot.api.editMessageText(numericChatId, mid, text);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      const desc =
-        (err as { description?: string })?.description ?? msg;
+      const desc = (err as { description?: string })?.description ?? msg;
       if (/message is not modified/i.test(desc)) return;
       if (/too many requests/i.test(desc)) {
         logger.warn(

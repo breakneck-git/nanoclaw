@@ -22,10 +22,12 @@ vi.mock('./logger.js', () => ({
   },
 }));
 
-function makeDeps(opts: {
-  sendImpl?: (text: string) => Promise<string | undefined>;
-  editImpl?: (id: string, text: string) => Promise<void>;
-} = {}) {
+function makeDeps(
+  opts: {
+    sendImpl?: (text: string) => Promise<string | undefined>;
+    editImpl?: (id: string, text: string) => Promise<void>;
+  } = {},
+) {
   const sendMessage = vi.fn(
     opts.sendImpl ?? (async (_text: string) => 'msg-1'),
   );

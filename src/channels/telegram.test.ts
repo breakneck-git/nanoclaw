@@ -658,7 +658,9 @@ describe('TelegramChannel.editMessage', () => {
   }
 
   it('calls api.editMessageText with parsed chat id and messageId', async () => {
-    const editMessageText = vi.fn().mockResolvedValue({ message_id: 42 } as any);
+    const editMessageText = vi
+      .fn()
+      .mockResolvedValue({ message_id: 42 } as any);
     const { channel } = makeChannelWithEdit(editMessageText);
     await channel.editMessage!('tg:1001', '42', 'updated body');
     expect(editMessageText).toHaveBeenCalledTimes(1);
@@ -689,7 +691,7 @@ describe('TelegramChannel.editMessage', () => {
     const editMessageText = vi.fn().mockRejectedValue({
       error_code: 400,
       description:
-        "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message",
+        'Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message',
     });
     const { channel } = makeChannelWithEdit(editMessageText);
     await expect(
