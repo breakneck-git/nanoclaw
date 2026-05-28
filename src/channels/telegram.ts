@@ -1191,11 +1191,24 @@ export class TelegramChannel implements Channel {
     }
   }
 
-  async setTyping(jid: string, isTyping: boolean): Promise<void> {
+  async setTyping(
+    jid: string,
+    isTyping: boolean,
+    opts?: { threadId?: string },
+  ): Promise<void> {
     if (!this.bot || !isTyping) return;
     try {
       const numericId = jid.replace(/^tg:/, '');
-      await this.bot.api.sendChatAction(numericId, 'typing');
+      const threadId = opts?.threadId
+        ? parseInt(opts.threadId, 10)
+        : undefined;
+      await this.bot.api.sendChatAction(
+        numericId,
+        'typing',
+        threadId !== undefined && !isNaN(threadId)
+          ? { message_thread_id: threadId }
+          : undefined,
+      );
     } catch (err) {
       logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
     }

@@ -61,6 +61,7 @@ import {
   formatOutbound,
   routeOutbound,
 } from './router.js';
+import { startTypingKeepalive } from './typing-keepalive.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -269,7 +270,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
+  // Typing keepalive: re-ping every 4s (Telegram drops the indicator after
+  // ~5s) so the user sees "печатает…" the entire time the agent is working,
+  // not just for the first 5 seconds after spawn. Routed to the originating
+  // thread via lastThreadId so it lands in the correct forum topic.
+  const typing = startTypingKeepalive(
+    channel,
+    chatJid,
+    lastThreadId[chatJid],
+  );
   let hadError = false;
   let outputSentToUser = false;
   // Tracks failed outbound delivery from inside the streaming callback.
@@ -315,7 +324,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
-  await channel.setTyping?.(chatJid, false);
+  typing.stop();
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError || streamingSendFailed) {
@@ -512,12 +521,11 @@ async function startMessageLoop(): Promise<void> {
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
-            // Show typing indicator while the container processes the piped message
-            channel
-              .setTyping?.(chatJid, true)
-              ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-              );
+            // Typing keepalive from the active runAgent is already pinging
+            // every 4s (src/typing-keepalive.ts) — no need for a one-shot
+            // here. (Removing this fixes a second bug too: the previous
+            // one-shot didn't pass message_thread_id, so typing for piped
+            // follow-ups showed in the general chat instead of the topic.)
           } else {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);

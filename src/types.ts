@@ -113,7 +113,12 @@ export interface Channel {
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
-  setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  // `opts.threadId` routes the indicator to a specific forum topic when set.
+  setTyping?(
+    jid: string,
+    isTyping: boolean,
+    opts?: SendMessageOptions,
+  ): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
   // Optional: channel-specific identifier for the bot/sender (e.g. bot user ID).
