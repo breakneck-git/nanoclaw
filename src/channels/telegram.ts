@@ -1280,19 +1280,22 @@ export class TelegramChannel implements Channel {
   async setTyping(
     jid: string,
     isTyping: boolean,
-    opts?: { threadId?: string },
+    _opts?: { threadId?: string },
   ): Promise<void> {
     if (!this.bot || !isTyping) return;
     try {
       const numericId = jid.replace(/^tg:/, '');
-      const threadId = opts?.threadId ? parseInt(opts.threadId, 10) : undefined;
-      await this.bot.api.sendChatAction(
-        numericId,
-        'typing',
-        threadId !== undefined && !isNaN(threadId)
-          ? { message_thread_id: threadId }
-          : undefined,
-      );
+      // Send a CHAT-LEVEL typing action — deliberately NOT scoped to a
+      // message_thread_id. These chats are private DMs with the bot
+      // (is_group=0) that expose Telegram's bot-DM thread feature. Telegram
+      // mobile leniently renders a thread-scoped sendChatAction in a DM, but
+      // Telegram Desktop renders nothing for it — the user saw "печатает…"
+      // on the phone but a blank desktop. Chat-level typing is the
+      // universally-rendered form and is semantically correct for a DM
+      // (typing status is per-chat there, not per-thread). Outbound MESSAGES
+      // still carry message_thread_id so replies land in the right thread —
+      // only the ephemeral typing action drops it.
+      await this.bot.api.sendChatAction(numericId, 'typing');
     } catch (err) {
       logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
     }
