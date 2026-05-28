@@ -52,8 +52,7 @@ function readAnthropicAuthHeader(): Record<string, string> | null {
   if (secrets.ANTHROPIC_API_KEY) {
     return { 'x-api-key': secrets.ANTHROPIC_API_KEY };
   }
-  const oauth =
-    secrets.CLAUDE_CODE_OAUTH_TOKEN || secrets.ANTHROPIC_AUTH_TOKEN;
+  const oauth = secrets.CLAUDE_CODE_OAUTH_TOKEN || secrets.ANTHROPIC_AUTH_TOKEN;
   if (oauth) {
     return { authorization: `Bearer ${oauth}` };
   }

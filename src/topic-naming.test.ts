@@ -14,9 +14,7 @@ describe('generateTopicTitle', () => {
   });
 
   it('passes through short messages verbatim', () => {
-    expect(generateTopicTitle('есть новые письма?')).toBe(
-      'есть новые письма?',
-    );
+    expect(generateTopicTitle('есть новые письма?')).toBe('есть новые письма?');
   });
 
   it('strips leading @mention trigger', () => {
@@ -39,9 +37,9 @@ describe('generateTopicTitle', () => {
     // Should not split a word — last char before ellipsis must not be a partial word
     // (i.e. the original message had a space right before our cut point)
     const beforeEllipsis = out!.slice(0, -1); // strip the ellipsis
-    expect(long.startsWith(beforeEllipsis + ' ') || long === beforeEllipsis).toBe(
-      true,
-    );
+    expect(
+      long.startsWith(beforeEllipsis + ' ') || long === beforeEllipsis,
+    ).toBe(true);
   });
 
   it('hard-cuts when no good word boundary in the back half', () => {
