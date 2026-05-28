@@ -63,7 +63,10 @@ import {
   routeOutbound,
 } from './router.js';
 import { StreamingMessage } from './streaming-message.js';
-import { startTypingKeepalive } from './typing-keepalive.js';
+import {
+  startTypingKeepalive,
+  type TypingKeepaliveHandle,
+} from './typing-keepalive.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -94,6 +97,32 @@ let messageLoopRunning = false;
 // wrote. In-memory only — restored implicitly when the next inbound message
 // arrives. Channels that don't use threads keep the entry undefined.
 const lastThreadId: Record<string, string | undefined> = {};
+
+// Per-chat typing-indicator keepalive. Telegram drops the "typing" action
+// after ~5s, so we re-ping every 4s — but ONLY while the agent is actively
+// working a turn. The container lingers up to IDLE_TIMEOUT after a reply
+// (waiting for follow-ups); typing must NOT show during that idle window.
+// So the handle is started per turn (initial spawn AND each follow-up piped
+// into the live container) and stopped the moment that turn's result is
+// delivered. Keyed by chatJid.
+const typingHandles = new Map<string, TypingKeepaliveHandle>();
+
+function startChatTyping(chatJid: string): void {
+  stopChatTyping(chatJid); // replace any stale handle first
+  const channel = findChannel(channels, chatJid);
+  typingHandles.set(
+    chatJid,
+    startTypingKeepalive(channel, chatJid, lastThreadId[chatJid]),
+  );
+}
+
+function stopChatTyping(chatJid: string): void {
+  const handle = typingHandles.get(chatJid);
+  if (handle) {
+    handle.stop();
+    typingHandles.delete(chatJid);
+  }
+}
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -272,11 +301,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  // Typing keepalive: re-ping every 4s (Telegram drops the indicator after
-  // ~5s) so the user sees "печатает…" the entire time the agent is working,
-  // not just for the first 5 seconds after spawn. Routed to the originating
-  // thread via lastThreadId so it lands in the correct forum topic.
-  const typing = startTypingKeepalive(channel, chatJid, lastThreadId[chatJid]);
+  // Typing keepalive for THIS turn. Stopped when the result is delivered
+  // (see the result callback) — NOT when the container exits, which can be
+  // up to IDLE_TIMEOUT later while it waits for follow-ups. Restarted by the
+  // message-loop when a follow-up is piped into the still-alive container.
+  startChatTyping(chatJid);
   let hadError = false;
   let outputSentToUser = false;
   // Tracks failed outbound delivery from inside the streaming callback.
@@ -406,6 +435,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         resetIdleTimer();
       }
 
+      // Turn boundary: a result event (success or error) means the agent
+      // finished this turn and is now idle (the container lingers for
+      // follow-ups but does no work). Stop the typing indicator here so it
+      // doesn't show during the IDLE_TIMEOUT silence after a reply.
+      if (result.status === 'success' || result.status === 'error') {
+        stopChatTyping(chatJid);
+      }
+
       if (result.status === 'success') {
         queue.notifyIdle(chatJid);
       }
@@ -437,7 +474,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     streaming = undefined;
   }
 
-  typing.stop();
+  // Final cleanup: the result callback already stops typing per turn, but a
+  // container that exits without a final result (timeout/crash) could leave
+  // it running. Idempotent.
+  stopChatTyping(chatJid);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError || streamingSendFailed) {
@@ -639,11 +679,11 @@ async function startMessageLoop(): Promise<void> {
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
-            // Typing keepalive from the active runAgent is already pinging
-            // every 4s (src/typing-keepalive.ts) — no need for a one-shot
-            // here. (Removing this fixes a second bug too: the previous
-            // one-shot didn't pass message_thread_id, so typing for piped
-            // follow-ups showed in the general chat instead of the topic.)
+            // A follow-up just started a new turn in the still-alive
+            // container. The previous turn's typing was stopped when its
+            // result arrived, so restart it now (routed to the right topic
+            // via lastThreadId). The next result event stops it again.
+            startChatTyping(chatJid);
           } else {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
