@@ -1280,24 +1280,44 @@ export class TelegramChannel implements Channel {
   async setTyping(
     jid: string,
     isTyping: boolean,
-    _opts?: { threadId?: string },
+    opts?: { threadId?: string },
   ): Promise<void> {
     if (!this.bot || !isTyping) return;
+    const numericId = jid.replace(/^tg:/, '');
+    const threadId = opts?.threadId ? parseInt(opts.threadId, 10) : undefined;
+    // Telegram tracks the "typing" status separately per (chat) and per
+    // (chat, thread). For these bot-DM-with-threads chats neither scope alone
+    // covers both clients:
+    //   - thread-scoped only → shows inside the thread on mobile, but
+    //     Telegram Desktop renders nothing for a thread-scoped action;
+    //   - chat-level only → shows in the aggregate "All" view but never
+    //     inside the open thread.
+    // So we send BOTH: chat-level (renders in "All" on every client) and,
+    // when we know the thread, a thread-scoped action (renders in the thread
+    // where the client supports it). Two cheap calls every 4s; each isolated
+    // so one failing doesn't suppress the other.
+    await this.sendChatActionSafe(numericId, undefined);
+    if (threadId !== undefined && !isNaN(threadId)) {
+      await this.sendChatActionSafe(numericId, threadId);
+    }
+  }
+
+  private async sendChatActionSafe(
+    chatId: string,
+    threadId: number | undefined,
+  ): Promise<void> {
+    if (!this.bot) return;
     try {
-      const numericId = jid.replace(/^tg:/, '');
-      // Send a CHAT-LEVEL typing action — deliberately NOT scoped to a
-      // message_thread_id. These chats are private DMs with the bot
-      // (is_group=0) that expose Telegram's bot-DM thread feature. Telegram
-      // mobile leniently renders a thread-scoped sendChatAction in a DM, but
-      // Telegram Desktop renders nothing for it — the user saw "печатает…"
-      // on the phone but a blank desktop. Chat-level typing is the
-      // universally-rendered form and is semantically correct for a DM
-      // (typing status is per-chat there, not per-thread). Outbound MESSAGES
-      // still carry message_thread_id so replies land in the right thread —
-      // only the ephemeral typing action drops it.
-      await this.bot.api.sendChatAction(numericId, 'typing');
+      await this.bot.api.sendChatAction(
+        chatId,
+        'typing',
+        threadId !== undefined ? { message_thread_id: threadId } : undefined,
+      );
     } catch (err) {
-      logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
+      logger.debug(
+        { chatId, threadId, err },
+        'Failed to send Telegram typing indicator',
+      );
     }
   }
 }
