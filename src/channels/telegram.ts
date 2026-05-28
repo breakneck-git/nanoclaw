@@ -600,6 +600,20 @@ export class TelegramChannel implements Channel {
     newMsg: import('../types.js').NewMessage,
     extras?: BuildMetaBlockExtras,
   ): void {
+    // Backfill thread_id from grammy Context when the caller forgot to set
+    // it. Only message:text wired this up explicitly; storeNonText, photo,
+    // voice, document, sticker, and edited/channel handlers all dropped it.
+    // The downstream message-loop reads thread_id from the LATEST stored
+    // message and uses it as the lastThreadId for outbound — so a single
+    // photo with thread_id=null was clobbering the per-chat thread cursor,
+    // sending the bot's next reply to General instead of the topic.
+    if (newMsg.thread_id === undefined) {
+      const ctxThreadId = ctx.msg?.message_thread_id;
+      if (ctxThreadId !== undefined) {
+        newMsg = { ...newMsg, thread_id: ctxThreadId.toString() };
+      }
+    }
+
     // Sender allowlist pre-gate: when the per-chat (or default) entry is
     // mode='drop' and the sender is not in the allow list, drop EVERYTHING:
     //   - no contact upsert (otherwise a random sender's display name + phone
@@ -1199,9 +1213,7 @@ export class TelegramChannel implements Channel {
     if (!this.bot || !isTyping) return;
     try {
       const numericId = jid.replace(/^tg:/, '');
-      const threadId = opts?.threadId
-        ? parseInt(opts.threadId, 10)
-        : undefined;
+      const threadId = opts?.threadId ? parseInt(opts.threadId, 10) : undefined;
       await this.bot.api.sendChatAction(
         numericId,
         'typing',

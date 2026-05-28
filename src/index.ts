@@ -274,11 +274,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // ~5s) so the user sees "печатает…" the entire time the agent is working,
   // not just for the first 5 seconds after spawn. Routed to the originating
   // thread via lastThreadId so it lands in the correct forum topic.
-  const typing = startTypingKeepalive(
-    channel,
-    chatJid,
-    lastThreadId[chatJid],
-  );
+  const typing = startTypingKeepalive(channel, chatJid, lastThreadId[chatJid]);
   let hadError = false;
   let outputSentToUser = false;
   // Tracks failed outbound delivery from inside the streaming callback.
@@ -475,7 +471,10 @@ async function startMessageLoop(): Promise<void> {
           // outbound replies land in the same Telegram forum topic.
           const newestThread =
             groupMessages[groupMessages.length - 1]?.thread_id;
-          if (newestThread !== undefined) {
+          // Don't clobber a known-good thread cursor with a null reading.
+          // SQLite returns NULL (→ JS null) for messages stored without a
+          // thread_id; treat that as "no signal" not "send to General".
+          if (newestThread !== undefined && newestThread !== null) {
             lastThreadId[chatJid] = newestThread;
           }
 
