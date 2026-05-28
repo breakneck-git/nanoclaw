@@ -340,7 +340,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       // SKIP the legacy routeOutbound send — the user already saw the
       // body. Otherwise (no partials → legacy fallback, or streaming
       // failed mid-flight), send the full result text via routeOutbound.
-      const liveStreamed = streaming?.hasSent === true;
+      // CRITICAL: capture liveStreamed AFTER finish(), not before. finish()
+      // force-flushes a debounce-pending buffer — on a fast turn (completes
+      // within FLUSH_DEBOUNCE_MS of the last token) the flush timer has NOT
+      // fired yet, so hasSent is false until finish() actually sends. Reading
+      // hasSent before finish() would see false, then finish() sends the
+      // message, then the legacy routeOutbound below ALSO sends it → the user
+      // gets the reply twice. Capturing after finish() reflects the real send.
+      let liveStreamed = false;
       if (streaming) {
         try {
           await streaming.finish();
@@ -350,6 +357,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             'StreamingMessage finish() failed; falling back to result send',
           );
         }
+        liveStreamed = streaming.hasSent === true;
         streaming = undefined;
       }
 
