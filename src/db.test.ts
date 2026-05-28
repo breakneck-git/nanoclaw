@@ -95,6 +95,48 @@ describe('storeMessage', () => {
     expect(messages).toHaveLength(0);
   });
 
+  it('persists thread_id round-trip through storeMessage → getNewMessages → getMessagesSince', () => {
+    storeChatMetadata('tg:99', '2024-01-01T00:00:00.000Z');
+
+    storeMessage({
+      id: 'topic-1',
+      chat_jid: 'tg:99',
+      sender: '5',
+      sender_name: 'Alice',
+      content: 'topic message',
+      timestamp: '2024-01-01T00:00:05.000Z',
+      is_from_me: false,
+      thread_id: '42',
+    });
+
+    const since = getMessagesSince('tg:99', '2024-01-01T00:00:00.000Z', 'Andy');
+    expect(since[0].thread_id).toBe('42');
+
+    const { messages } = getNewMessages(
+      ['tg:99'],
+      '2024-01-01T00:00:00.000Z',
+      'Andy',
+    );
+    expect(messages[0].thread_id).toBe('42');
+  });
+
+  it('stores thread_id=null when not provided (non-topic chats)', () => {
+    storeChatMetadata('tg:99', '2024-01-01T00:00:00.000Z');
+
+    storeMessage({
+      id: 'no-topic-1',
+      chat_jid: 'tg:99',
+      sender: '5',
+      sender_name: 'Alice',
+      content: 'plain DM',
+      timestamp: '2024-01-01T00:00:06.000Z',
+      is_from_me: false,
+    });
+
+    const since = getMessagesSince('tg:99', '2024-01-01T00:00:00.000Z', 'Andy');
+    expect(since[0].thread_id).toBeNull();
+  });
+
   it('stores is_from_me flag', () => {
     storeChatMetadata('group@g.us', '2024-01-01T00:00:00.000Z');
 

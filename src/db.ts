@@ -31,6 +31,21 @@ function addMetaColumnIfMissing(database: Database.Database): void {
   }
 }
 
+/**
+ * Add the `thread_id` column to messages (idempotent). Holds the Telegram
+ * `message_thread_id` of forum-topic messages so outbound replies can land
+ * in the same topic. NULL for non-topic chats and for channels that lack
+ * the concept (Gmail, WhatsApp DM, Slack thread is a separate field, etc.).
+ */
+function addThreadIdColumnIfMissing(database: Database.Database): void {
+  const cols = database.prepare('PRAGMA table_info(messages)').all() as {
+    name: string;
+  }[];
+  if (!cols.some((c) => c.name === 'thread_id')) {
+    database.exec('ALTER TABLE messages ADD COLUMN thread_id TEXT');
+  }
+}
+
 function createSchema(database: Database.Database): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS chats (
@@ -49,6 +64,7 @@ function createSchema(database: Database.Database): void {
       timestamp TEXT,
       is_from_me INTEGER,
       is_bot_message INTEGER DEFAULT 0,
+      thread_id TEXT,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
@@ -217,6 +233,7 @@ export function initDatabase(): void {
   wireDatabaseFeatures(db);
   createSchema(db);
   addMetaColumnIfMissing(db);
+  addThreadIdColumnIfMissing(db);
 
   // Migrate from JSON files if they exist
   migrateJsonState();
@@ -442,7 +459,7 @@ export function storeMessage(msg: NewMessage): void {
     `INSERT OR IGNORE INTO chats (jid, name, last_message_time, channel, is_group) VALUES (?, NULL, ?, NULL, 0)`,
   ).run(msg.chat_jid, msg.timestamp);
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, meta, thread_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -453,6 +470,7 @@ export function storeMessage(msg: NewMessage): void {
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
     msg.meta ?? null,
+    msg.thread_id ?? null,
   );
 }
 
@@ -560,7 +578,7 @@ export function getNewMessages(
   // skip them. Keep that guard for plain text rows so an inbound channel
   // can't leak placeholder/zero-byte rows into the agent stream.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, meta
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, meta, thread_id
     FROM messages
     WHERE timestamp > ? AND chat_jid IN (${placeholders})
       AND is_bot_message = 0 AND content NOT LIKE ?
@@ -595,7 +613,7 @@ export function getMessagesSince(
   // empty `content` but populated `meta` (photo, sticker, location) are
   // admitted via the OR branch. See getNewMessages for the full rationale.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, meta
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, meta, thread_id
     FROM messages
     WHERE chat_jid = ? AND timestamp > ?
       AND is_bot_message = 0 AND content NOT LIKE ?
