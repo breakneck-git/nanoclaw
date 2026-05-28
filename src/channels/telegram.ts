@@ -14,7 +14,12 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
-import { upsertContact, promoteContactIdent } from '../db.js';
+import {
+  upsertContact,
+  promoteContactIdent,
+  isFirstInboundInTopic,
+} from '../db.js';
+import { generateTopicTitle } from '../topic-naming.js';
 import {
   isSenderAllowed,
   loadSenderAllowlist,
@@ -756,6 +761,40 @@ export class TelegramChannel implements Channel {
           'Message from unregistered Telegram chat',
         );
         return;
+      }
+
+      // If this is the very first inbound message in a forum topic that still
+      // carries Telegram's placeholder name ("New Chat" on macOS), rename the
+      // topic to a meaningful title derived from the message body. We do this
+      // BEFORE storeMessage so the "first-in-topic" check is honest. Best-
+      // effort: any API error is logged at warn and never crashes delivery.
+      if (threadId !== undefined && this.bot) {
+        const threadIdStr = threadId.toString();
+        const bot = this.bot;
+        if (isFirstInboundInTopic(chatJid, threadIdStr)) {
+          const title = generateTopicTitle(ctx.message.text);
+          if (title) {
+            bot.api
+              .editForumTopic(ctx.chat.id, threadId, { name: title })
+              .then(() =>
+                logger.info(
+                  { chatJid, threadId: threadIdStr, title },
+                  'Renamed Telegram forum topic',
+                ),
+              )
+              .catch((err) =>
+                logger.warn(
+                  {
+                    chatJid,
+                    threadId: threadIdStr,
+                    err:
+                      err instanceof Error ? err.message : String(err),
+                  },
+                  'editForumTopic failed (bot may lack can_manage_topics admin right)',
+                ),
+              );
+          }
+        }
       }
 
       // Deliver message — startMessageLoop() will pick it up

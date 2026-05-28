@@ -436,6 +436,25 @@ export function getLastGroupSync(): string | null {
 }
 
 /**
+ * True when no inbound user message has yet been recorded in this
+ * (chat_jid, thread_id) tuple. Used to decide whether to rename the
+ * Telegram forum topic from its placeholder name ("New Chat") on the
+ * very first message. Excludes is_from_me=1 so the bot's own outbound
+ * doesn't count as "first inbound".
+ */
+export function isFirstInboundInTopic(
+  chatJid: string,
+  threadId: string,
+): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 FROM messages WHERE chat_jid = ? AND thread_id = ? AND is_from_me = 0 LIMIT 1`,
+    )
+    .get(chatJid, threadId);
+  return !row;
+}
+
+/**
  * Record that group metadata was synced.
  */
 export function setLastGroupSync(): void {
