@@ -45,6 +45,7 @@ import {
   setSession,
   storeChatMetadata,
   storeMessage,
+  storeOutboundMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
@@ -324,6 +325,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         await channel.editMessage(chatJid, messageId, text, {
           threadId: lastThreadId[chatJid],
         });
+      },
+      finalizeStore: (messageId, fullText) => {
+        // Rewrite the DB row for this sealed message with its final full
+        // text. The first flush stored a partial via routeOutbound's
+        // SEND/STORE chokepoint; edits bypassed it. INSERT OR REPLACE on
+        // (id, chat_jid) updates that same row so lookup_messages and
+        // context rebuilds see the complete reply, not the first chunk.
+        // messageId may be undefined when the send failed — storeOutboundMessage
+        // synthesizes an `out-…` id so the reply still lands in history.
+        storeOutboundMessage(
+          chatJid,
+          fullText,
+          messageId,
+          channel.botSenderId?.(),
+        );
       },
     });
     return streaming;

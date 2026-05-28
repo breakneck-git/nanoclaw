@@ -29,6 +29,24 @@ export interface StreamingMessageDeps {
   sendMessage: (text: string) => Promise<string | undefined>;
   /** Edit an existing outbound message. */
   editMessage: (messageId: string, text: string) => Promise<void>;
+  /**
+   * Persist the FINAL full text of a sealed message to the DB, keyed by its
+   * channel messageId (INSERT OR REPLACE on the existing row). Edits go
+   * straight to the channel and bypass the SEND/STORE chokepoint, so without
+   * this the stored copy of a long, multi-flush reply would be frozen at its
+   * first partial chunk — truncating the bot's own history in lookup_messages
+   * and context rebuilds. Called once per sealed segment (the head when an
+   * overflow split happens, and the tail/whole on finish()). Optional:
+   * channels that don't need history fidelity can omit it.
+   *
+   * messageId may be undefined when the send itself failed (network blip,
+   * bot kicked) — the store impl should synthesize an id so the agent's own
+   * history still records the full reply even if Telegram never displayed it.
+   */
+  finalizeStore?: (
+    messageId: string | undefined,
+    fullText: string,
+  ) => void | Promise<void>;
 }
 
 export class StreamingMessage {
@@ -175,6 +193,12 @@ export class StreamingMessage {
       }
     }
 
+    // Persist the sealed head's final content to the DB (edits bypassed the
+    // store chokepoint). This segment is now frozen — no more edits to it.
+    if (this.messageId) {
+      await this.persistFinal(this.messageId, head);
+    }
+
     // Open a fresh message for the tail. Reset the buffer to tail so future
     // edits target the new message body.
     this.buffer = tail;
@@ -204,13 +228,47 @@ export class StreamingMessage {
     }
     // Drain anything already queued.
     await this.pendingFlush;
+    // Bug-A fix: reconcile any deferred partial-tag chars. `append()` holds
+    // back trailing bytes that COULD be the start of `<internal>`/`</internal>`
+    // (e.g. a reply ending in `<` or `</`). At end-of-stream no more input can
+    // complete a tag, so those bytes are now decided: if we're not inside an
+    // internal block they're literal visible text and must be shown; if we ARE
+    // inside an (unclosed) internal block they're hidden content → drop.
+    if (this.pendingPrefix && !this.insideInternal) {
+      this.buffer += this.pendingPrefix;
+    }
+    this.pendingPrefix = '';
     // If the buffer still has unflushed content (likely — the debounce timer
     // never fired), force one final flush.
     if (this.buffer.length > 0) {
       // Don't go through scheduleFlush — we want to await this one.
       await this.flush();
     }
+    // Persist the final full text of the current (last) message so the DB
+    // copy matches what the user sees, not the first partial chunk.
+    // Bug-D fix: persist even when messageId is undefined (the send failed) —
+    // storeOutboundMessage synthesizes an id, so the agent's history keeps the
+    // full reply rather than silently losing the tail on a transient failure.
+    if (this.buffer.length > 0) {
+      await this.persistFinal(this.messageId, this.buffer);
+    }
     this.closed = true;
+  }
+
+  /** Re-store a sealed segment's full text. Never throws. */
+  private async persistFinal(
+    messageId: string | undefined,
+    fullText: string,
+  ): Promise<void> {
+    if (!this.deps.finalizeStore) return;
+    try {
+      await this.deps.finalizeStore(messageId, fullText);
+    } catch (err) {
+      logger.warn(
+        { err: String(err) },
+        'StreamingMessage: finalizeStore failed (history copy may be stale)',
+      );
+    }
   }
 
   /** Whether anything was actually sent. Used to suppress the result-event delivery. */

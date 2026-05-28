@@ -678,13 +678,24 @@ export async function runContainerAgent(
             : OUTPUT_END_MARKER;
           const startIdx = usePartial ? partIdx : outIdx;
 
-          const endIdx = parseBuffer.indexOf(endMarker, startIdx);
-          if (endIdx === -1) break; // Incomplete pair, wait for more data
+          // Bug-B fix: the container emits every marker on its own line via
+          // console.log, and JSON.stringify never emits a literal newline
+          // inside the payload (it escapes \n → \\n). So the REAL frame
+          // terminator is always a newline immediately followed by the end
+          // marker. Searching for `\n + endMarker` (instead of the bare
+          // marker) means a marker string appearing INSIDE the JSON text
+          // (e.g. the bot quoting `---NANOCLAW_PARTIAL_END---` while
+          // discussing its own internals) can never be mistaken for the
+          // frame end — that in-payload copy is mid-line, not newline-led.
+          const anchoredEnd = '\n' + endMarker;
+          const anchoredIdx = parseBuffer.indexOf(anchoredEnd, startIdx);
+          if (anchoredIdx === -1) break; // Incomplete pair, wait for more data
+          const endIdx = anchoredIdx; // points at the leading newline
 
           const jsonStr = parseBuffer
             .slice(startIdx + startMarker.length, endIdx)
             .trim();
-          parseBuffer = parseBuffer.slice(endIdx + endMarker.length);
+          parseBuffer = parseBuffer.slice(endIdx + anchoredEnd.length);
 
           if (usePartial) {
             // PARTIAL block: deliver `text` chunk to onPartialOutput. We
@@ -967,9 +978,12 @@ export async function runContainerAgent(
 
       // Legacy mode: parse the last output marker pair from accumulated stdout
       try {
-        // Extract JSON between sentinel markers for robust parsing
+        // Extract JSON between sentinel markers for robust parsing.
+        // Bug-B fix: anchor the end marker to a leading newline so a marker
+        // string echoed inside the result text can't terminate the frame
+        // early (see the streaming parser above for the full rationale).
         const startIdx = stdout.indexOf(OUTPUT_START_MARKER);
-        const endIdx = stdout.indexOf(OUTPUT_END_MARKER);
+        const endIdx = stdout.indexOf('\n' + OUTPUT_END_MARKER);
 
         let jsonLine: string;
         if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {

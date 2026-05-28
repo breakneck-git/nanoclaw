@@ -239,4 +239,58 @@ describe('StreamingMessage', () => {
     expect(deps.editMessage).not.toHaveBeenCalled();
     expect(sm.hasSent).toBe(false);
   });
+
+  // Bug-A regression: a reply whose final tokens end on a tag-prefix (`<`,
+  // `</`, `<i`…) used to leave those chars stranded in pendingPrefix, lost
+  // forever because finish() only flushed `buffer`.
+  it('flushes trailing pendingPrefix that turned out to be literal text (ends in "<")', async () => {
+    const deps = makeDeps();
+    const sm = new StreamingMessage(deps);
+
+    // Last char "<" is a prefix of "<internal>" → deferred to pendingPrefix.
+    sm.append('compare a <');
+    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
+    // First flush sends only the un-deferred part.
+    expect(deps.sendMessage).toHaveBeenCalledWith('compare a ');
+
+    await sm.finish();
+    // finish() must reconcile the deferred "<" into the final text.
+    expect(deps.editMessage).toHaveBeenLastCalledWith('msg-1', 'compare a <');
+  });
+
+  it('drops trailing pendingPrefix when the stream ends inside an unclosed <internal>', async () => {
+    const deps = makeDeps();
+    const sm = new StreamingMessage(deps);
+
+    // Open internal, then end mid-close-tag. Nothing visible should survive.
+    sm.append('hi <internal>secret</intern');
+    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
+    await sm.finish();
+
+    // Only "hi " is visible; the unclosed-internal tail is dropped.
+    const allText = [
+      ...deps.sendMessage.mock.calls.map((c) => c[0]),
+      ...deps.editMessage.mock.calls.map((c) => c[1]),
+    ].join('|');
+    expect(allText).not.toContain('secret');
+    expect(allText).not.toContain('</intern');
+    expect(deps.sendMessage).toHaveBeenCalledWith('hi ');
+  });
+
+  // Bug-D regression: when the send fails (messageId never assigned), finish()
+  // must still persist the full text so the agent's own history isn't lost.
+  it('persistFinal runs with undefined messageId when the send failed', async () => {
+    const finalizeStore = vi.fn();
+    const sm = new StreamingMessage({
+      sendMessage: async () => undefined, // simulate send failure (no id)
+      editMessage: async () => {},
+      finalizeStore,
+    });
+
+    sm.append('the whole reply');
+    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
+    await sm.finish();
+
+    expect(finalizeStore).toHaveBeenCalledWith(undefined, 'the whole reply');
+  });
 });

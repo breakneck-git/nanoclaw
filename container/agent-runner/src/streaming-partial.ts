@@ -20,6 +20,10 @@
  */
 type PartialMessageShape = {
   type?: unknown;
+  // Set to the spawning tool_use id when the partial comes from a subagent /
+  // agent-team member; null for the main assistant. We only stream the main
+  // assistant — see the guard in extractPartialTextChunk.
+  parent_tool_use_id?: unknown;
   event?: {
     type?: unknown;
     delta?: {
@@ -36,6 +40,10 @@ type PartialMessageShape = {
  *
  * Returns null for:
  *   - non-stream_event messages (assistant / result / system / etc.)
+ *   - subagent / agent-team partials (parent_tool_use_id != null) — these
+ *     interleave token-by-token with the main assistant's stream and would
+ *     garble the single Telegram message we render into; the main turn's
+ *     final result still contains the relevant text
  *   - stream_events that are not `content_block_delta`
  *   - content_block_delta whose delta is not `text_delta`
  *     (e.g. `input_json_delta` carrying tool_use input fragments)
@@ -46,6 +54,8 @@ export function extractPartialTextChunk(msg: unknown): string | null {
   if (!msg || typeof msg !== 'object') return null;
   const m = msg as PartialMessageShape;
   if (m.type !== 'stream_event') return null;
+  // Drop subagent/team deltas — only the main assistant streams to the user.
+  if (m.parent_tool_use_id != null) return null;
   const event = m.event;
   if (!event || typeof event !== 'object') return null;
   if (event.type !== 'content_block_delta') return null;

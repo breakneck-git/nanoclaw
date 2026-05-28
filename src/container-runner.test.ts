@@ -345,6 +345,41 @@ describe('container-runner partial marker parsing', () => {
     await resultPromise;
   });
 
+  // Bug-B regression: a chunk whose text literally contains an end-marker
+  // string must NOT terminate the frame early. The real terminator is always
+  // newline-led (markers are emitted on their own line); an in-payload copy
+  // is mid-line inside the JSON string and must be ignored.
+  it('does not let an end-marker inside the payload text desync the parser', async () => {
+    const onOutput = vi.fn(async () => {});
+    const onPartialOutput = vi.fn(async (_chunk: string) => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+      onPartialOutput,
+    );
+
+    // The agent quotes the partial end marker while explaining itself.
+    const tricky = `the marker is ${OUTPUT_PARTIAL_END_MARKER} ok`;
+    emitPartialMarker(fakeProc, { text: tricky });
+    // A normal chunk right after — proves the parser didn't desync.
+    emitPartialMarker(fakeProc, { text: 'next' });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(onPartialOutput.mock.calls.map((c) => c[0])).toEqual([
+      tricky,
+      'next',
+    ]);
+
+    emitOutputMarker(fakeProc, { status: 'success', result: null });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await resultPromise;
+  });
+
   it('ignores PARTIAL blocks whose `text` field is missing or non-string', async () => {
     const onOutput = vi.fn(async () => {});
     const onPartialOutput = vi.fn(async (_chunk: string) => {});

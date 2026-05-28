@@ -783,7 +783,20 @@ export class TelegramChannel implements Channel {
       // topic to a meaningful title derived from the message body. We do this
       // BEFORE storeMessage so the "first-in-topic" check is honest. Best-
       // effort: any API error is logged at warn and never crashes delivery.
-      if (threadId !== undefined && this.bot) {
+      // Bug-E fix: gate the rename (which spends an Anthropic API call via the
+      // titler AND mutates the chat via editForumTopic) on the SAME allowlist
+      // that deliverInbound enforces. Otherwise a per-sender-denied user in a
+      // registered forum group could make the bot burn tokens + rename topics
+      // before their message is dropped. Bot-originated messages have no
+      // external sender to authorize and never reach this text handler.
+      const renameAllowed = (() => {
+        const cfg = loadSenderAllowlist();
+        return !(
+          shouldDropMessage(chatJid, cfg) &&
+          !isSenderAllowed(chatJid, sender, cfg)
+        );
+      })();
+      if (threadId !== undefined && this.bot && renameAllowed) {
         const threadIdStr = threadId.toString();
         const bot = this.bot;
         if (isFirstInboundInTopic(chatJid, threadIdStr)) {

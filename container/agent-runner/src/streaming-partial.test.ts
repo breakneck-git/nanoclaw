@@ -125,4 +125,34 @@ describe('extractPartialTextChunk', () => {
       }),
     ).toBeNull();
   });
+
+  // Bug-C regression: subagent / agent-team token deltas surface in the parent
+  // query stream with parent_tool_use_id set. They must NOT be forwarded —
+  // they would interleave token-by-token with the main assistant and garble
+  // the single Telegram message we render into.
+  it('returns null for subagent partials (parent_tool_use_id set)', () => {
+    const subagentDelta = {
+      type: 'stream_event',
+      parent_tool_use_id: 'toolu_abc123',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: 'subagent thinking out loud' },
+      },
+    };
+    expect(extractPartialTextChunk(subagentDelta)).toBeNull();
+  });
+
+  it('still returns text when parent_tool_use_id is explicitly null (main assistant)', () => {
+    const mainDelta = {
+      type: 'stream_event',
+      parent_tool_use_id: null,
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: 'main reply' },
+      },
+    };
+    expect(extractPartialTextChunk(mainDelta)).toBe('main reply');
+  });
 });
