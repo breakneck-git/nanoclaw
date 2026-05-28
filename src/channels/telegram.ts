@@ -20,6 +20,7 @@ import {
   isFirstInboundInTopic,
 } from '../db.js';
 import { generateTopicTitle } from '../topic-naming.js';
+import { titleFromMessage } from '../topic-titler.js';
 import {
   isSenderAllowed,
   loadSenderAllowlist,
@@ -772,28 +773,38 @@ export class TelegramChannel implements Channel {
         const threadIdStr = threadId.toString();
         const bot = this.bot;
         if (isFirstInboundInTopic(chatJid, threadIdStr)) {
-          const title = generateTopicTitle(ctx.message.text);
-          if (title) {
-            bot.api
-              .editForumTopic(ctx.chat.id, threadId, { name: title })
-              .then(() =>
-                logger.info(
-                  { chatJid, threadId: threadIdStr, title },
-                  'Renamed Telegram forum topic',
-                ),
-              )
-              .catch((err) =>
-                logger.warn(
-                  {
-                    chatJid,
-                    threadId: threadIdStr,
-                    err:
-                      err instanceof Error ? err.message : String(err),
-                  },
-                  'editForumTopic failed (bot may lack can_manage_topics admin right)',
-                ),
+          // Fire-and-forget: LLM titler first (semantic, via Claude Haiku),
+          // fall back to string-trim if the API is unreachable. The whole
+          // rename runs off the critical path — delivery proceeds in
+          // parallel.
+          (async () => {
+            const llmTitle = await titleFromMessage(ctx.message.text);
+            const title = llmTitle ?? generateTopicTitle(ctx.message.text);
+            if (!title) return;
+            try {
+              await bot.api.editForumTopic(ctx.chat.id, threadId, {
+                name: title,
+              });
+              logger.info(
+                {
+                  chatJid,
+                  threadId: threadIdStr,
+                  title,
+                  source: llmTitle ? 'llm' : 'fallback',
+                },
+                'Renamed Telegram forum topic',
               );
-          }
+            } catch (err) {
+              logger.warn(
+                {
+                  chatJid,
+                  threadId: threadIdStr,
+                  err: err instanceof Error ? err.message : String(err),
+                },
+                'editForumTopic failed (bot may lack can_manage_topics admin right)',
+              );
+            }
+          })();
         }
       }
 
