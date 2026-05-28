@@ -241,13 +241,15 @@ describe('routeOutbound — SEND/STORE isolation', () => {
     });
 
     // Drop the messages table so the internal INSERT throws. STORE failure
-    // must NOT propagate; routeOutbound must still resolve void.
+    // must NOT propagate; routeOutbound must still resolve. The messageId
+    // from the successful send is surfaced regardless of the DB hiccup
+    // (StreamingMessage needs it to drive subsequent edits).
     db.prepare('DROP TABLE messages').run();
     const errorSpy = vi.spyOn(logger, 'error').mockImplementation(() => {});
 
     await expect(
       routeOutbound([channel], 'tg:1', 'hello'),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ messageId: 'tg-xyz' });
     expect(errorSpy).toHaveBeenCalled();
 
     errorSpy.mockRestore();
@@ -296,5 +298,27 @@ describe('routeOutbound — SEND/STORE isolation', () => {
     expect(row.id).toMatch(/^out-/);
     expect(row.sender).toBe('bot42');
     expect(row.meta).toBe('<m kind="outbound-synthetic"/>');
+  });
+
+  it('returns { messageId } when sendMessage produces one (for StreamingMessage)', async () => {
+    // StreamingMessage needs the messageId from its first send to drive
+    // subsequent edits — routeOutbound surfaces it through the return value.
+    const channel = makeChannel({
+      sendMessage: vi.fn().mockResolvedValue({ messageId: 'tg-42' }),
+      botSenderId: vi.fn().mockReturnValue('bot42'),
+    });
+
+    const res = await routeOutbound([channel], 'tg:1', 'hello');
+    expect(res).toEqual({ messageId: 'tg-42' });
+  });
+
+  it('returns void when sendMessage returns no messageId', async () => {
+    const channel = makeChannel({
+      sendMessage: vi.fn().mockResolvedValue(undefined),
+      botSenderId: vi.fn().mockReturnValue('bot42'),
+    });
+
+    const res = await routeOutbound([channel], 'tg:1', 'hello');
+    expect(res).toBeUndefined();
   });
 });

@@ -61,6 +61,7 @@ import {
   formatOutbound,
   routeOutbound,
 } from './router.js';
+import { StreamingMessage } from './streaming-message.js';
 import { startTypingKeepalive } from './typing-keepalive.js';
 import {
   restoreRemoteControl,
@@ -283,42 +284,134 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // would advance as if the user got the reply — losing it permanently.
   let streamingSendFailed = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-      if (text) {
+  // Token-level streaming state. Only enabled when the channel exposes
+  // `editMessage` (Telegram today). Other channels fall through to the
+  // legacy one-message-per-turn path via `onOutput`. A fresh
+  // StreamingMessage is created lazily on the FIRST partial chunk after
+  // each result event, so multi-turn agent conversations get one streamed
+  // Telegram message per turn instead of one giant continuously-edited
+  // message that mixes turns together.
+  const supportsStreaming = typeof channel.editMessage === 'function';
+  let streaming: StreamingMessage | undefined;
+  const ensureStreaming = (): StreamingMessage => {
+    if (streaming) return streaming;
+    streaming = new StreamingMessage({
+      sendMessage: async (text) => {
         try {
-          await routeOutbound(channels, chatJid, text, {
+          const res = await routeOutbound(channels, chatJid, text, {
             threadId: lastThreadId[chatJid],
           });
           outputSentToUser = true;
+          return res && typeof res === 'object' && 'messageId' in res
+            ? res.messageId
+            : undefined;
         } catch (err) {
           logger.error(
             { chatJid, err },
-            'Failed to deliver streamed agent output',
+            'StreamingMessage send via routeOutbound failed',
           );
           streamingSendFailed = true;
+          // Swallow — StreamingMessage's flush handler already logs and
+          // moves on; rethrowing would leave its pendingFlush rejected
+          // forever and wedge subsequent appends. The outer
+          // streamingSendFailed flag will trigger cursor rollback so the
+          // user's prompt isn't silently lost.
+          return undefined;
         }
+      },
+      editMessage: async (messageId, text) => {
+        if (!channel.editMessage) return;
+        await channel.editMessage(chatJid, messageId, text, {
+          threadId: lastThreadId[chatJid],
+        });
+      },
+    });
+    return streaming;
+  };
+
+  const output = await runAgent(
+    group,
+    prompt,
+    chatJid,
+    async (result) => {
+      // Result-event callback. Fires at the end of each agent turn.
+      //
+      // If StreamingMessage delivered text via live edits, finalize it and
+      // SKIP the legacy routeOutbound send — the user already saw the
+      // body. Otherwise (no partials → legacy fallback, or streaming
+      // failed mid-flight), send the full result text via routeOutbound.
+      const liveStreamed = streaming?.hasSent === true;
+      if (streaming) {
+        try {
+          await streaming.finish();
+        } catch (err) {
+          logger.warn(
+            { chatJid, err },
+            'StreamingMessage finish() failed; falling back to result send',
+          );
+        }
+        streaming = undefined;
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info(
+          { group: group.name, liveStreamed },
+          `Agent output: ${raw.length} chars`,
+        );
+        if (text && !liveStreamed) {
+          try {
+            await routeOutbound(channels, chatJid, text, {
+              threadId: lastThreadId[chatJid],
+            });
+            outputSentToUser = true;
+          } catch (err) {
+            logger.error(
+              { chatJid, err },
+              'Failed to deliver streamed agent output',
+            );
+            streamingSendFailed = true;
+          }
+        }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
+      }
 
-    if (result.status === 'error') {
-      hadError = true;
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
+
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    },
+    supportsStreaming
+      ? (chunk) => {
+          // Lazy-create the StreamingMessage on the first chunk of a turn.
+          // Subsequent chunks reuse the same instance until the next result
+          // event finalizes it.
+          ensureStreaming().append(chunk);
+        }
+      : undefined,
+  );
+
+  // Drain any in-flight streaming state. Defensive: the result-event
+  // callback above normally finalizes it, but a container that exits
+  // without emitting a final result block (timeout edge cases) would
+  // leave a half-flushed StreamingMessage behind.
+  if (streaming) {
+    try {
+      await streaming.finish();
+    } catch (err) {
+      logger.warn({ chatJid, err }, 'Drain streaming.finish() failed');
     }
-  });
+    streaming = undefined;
+  }
 
   typing.stop();
   if (idleTimer) clearTimeout(idleTimer);
@@ -351,6 +444,7 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  onPartialOutput?: (chunk: string) => Promise<void> | void,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
@@ -405,6 +499,7 @@ async function runAgent(
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
+      onPartialOutput,
     );
 
     if (output.newSessionId) {

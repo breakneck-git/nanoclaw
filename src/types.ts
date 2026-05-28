@@ -119,6 +119,18 @@ export interface Channel {
     isTyping: boolean,
     opts?: SendMessageOptions,
   ): Promise<void>;
+  // Optional: edit an already-sent message in place. Implemented by channels
+  // that support live updates (Telegram). Used by StreamingMessage to render
+  // token-level agent output as typing-style edits instead of one message
+  // per turn. Channels without this capability fall back to legacy
+  // sendMessage-only behavior — the orchestrator only constructs a
+  // StreamingMessage when `editMessage` is present.
+  editMessage?(
+    jid: string,
+    messageId: string,
+    text: string,
+    opts?: SendMessageOptions,
+  ): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
   // Optional: channel-specific identifier for the bot/sender (e.g. bot user ID).

@@ -54,7 +54,7 @@ export async function routeOutbound(
   jid: string,
   text: string,
   opts?: SendMessageOptions,
-): Promise<void> {
+): Promise<{ messageId?: string } | void> {
   const channel = channels.find((c) => c.ownsJid(jid) && c.isConnected());
   if (!channel) throw new Error(`No channel for JID: ${jid}`);
   // SEND first — any throw here means the user didn't receive the message; propagate
@@ -63,11 +63,11 @@ export async function routeOutbound(
   // STORE in an isolated try — the user already saw the message; a DB error here must
   // NOT propagate, otherwise the caller will roll back the cursor and re-deliver the
   // same agent output on the next poll (user sees duplicates).
+  const messageId =
+    result && typeof result === 'object' && 'messageId' in result
+      ? (result.messageId ?? undefined)
+      : undefined;
   try {
-    const messageId =
-      result && typeof result === 'object' && 'messageId' in result
-        ? (result.messageId ?? undefined)
-        : undefined;
     const senderId = channel.botSenderId?.();
     storeOutboundMessage(jid, text, messageId, senderId);
   } catch (err) {
@@ -76,6 +76,11 @@ export async function routeOutbound(
       'storeOutboundMessage failed (message was delivered)',
     );
   }
+  // Surface the messageId so callers that need to edit the sent message
+  // later (e.g. StreamingMessage's first send → subsequent edits) can do
+  // so without a second send. Legacy callers that ignore the return value
+  // are unaffected.
+  return messageId !== undefined ? { messageId } : undefined;
 }
 
 export function findChannel(

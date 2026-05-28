@@ -1205,6 +1205,66 @@ export class TelegramChannel implements Channel {
     }
   }
 
+  /**
+   * Edit a previously-sent Telegram message in place. Used by
+   * `StreamingMessage` to render token-level agent output as live edits
+   * instead of one Telegram message per agent turn.
+   *
+   * Plain text only — partial Markdown during streaming can split mid-tag
+   * (e.g. `**bold` without a closing `**`) and Telegram rejects the parse.
+   * The final result-event delivery path still goes through the normal
+   * `sendMessage` Markdown→plain fallback.
+   *
+   * Error handling matches `StreamingMessage`'s contract:
+   *   - "message is not modified" → benign no-op (we re-flushed identical
+   *     content because the debounce timer fired without new tokens).
+   *   - 429 Too Many Requests   → swallowed; the next debounce window will
+   *     re-attempt with the accumulated buffer.
+   *   - Other errors            → rethrown so the caller decides (the
+   *     orchestrator currently logs and continues, since the result event
+   *     will still deliver the final text via routeOutbound).
+   *
+   * `opts.threadId` is intentionally NOT passed: `editMessageText` derives
+   * the message's location from `messageId`. Forum topics work without
+   * additional plumbing.
+   */
+  async editMessage(
+    jid: string,
+    messageId: string,
+    text: string,
+    _opts?: { threadId?: string },
+  ): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized; skipping editMessage');
+      return;
+    }
+    const numericChatId = parseInt(jid.replace(/^tg:/, ''), 10);
+    const mid = parseInt(messageId, 10);
+    if (isNaN(numericChatId) || isNaN(mid)) {
+      logger.warn(
+        { jid, messageId },
+        'editMessage: non-numeric chat id or message id, skipping',
+      );
+      return;
+    }
+    try {
+      await this.bot.api.editMessageText(numericChatId, mid, text);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const desc =
+        (err as { description?: string })?.description ?? msg;
+      if (/message is not modified/i.test(desc)) return;
+      if (/too many requests/i.test(desc)) {
+        logger.warn(
+          { jid, mid, err: desc },
+          'editMessageText rate-limited; debounce will catch up next flush',
+        );
+        return;
+      }
+      throw err;
+    }
+  }
+
   async setTyping(
     jid: string,
     isTyping: boolean,

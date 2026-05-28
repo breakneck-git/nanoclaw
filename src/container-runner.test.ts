@@ -5,6 +5,8 @@ import { PassThrough } from 'stream';
 // Sentinel markers must match container-runner.ts
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+const OUTPUT_PARTIAL_START_MARKER = '---NANOCLAW_PARTIAL_START---';
+const OUTPUT_PARTIAL_END_MARKER = '---NANOCLAW_PARTIAL_END---';
 
 // Mock config
 vi.mock('./config.js', () => ({
@@ -119,6 +121,18 @@ function emitOutputMarker(
   proc.stdout.push(`${OUTPUT_START_MARKER}\n${json}\n${OUTPUT_END_MARKER}\n`);
 }
 
+function emitPartialMarker(
+  proc: ReturnType<typeof createFakeProcess>,
+  payload: { text?: unknown } | string,
+) {
+  // Caller may pass a string to inject malformed JSON.
+  const body =
+    typeof payload === 'string' ? payload : JSON.stringify(payload);
+  proc.stdout.push(
+    `${OUTPUT_PARTIAL_START_MARKER}\n${body}\n${OUTPUT_PARTIAL_END_MARKER}\n`,
+  );
+}
+
 describe('container-runner timeout behavior', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -214,6 +228,216 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Token-level streaming — PARTIAL marker parsing.
+//
+// The container emits PARTIAL_START..PARTIAL_END blocks as the agent streams
+// `text_delta` events from the SDK. The host parses them in the same stdout
+// loop as the legacy OUTPUT_* markers and forwards `text` chunks to
+// onPartialOutput. The orchestrator turns those chunks into Telegram edit
+// calls via StreamingMessage. Tests below pin down the parsing seam without
+// involving the channel layer.
+// ---------------------------------------------------------------------------
+describe('container-runner partial marker parsing', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('forwards a single PARTIAL block to onPartialOutput with the text chunk', async () => {
+    const onOutput = vi.fn(async () => {});
+    const onPartialOutput = vi.fn(async (_chunk: string) => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+      onPartialOutput,
+    );
+
+    emitPartialMarker(fakeProc, { text: 'Hello ' });
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(onPartialOutput).toHaveBeenCalledTimes(1);
+    expect(onPartialOutput).toHaveBeenCalledWith('Hello ');
+
+    // Settle the agent so the outer promise resolves.
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Hello world',
+      newSessionId: 'session-p1',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await resultPromise;
+  });
+
+  it('interleaves multiple PARTIAL blocks before a final OUTPUT block', async () => {
+    const onOutput = vi.fn(async () => {});
+    const onPartialOutput = vi.fn(async (_chunk: string) => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+      onPartialOutput,
+    );
+
+    emitPartialMarker(fakeProc, { text: 'Hel' });
+    emitPartialMarker(fakeProc, { text: 'lo ' });
+    emitPartialMarker(fakeProc, { text: 'world' });
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Hello world',
+      newSessionId: 'session-p2',
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(onPartialOutput).toHaveBeenCalledTimes(3);
+    expect(onPartialOutput.mock.calls.map((c) => c[0])).toEqual([
+      'Hel',
+      'lo ',
+      'world',
+    ]);
+    expect(onOutput).toHaveBeenCalledTimes(1);
+
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await resultPromise;
+  });
+
+  it('ignores PARTIAL blocks with malformed JSON without crashing the parser', async () => {
+    const onOutput = vi.fn(async () => {});
+    const onPartialOutput = vi.fn(async (_chunk: string) => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+      onPartialOutput,
+    );
+
+    // Malformed body — must not throw, must not call onPartialOutput.
+    emitPartialMarker(fakeProc, 'not valid json {');
+    // A well-formed one right after — must still be delivered.
+    emitPartialMarker(fakeProc, { text: 'after' });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(onPartialOutput).toHaveBeenCalledTimes(1);
+    expect(onPartialOutput).toHaveBeenCalledWith('after');
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: null,
+      newSessionId: 'session-p3',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await resultPromise;
+  });
+
+  it('ignores PARTIAL blocks whose `text` field is missing or non-string', async () => {
+    const onOutput = vi.fn(async () => {});
+    const onPartialOutput = vi.fn(async (_chunk: string) => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+      onPartialOutput,
+    );
+
+    emitPartialMarker(fakeProc, {}); // missing text
+    emitPartialMarker(fakeProc, { text: 123 }); // wrong type
+    emitPartialMarker(fakeProc, { text: '' }); // empty (per spec, no-op)
+    emitPartialMarker(fakeProc, { text: 'real' });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(onPartialOutput).toHaveBeenCalledTimes(1);
+    expect(onPartialOutput).toHaveBeenCalledWith('real');
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: null,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await resultPromise;
+  });
+
+  it('does NOT mark a partial-only stream as "hadStreamingOutput"; timeout still errors', async () => {
+    const onOutput = vi.fn(async () => {});
+    const onPartialOutput = vi.fn(async (_chunk: string) => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+      onPartialOutput,
+    );
+
+    // Stream a few partials but never emit a full OUTPUT result.
+    emitPartialMarker(fakeProc, { text: 'streaming…' });
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Hard timeout fires before any final result.
+    await vi.advanceTimersByTimeAsync(1830000);
+    fakeProc.emit('close', 137);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    // Partials alone do not satisfy "had output" — caller must see error so
+    // the cursor rolls back and the user's message isn't silently dropped.
+    expect(result.status).toBe('error');
+    expect(result.error).toContain('timed out');
+  });
+
+  it('survives onPartialOutput throwing without dropping subsequent partials', async () => {
+    const onOutput = vi.fn(async () => {});
+    let callCount = 0;
+    // Typed as (chunk: string) => Promise<void> so .mock.calls[i][0] is string,
+    // not the empty tuple TS would infer from a zero-arg lambda.
+    const onPartialOutput = vi.fn(async (_chunk: string) => {
+      callCount++;
+      if (callCount === 1) throw new Error('telegram api boom');
+    });
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+      onPartialOutput,
+    );
+
+    emitPartialMarker(fakeProc, { text: 'first' });
+    emitPartialMarker(fakeProc, { text: 'second' });
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Both calls happened — the throw on call 1 did not wedge the loop.
+    expect(onPartialOutput).toHaveBeenCalledTimes(2);
+    expect(onPartialOutput.mock.calls[0][0]).toBe('first');
+    expect(onPartialOutput.mock.calls[1][0]).toBe('second');
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: null,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await resultPromise;
   });
 });
 

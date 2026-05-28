@@ -37,6 +37,13 @@ import { RegisteredGroup } from './types.js';
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+// Token-level streaming markers — emitted by the container while a turn is
+// still in progress so the host can render typing-style updates without
+// waiting for the final result. Inline duplication of the constants on the
+// container side (container/agent-runner/src/index.ts) is intentional; they
+// must stay in sync by convention.
+const OUTPUT_PARTIAL_START_MARKER = '---NANOCLAW_PARTIAL_START---';
+const OUTPUT_PARTIAL_END_MARKER = '---NANOCLAW_PARTIAL_END---';
 
 export interface ContainerInput {
   prompt: string;
@@ -529,6 +536,7 @@ export async function runContainerAgent(
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  onPartialOutput?: (chunk: string) => Promise<void> | void,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
   const tMark = (label: string): void => {
@@ -644,19 +652,74 @@ export async function runContainerAgent(
         }
       }
 
-      // Stream-parse for output markers
-      if (onOutput) {
+      // Stream-parse for output markers (both final OUTPUT_* and live PARTIAL_*)
+      if (onOutput || onPartialOutput) {
         parseBuffer += chunk;
-        let startIdx: number;
-        while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
-          const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
+        // Loop: at each step find the EARLIEST opening marker (either OUTPUT
+        // or PARTIAL). If the matching closing marker isn't in the buffer yet,
+        // wait for more data. Interleaved parsing matters: the container emits
+        // PARTIAL frames every few tokens during a turn, then OUTPUT at the
+        // end — without interleaving, partials behind a stalled OUTPUT search
+        // would never get drained.
+        while (true) {
+          const outIdx = parseBuffer.indexOf(OUTPUT_START_MARKER);
+          const partIdx = parseBuffer.indexOf(OUTPUT_PARTIAL_START_MARKER);
+          // Nothing pending — wait for the next chunk.
+          if (outIdx === -1 && partIdx === -1) break;
+
+          // Pick whichever marker appears first in the buffer.
+          const usePartial =
+            partIdx !== -1 && (outIdx === -1 || partIdx < outIdx);
+          const startMarker = usePartial
+            ? OUTPUT_PARTIAL_START_MARKER
+            : OUTPUT_START_MARKER;
+          const endMarker = usePartial
+            ? OUTPUT_PARTIAL_END_MARKER
+            : OUTPUT_END_MARKER;
+          const startIdx = usePartial ? partIdx : outIdx;
+
+          const endIdx = parseBuffer.indexOf(endMarker, startIdx);
           if (endIdx === -1) break; // Incomplete pair, wait for more data
 
           const jsonStr = parseBuffer
-            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
+            .slice(startIdx + startMarker.length, endIdx)
             .trim();
-          parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
+          parseBuffer = parseBuffer.slice(endIdx + endMarker.length);
 
+          if (usePartial) {
+            // PARTIAL block: deliver `text` chunk to onPartialOutput. We
+            // intentionally do NOT mark hadStreamingOutput or reset the
+            // timeout from partials — those signals are reserved for full
+            // result blocks. A partial-only stream that never produces a
+            // result must still trip the hard timeout.
+            if (!onPartialOutput) continue;
+            try {
+              const parsed = JSON.parse(jsonStr) as { text?: unknown };
+              const text = parsed?.text;
+              if (typeof text !== 'string' || text.length === 0) continue;
+              // Fire-and-forget — don't await. Same rationale as outputChain
+              // on the full-result path: a slow Telegram edit must not block
+              // the per-chunk parse loop. Errors are logged and swallowed so
+              // a single bad chunk doesn't wedge subsequent ones.
+              const partialResult = onPartialOutput(text);
+              if (partialResult && typeof partialResult.then === 'function') {
+                partialResult.catch((err: unknown) => {
+                  logger.warn(
+                    { group: group.name, err },
+                    'Streaming onPartialOutput callback failed; continuing',
+                  );
+                });
+              }
+            } catch (err) {
+              logger.warn(
+                { group: group.name, error: err },
+                'Failed to parse streamed partial chunk',
+              );
+            }
+            continue;
+          }
+
+          // OUTPUT block: full result, drives session bookkeeping.
           try {
             const parsed: ContainerOutput = JSON.parse(jsonStr);
             if (parsed.newSessionId) {
@@ -665,6 +728,7 @@ export async function runContainerAgent(
             hadStreamingOutput = true;
             // Activity detected — reset the hard timeout
             resetTimeout();
+            if (!onOutput) continue;
             // Call onOutput for all markers (including null results)
             // so idle timers start even for "silent" query completions.
             // Capture failures in the streaming callback (e.g. channel send

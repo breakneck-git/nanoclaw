@@ -22,6 +22,7 @@ import { query, HookCallback, McpServerConfig, PreCompactHookInput } from '@anth
 import { fileURLToPath } from 'url';
 import { safeTruncate } from './safe-truncate.js';
 import { filterAllowedToolPatterns, filterMcpServers } from './mcp-whitelist.js';
+import { extractPartialTextChunk } from './streaming-partial.js';
 
 interface ContainerInput {
   prompt: string;
@@ -119,11 +120,24 @@ async function readStdin(): Promise<string> {
 
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+// Token-level streaming markers. Emitted alongside the existing OUTPUT_*
+// markers so the host can render partial text as it arrives while still
+// receiving the final result block (with newSessionId etc.) at turn end.
+// Markers are duplicated inline on host (src/container-runner.ts) — kept
+// in sync by convention.
+const OUTPUT_PARTIAL_START_MARKER = '---NANOCLAW_PARTIAL_START---';
+const OUTPUT_PARTIAL_END_MARKER = '---NANOCLAW_PARTIAL_END---';
 
 function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
   console.log(JSON.stringify(output));
   console.log(OUTPUT_END_MARKER);
+}
+
+function writePartial(chunk: string): void {
+  console.log(OUTPUT_PARTIAL_START_MARKER);
+  console.log(JSON.stringify({ text: chunk }));
+  console.log(OUTPUT_PARTIAL_END_MARKER);
 }
 
 function log(message: string): void {
@@ -435,6 +449,12 @@ async function runQuery(
     options: {
       model: 'claude-opus-4-7',
       cwd: '/workspace/group',
+      // Emit SDKPartialAssistantMessage events as the agent's text streams in.
+      // The for-await loop below forwards `text_delta` fragments to the host
+      // as PARTIAL markers so Telegram can render typing-style updates without
+      // waiting for the full result. See container/agent-runner/src/streaming-partial.ts
+      // for the per-message classifier.
+      includePartialMessages: true,
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
@@ -541,7 +561,22 @@ async function runQuery(
   })) {
     messageCount++;
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
-    log(`[msg #${messageCount}] type=${msgType}`);
+    // Skip noisy [msg #N] logging for stream_event — they fire per token and
+    // would drown out every other agent-runner stderr line at debug level.
+    if (message.type !== 'stream_event') {
+      log(`[msg #${messageCount}] type=${msgType}`);
+    }
+
+    // Token-level streaming: forward visible text_delta fragments to the host
+    // as PARTIAL markers. Tool-use input_json_delta, control events, and other
+    // stream_events are ignored by extractPartialTextChunk and never leak to
+    // the chat. Placed BEFORE the result branch so the host receives partials
+    // first, then the final result with newSessionId/status for bookkeeping.
+    if (message.type === 'stream_event') {
+      const chunk = extractPartialTextChunk(message);
+      if (chunk) writePartial(chunk);
+      continue;
+    }
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;

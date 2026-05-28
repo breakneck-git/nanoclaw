@@ -638,3 +638,85 @@ describe('TelegramChannel.sendMessage multi-chunk', () => {
     expect(sendMessageMock).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('TelegramChannel.editMessage', () => {
+  // editMessage is used by StreamingMessage to update a single bot message in
+  // place as the agent streams tokens. We deliberately keep the surface
+  // narrow: plain text only (Markdown can split mid-tag during streaming),
+  // benign "message is not modified" swallowed, 429 swallowed (next debounce
+  // window catches up), other transport errors re-thrown for the caller.
+  function makeChannelWithEdit(editMessageText: ReturnType<typeof vi.fn>): {
+    channel: TelegramChannel;
+  } {
+    const channel = new TelegramChannel('test-token', {
+      onMessage: vi.fn(),
+      onChatMetadata: vi.fn(),
+      registeredGroups: () => ({}),
+    });
+    (channel as any).bot = { api: { editMessageText } };
+    return { channel };
+  }
+
+  it('calls api.editMessageText with parsed chat id and messageId', async () => {
+    const editMessageText = vi.fn().mockResolvedValue({ message_id: 42 } as any);
+    const { channel } = makeChannelWithEdit(editMessageText);
+    await channel.editMessage!('tg:1001', '42', 'updated body');
+    expect(editMessageText).toHaveBeenCalledTimes(1);
+    expect(editMessageText).toHaveBeenCalledWith(1001, 42, 'updated body');
+  });
+
+  it('returns silently when the bot is not initialized', async () => {
+    const channel = new TelegramChannel('test-token', {
+      onMessage: vi.fn(),
+      onChatMetadata: vi.fn(),
+      registeredGroups: () => ({}),
+    });
+    // Default state: bot === null. Should be a silent no-op.
+    await expect(
+      channel.editMessage!('tg:1', '2', 'x'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('returns silently for non-numeric chat id or messageId', async () => {
+    const editMessageText = vi.fn();
+    const { channel } = makeChannelWithEdit(editMessageText);
+    await channel.editMessage!('tg:not-a-number', '42', 'x');
+    await channel.editMessage!('tg:1', 'not-a-number', 'x');
+    expect(editMessageText).not.toHaveBeenCalled();
+  });
+
+  it('swallows "message is not modified" without throwing', async () => {
+    const editMessageText = vi.fn().mockRejectedValue({
+      error_code: 400,
+      description:
+        "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message",
+    });
+    const { channel } = makeChannelWithEdit(editMessageText);
+    await expect(
+      channel.editMessage!('tg:1', '2', 'same as before'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('swallows 429 rate-limit (debounce will catch up on next flush)', async () => {
+    const editMessageText = vi.fn().mockRejectedValue({
+      error_code: 429,
+      description: 'Too Many Requests: retry after 1',
+    });
+    const { channel } = makeChannelWithEdit(editMessageText);
+    await expect(
+      channel.editMessage!('tg:1', '2', 'rate limited'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('re-throws other transport errors (so the caller can decide)', async () => {
+    const editMessageText = vi.fn().mockRejectedValue({
+      error_code: 400,
+      description: 'Bad Request: chat not found',
+    });
+    const { channel } = makeChannelWithEdit(editMessageText);
+    await expect(channel.editMessage!('tg:1', '2', 'x')).rejects.toMatchObject({
+      error_code: 400,
+      description: expect.stringMatching(/chat not found/),
+    });
+  });
+});
