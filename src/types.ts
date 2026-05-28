@@ -120,14 +120,25 @@ export interface Channel {
     opts?: SendMessageOptions,
   ): Promise<void>;
   // Optional: edit an already-sent message in place. Implemented by channels
-  // that support live updates (Telegram). Used by StreamingMessage to render
-  // token-level agent output as typing-style edits instead of one message
-  // per turn. Channels without this capability fall back to legacy
-  // sendMessage-only behavior — the orchestrator only constructs a
-  // StreamingMessage when `editMessage` is present.
+  // that support live updates (Telegram). Retained as a general capability;
+  // streaming no longer uses it (see sendMessageDraft).
   editMessage?(
     jid: string,
     messageId: string,
+    text: string,
+    opts?: SendMessageOptions,
+  ): Promise<void>;
+  // Optional: native streaming preview. Telegram's sendMessageDraft (Bot API
+  // 9.5) renders an ephemeral, animated "draft" bubble that updates in place
+  // as tokens arrive — the purpose-built streaming primitive, smoother than
+  // editMessage and with no edit rate-limit. `draftId` must be a stable
+  // non-zero integer for the whole turn (same id ⇒ animated update). The
+  // draft is a preview only; the orchestrator sends the real, persisted
+  // message via sendMessage once the turn completes. Private chats only.
+  // Channels without this capability skip live streaming (final message only).
+  sendMessageDraft?(
+    jid: string,
+    draftId: number,
     text: string,
     opts?: SendMessageOptions,
   ): Promise<void>;

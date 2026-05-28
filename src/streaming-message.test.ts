@@ -1,17 +1,24 @@
 /**
- * Behavior tests for the StreamingMessage class.
+ * Behavior tests for the StreamingMessage class (native-draft renderer).
  *
- * StreamingMessage debounces a stream of `append(chunk)` calls into a small
- * number of Telegram sendMessage/editMessage calls, hides `<internal>...`
- * blocks from the visible buffer (cross-chunk safe), and splits into a fresh
- * Telegram message when the running buffer would exceed the per-message cap.
+ * StreamingMessage throttles a stream of `append(chunk)` calls into a small
+ * number of `sendDraft(text)` pushes, where each push carries the WHOLE visible
+ * buffer so far (Telegram's sendMessageDraft replaces the bubble). It hides
+ * `<internal>...</internal>` blocks (cross-chunk safe) and clamps the preview to
+ * DRAFT_MAX_LEN. The draft is an ephemeral preview — `finish()` simply stops
+ * further updates; the real persisted message is sent separately by the
+ * orchestrator, so finish() neither flushes nor persists anything.
  *
- * The implementation uses real `setTimeout` so we drive it with
+ * The implementation uses real `setTimeout`/`Date.now`, so we drive it with
  * `vi.useFakeTimers()` and `vi.advanceTimersByTimeAsync`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { StreamingMessage, FLUSH_DEBOUNCE_MS } from './streaming-message.js';
+import {
+  StreamingMessage,
+  DRAFT_THROTTLE_MS,
+  DRAFT_MAX_LEN,
+} from './streaming-message.js';
 
 vi.mock('./logger.js', () => ({
   logger: {
@@ -22,17 +29,9 @@ vi.mock('./logger.js', () => ({
   },
 }));
 
-function makeDeps(
-  opts: {
-    sendImpl?: (text: string) => Promise<string | undefined>;
-    editImpl?: (id: string, text: string) => Promise<void>;
-  } = {},
-) {
-  const sendMessage = vi.fn(
-    opts.sendImpl ?? (async (_text: string) => 'msg-1'),
-  );
-  const editMessage = vi.fn(opts.editImpl ?? (async () => {}));
-  return { sendMessage, editMessage };
+function makeDeps(sendImpl?: (text: string) => Promise<void>) {
+  const sendDraft = vi.fn(sendImpl ?? (async (_text: string) => {}));
+  return { sendDraft };
 }
 
 describe('StreamingMessage', () => {
@@ -44,49 +43,47 @@ describe('StreamingMessage', () => {
     vi.useRealTimers();
   });
 
-  it('debounces a single append into one sendMessage call after the debounce window', async () => {
+  it('throttles a single append into one sendDraft after the throttle window', async () => {
     const deps = makeDeps();
     const sm = new StreamingMessage(deps);
 
     sm.append('Hello');
-    // Nothing fires synchronously.
-    expect(deps.sendMessage).not.toHaveBeenCalled();
+    // Nothing fires synchronously — the push is always scheduled on a timer.
+    expect(deps.sendDraft).not.toHaveBeenCalled();
 
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS);
 
-    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
-    expect(deps.sendMessage).toHaveBeenCalledWith('Hello');
-    expect(deps.editMessage).not.toHaveBeenCalled();
+    expect(deps.sendDraft).toHaveBeenCalledTimes(1);
+    expect(deps.sendDraft).toHaveBeenCalledWith('Hello');
   });
 
-  it('coalesces two appends inside the debounce window into a single flush', async () => {
+  it('coalesces appends inside the throttle window into a single push', async () => {
     const deps = makeDeps();
     const sm = new StreamingMessage(deps);
 
     sm.append('Hello ');
     sm.append('world');
-    expect(deps.sendMessage).not.toHaveBeenCalled();
+    expect(deps.sendDraft).not.toHaveBeenCalled();
 
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS);
 
-    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
-    expect(deps.sendMessage).toHaveBeenCalledWith('Hello world');
+    expect(deps.sendDraft).toHaveBeenCalledTimes(1);
+    expect(deps.sendDraft).toHaveBeenCalledWith('Hello world');
   });
 
-  it('subsequent flushes use editMessage with the returned messageId', async () => {
+  it('each push carries the full accumulated buffer (cumulative, not deltas)', async () => {
     const deps = makeDeps();
     const sm = new StreamingMessage(deps);
 
     sm.append('first');
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
-    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS);
+    expect(deps.sendDraft).toHaveBeenNthCalledWith(1, 'first');
 
     sm.append(' second');
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS);
 
-    expect(deps.editMessage).toHaveBeenCalledTimes(1);
-    expect(deps.editMessage).toHaveBeenCalledWith('msg-1', 'first second');
-    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
+    expect(deps.sendDraft).toHaveBeenCalledTimes(2);
+    expect(deps.sendDraft).toHaveBeenNthCalledWith(2, 'first second');
   });
 
   it('strips an <internal>...</internal> block inside a single chunk', async () => {
@@ -94,203 +91,119 @@ describe('StreamingMessage', () => {
     const sm = new StreamingMessage(deps);
 
     sm.append('before <internal>thinking</internal> after');
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS);
 
-    expect(deps.sendMessage).toHaveBeenCalledWith('before  after');
+    expect(deps.sendDraft).toHaveBeenCalledWith('before  after');
   });
 
   it('handles an <internal> block split across multiple chunks', async () => {
     const deps = makeDeps();
     const sm = new StreamingMessage(deps);
 
-    // First chunk opens the tag but does not close it. The buffer must NOT
-    // include the partial tag content yet — the visible text up to this point
-    // is just "visible ".
+    // First chunk opens the tag but does not close it. The visible text up to
+    // this point is just "visible ".
     sm.append('visible <internal>secret ');
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
-
-    // The first flush goes out with just the visible prefix.
-    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
-    expect(deps.sendMessage).toHaveBeenCalledWith('visible ');
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS);
+    expect(deps.sendDraft).toHaveBeenNthCalledWith(1, 'visible ');
 
     // Second chunk closes the tag and adds more visible text.
     sm.append('more secret</internal> after');
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS);
 
-    expect(deps.editMessage).toHaveBeenCalledTimes(1);
-    expect(deps.editMessage).toHaveBeenCalledWith('msg-1', 'visible  after');
+    expect(deps.sendDraft).toHaveBeenNthCalledWith(2, 'visible  after');
   });
 
-  it('overflow (> MAX_MESSAGE_LEN): splits into a new message, edit head + send tail', async () => {
-    // Generate text that crosses the 3500 cap on a single flush.
-    let sendIds = 0;
-    const deps = makeDeps({
-      sendImpl: async () => {
-        sendIds++;
-        return `msg-${sendIds}`;
-      },
-    });
-    const sm = new StreamingMessage(deps);
-
-    const big = 'A'.repeat(3000);
-    sm.append(big);
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
-    // First flush: under cap → single sendMessage.
-    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
-    expect(deps.sendMessage).toHaveBeenLastCalledWith('A'.repeat(3000));
-
-    // Next chunk pushes total over the cap.
-    sm.append('B'.repeat(1000));
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
-
-    // Head (first 3500) edited into msg-1, tail (remaining 500) sent as new.
-    expect(deps.editMessage).toHaveBeenCalledTimes(1);
-    const [editedId, editedText] = deps.editMessage.mock.calls[0];
-    expect(editedId).toBe('msg-1');
-    expect(editedText.length).toBe(3500);
-    expect(editedText).toBe('A'.repeat(3000) + 'B'.repeat(500));
-
-    // Tail goes out as a fresh sendMessage with the remaining 500 Bs.
-    expect(deps.sendMessage).toHaveBeenCalledTimes(2);
-    expect(deps.sendMessage).toHaveBeenLastCalledWith('B'.repeat(500));
-  });
-
-  it('swallows "message is not modified" errors silently', async () => {
-    const deps = makeDeps({
-      editImpl: async () => {
-        const err = new Error(
-          'Bad Request: message is not modified: specified new message content',
-        );
-        throw err;
-      },
-    });
-    const sm = new StreamingMessage(deps);
-
-    sm.append('first');
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
-    // Re-send identical content — edit will throw the benign error.
-    sm.append('');
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
-
-    // No throw bubbled up — the test just survives.
-    // (No assertion on logger.error: the contract is that the benign case is
-    // swallowed at warn or below, not error.)
-    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
-  });
-
-  it('finish() forces the remaining buffer to flush even if the debounce timer has not fired', async () => {
+  it('defers a chunk that ends on a partial tag prefix until the next append', async () => {
     const deps = makeDeps();
     const sm = new StreamingMessage(deps);
 
-    sm.append('immediate');
-    // Don't advance timers — the debounce window has NOT elapsed.
-    expect(deps.sendMessage).not.toHaveBeenCalled();
+    // Trailing "<" is a prefix of "<internal>" → deferred, not yet visible.
+    sm.append('compare a <');
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS);
+    expect(deps.sendDraft).toHaveBeenNthCalledWith(1, 'compare a ');
 
-    await sm.finish();
-
-    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
-    expect(deps.sendMessage).toHaveBeenCalledWith('immediate');
+    // Next chunk resolves it to literal text — the "<" surfaces now.
+    sm.append('b');
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS);
+    expect(deps.sendDraft).toHaveBeenNthCalledWith(2, 'compare a <b');
   });
 
-  it('finish() is idempotent — second call is a no-op', async () => {
+  it('clamps the preview to DRAFT_MAX_LEN characters', async () => {
     const deps = makeDeps();
     const sm = new StreamingMessage(deps);
 
-    sm.append('x');
-    await sm.finish();
-    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
+    sm.append('A'.repeat(DRAFT_MAX_LEN + 1000));
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS);
 
-    await sm.finish();
-    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
+    expect(deps.sendDraft).toHaveBeenCalledTimes(1);
+    const sent = deps.sendDraft.mock.calls[0][0];
+    expect(sent.length).toBe(DRAFT_MAX_LEN);
+    expect(sent).toBe('A'.repeat(DRAFT_MAX_LEN));
   });
 
-  it('after finish(), additional append() calls do not trigger further sends', async () => {
-    const deps = makeDeps();
-    const sm = new StreamingMessage(deps);
-
-    sm.append('first');
-    await sm.finish();
-    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
-
-    sm.append('second');
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS * 3);
-    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
-    expect(deps.editMessage).not.toHaveBeenCalled();
-  });
-
-  it('hasSent reflects whether sendMessage produced an id yet', async () => {
-    const deps = makeDeps();
-    const sm = new StreamingMessage(deps);
-
-    expect(sm.hasSent).toBe(false);
-    sm.append('x');
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
-    expect(sm.hasSent).toBe(true);
-  });
-
-  it('does not flush when the visible buffer is empty (e.g. only <internal> content)', async () => {
+  it('does not push when the visible buffer is empty (only <internal> content)', async () => {
     const deps = makeDeps();
     const sm = new StreamingMessage(deps);
 
     sm.append('<internal>only thinking</internal>');
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS * 2);
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS * 2);
 
-    expect(deps.sendMessage).not.toHaveBeenCalled();
-    expect(deps.editMessage).not.toHaveBeenCalled();
-    expect(sm.hasSent).toBe(false);
+    expect(deps.sendDraft).not.toHaveBeenCalled();
   });
 
-  // Bug-A regression: a reply whose final tokens end on a tag-prefix (`<`,
-  // `</`, `<i`…) used to leave those chars stranded in pendingPrefix, lost
-  // forever because finish() only flushed `buffer`.
-  it('flushes trailing pendingPrefix that turned out to be literal text (ends in "<")', async () => {
+  it('finish() before the throttle fires cancels the pending push (draft is ephemeral)', async () => {
     const deps = makeDeps();
     const sm = new StreamingMessage(deps);
 
-    // Last char "<" is a prefix of "<internal>" → deferred to pendingPrefix.
-    sm.append('compare a <');
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
-    // First flush sends only the un-deferred part.
-    expect(deps.sendMessage).toHaveBeenCalledWith('compare a ');
+    sm.append('immediate');
+    // Don't advance — the throttle window has NOT elapsed.
+    expect(deps.sendDraft).not.toHaveBeenCalled();
 
-    await sm.finish();
-    // finish() must reconcile the deferred "<" into the final text.
-    expect(deps.editMessage).toHaveBeenLastCalledWith('msg-1', 'compare a <');
+    sm.finish();
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS * 2);
+
+    // No push: the real message is sent by the orchestrator, not the draft.
+    expect(deps.sendDraft).not.toHaveBeenCalled();
   });
 
-  it('drops trailing pendingPrefix when the stream ends inside an unclosed <internal>', async () => {
+  it('after finish(), additional append() calls do not trigger further pushes', async () => {
     const deps = makeDeps();
     const sm = new StreamingMessage(deps);
 
-    // Open internal, then end mid-close-tag. Nothing visible should survive.
-    sm.append('hi <internal>secret</intern');
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
-    await sm.finish();
+    sm.append('first');
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS);
+    expect(deps.sendDraft).toHaveBeenCalledTimes(1);
 
-    // Only "hi " is visible; the unclosed-internal tail is dropped.
-    const allText = [
-      ...deps.sendMessage.mock.calls.map((c) => c[0]),
-      ...deps.editMessage.mock.calls.map((c) => c[1]),
-    ].join('|');
-    expect(allText).not.toContain('secret');
-    expect(allText).not.toContain('</intern');
-    expect(deps.sendMessage).toHaveBeenCalledWith('hi ');
+    sm.finish();
+    sm.append('second');
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS * 3);
+
+    expect(deps.sendDraft).toHaveBeenCalledTimes(1);
   });
 
-  // Bug-D regression: when the send fails (messageId never assigned), finish()
-  // must still persist the full text so the agent's own history isn't lost.
-  it('persistFinal runs with undefined messageId when the send failed', async () => {
-    const finalizeStore = vi.fn();
-    const sm = new StreamingMessage({
-      sendMessage: async () => undefined, // simulate send failure (no id)
-      editMessage: async () => {},
-      finalizeStore,
+  it('finish() is idempotent — a second call is a no-op and does not throw', async () => {
+    const deps = makeDeps();
+    const sm = new StreamingMessage(deps);
+
+    sm.append('x');
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS);
+    expect(deps.sendDraft).toHaveBeenCalledTimes(1);
+
+    sm.finish();
+    sm.finish();
+    expect(deps.sendDraft).toHaveBeenCalledTimes(1);
+  });
+
+  it('swallows a rejected sendDraft so it never escapes append/flush', async () => {
+    const deps = makeDeps(async () => {
+      throw new Error('Bad Request: draft expired');
     });
+    const sm = new StreamingMessage(deps);
 
-    sm.append('the whole reply');
-    await vi.advanceTimersByTimeAsync(FLUSH_DEBOUNCE_MS);
-    await sm.finish();
+    sm.append('boom');
+    // Must not throw / reject out of the throttled flush.
+    await vi.advanceTimersByTimeAsync(DRAFT_THROTTLE_MS);
 
-    expect(finalizeStore).toHaveBeenCalledWith(undefined, 'the whole reply');
+    expect(deps.sendDraft).toHaveBeenCalledTimes(1);
   });
 });

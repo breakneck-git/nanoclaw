@@ -1,84 +1,65 @@
 /**
- * StreamingMessage — Telegram-side renderer for the container's token-level
- * stream. Hides the messy details from the orchestrator: it owns one
- * Telegram message at a time, debounces edits to stay under Telegram's
- * ~1 edit/sec/chat rate limit, hides `<internal>...</internal>` blocks
- * from the visible text (cross-chunk safe), and splits into a fresh
- * message when the running buffer would exceed the per-message cap.
+ * StreamingMessage — renders the container's token-level stream as a native
+ * Telegram "draft" (sendMessageDraft, Bot API 9.5). The draft is an ephemeral,
+ * animated preview bubble that updates in place as tokens arrive — the
+ * purpose-built streaming primitive (smooth, no edit rate-limit, native
+ * rendering, shows inside forum topics).
+ *
+ * Division of labour:
+ *   - This class drives the LIVE PREVIEW only. It accumulates partial chunks,
+ *     hides `<internal>...</internal>` reasoning (cross-chunk safe), and pushes
+ *     the running text to the draft on a light throttle.
+ *   - The orchestrator (src/index.ts) sends the REAL, PERSISTED message via
+ *     routeOutbound when the turn's result event fires. The draft is a preview
+ *     and is never stored — the real message supersedes it (and Telegram
+ *     auto-expires an un-finalized draft after ~30s).
  *
  * Contract:
- *   - `append(chunk)` adds raw text from the SDK stream. It is non-blocking
- *     and never throws. Multiple appends inside the debounce window
- *     coalesce into a single edit.
- *   - `finish()` forces the final flush and seals the instance. After
- *     finish(), additional appends are silently ignored. Idempotent.
- *   - `hasSent` is true once `sendMessage` has produced a messageId.
- *     The orchestrator uses it to suppress the result-event delivery
- *     (no need to re-send what the user already saw).
+ *   - `append(chunk)` is non-blocking, never throws, coalesces bursts.
+ *   - `finish()` stops further draft updates and seals the instance. After
+ *     finish(), appends are ignored. Idempotent.
  */
 import { logger } from './logger.js';
 
-export const FLUSH_DEBOUNCE_MS = 1200; // Telegram bot: ~1 edit/sec/chat is safe
-export const MAX_MESSAGE_LEN = 3500; // headroom under Telegram's 4096 cap
+// Native drafts have no documented edit rate-limit, but pushing on every token
+// (hundreds/sec) is wasteful. A small throttle batches bursts while staying
+// far smoother than the old 1.2s editMessage debounce.
+export const DRAFT_THROTTLE_MS = 350;
+// Telegram caps sendMessageDraft text at 4096 chars. The live preview clamps to
+// this; the final persisted message (sent by the orchestrator) carries the full
+// text and is split across messages by the channel as needed.
+export const DRAFT_MAX_LEN = 4096;
 
 const INTERNAL_OPEN = '<internal>';
 const INTERNAL_CLOSE = '</internal>';
 
 export interface StreamingMessageDeps {
-  /** Send a fresh outbound message. Returns the channel-side messageId when known. */
-  sendMessage: (text: string) => Promise<string | undefined>;
-  /** Edit an existing outbound message. */
-  editMessage: (messageId: string, text: string) => Promise<void>;
-  /**
-   * Persist the FINAL full text of a sealed message to the DB, keyed by its
-   * channel messageId (INSERT OR REPLACE on the existing row). Edits go
-   * straight to the channel and bypass the SEND/STORE chokepoint, so without
-   * this the stored copy of a long, multi-flush reply would be frozen at its
-   * first partial chunk — truncating the bot's own history in lookup_messages
-   * and context rebuilds. Called once per sealed segment (the head when an
-   * overflow split happens, and the tail/whole on finish()). Optional:
-   * channels that don't need history fidelity can omit it.
-   *
-   * messageId may be undefined when the send itself failed (network blip,
-   * bot kicked) — the store impl should synthesize an id so the agent's own
-   * history still records the full reply even if Telegram never displayed it.
-   */
-  finalizeStore?: (
-    messageId: string | undefined,
-    fullText: string,
-  ) => void | Promise<void>;
+  /** Push the current visible text to the live draft bubble. Never throws. */
+  sendDraft: (text: string) => Promise<void>;
 }
 
 export class StreamingMessage {
-  // Visible text accumulated so far for the CURRENT outbound message. Each
-  // flush sends or edits with this entire value (Telegram editMessageText
-  // replaces the body, it doesn't append).
+  // Visible text accumulated so far (internal blocks already stripped). Each
+  // draft update sends this whole value — sendMessageDraft replaces the bubble.
   private buffer = '';
-  // Tracks state across chunks so a `<internal>` opened in chunk N closes
-  // correctly when `</internal>` arrives in chunk N+1.
+  // Cross-chunk `<internal>` state: a tag opened in chunk N closes when
+  // `</internal>` arrives in chunk N+1.
   private insideInternal = false;
-  // When a chunk ends with what could be the start of an `<internal>` or
-  // `</internal>` tag (e.g. `<inte`), we defer those chars until the next
-  // chunk so we don't accidentally treat a partial tag as visible text.
+  // Bytes deferred because they could be the start of a tag (e.g. `<inte`).
   private pendingPrefix = '';
 
-  private messageId: string | undefined = undefined;
-  private flushTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastFlushAt = 0;
-  // Serialises send/edit calls — Telegram complains if two edits race the
-  // same messageId and `.then(...)` chaining is the simplest serialiser.
-  private pendingFlush: Promise<void> = Promise.resolve();
+  private throttleTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastSentAt = 0;
+  // True when `buffer` changed since the last draft push.
+  private dirty = false;
   private closed = false;
 
   constructor(private deps: StreamingMessageDeps) {}
 
   /**
-   * Append a raw text chunk from the SDK stream. Non-blocking. Schedules a
-   * debounced flush — multiple appends inside FLUSH_DEBOUNCE_MS coalesce.
-   *
-   * Strips `<internal>...</internal>` blocks (the agent uses them for
-   * inner reasoning the user should not see). Cross-chunk safe via
-   * `pendingPrefix`.
+   * Append a raw text chunk from the SDK stream. Non-blocking. Strips
+   * `<internal>...</internal>` (the agent's hidden reasoning), cross-chunk
+   * safe, then schedules a throttled draft update.
    */
   append(chunk: string): void {
     if (this.closed) return;
@@ -100,7 +81,6 @@ export class StreamingMessage {
         i += INTERNAL_CLOSE.length;
         continue;
       }
-      // Could the remaining slice be a partial tag we shouldn't commit yet?
       const remaining = combined.length - i;
       if (remaining < tagLen) {
         const slice = combined.slice(i);
@@ -114,165 +94,53 @@ export class StreamingMessage {
       i++;
     }
 
-    this.buffer += newVisible;
     this.pendingPrefix = combined.slice(i);
     this.insideInternal = inside;
-    this.scheduleFlush();
+    if (newVisible) {
+      this.buffer += newVisible;
+      this.dirty = true;
+      this.scheduleDraft();
+    }
   }
 
-  private scheduleFlush(): void {
-    if (this.flushTimer) return;
-    if (this.closed) return;
-    const elapsed = Date.now() - this.lastFlushAt;
-    const delay = Math.max(0, FLUSH_DEBOUNCE_MS - elapsed);
-    this.flushTimer = setTimeout(() => {
-      this.flushTimer = null;
-      // Serialise: chain onto the previous flush so two flushes can never
-      // race. Errors are caught inside flush() — but defensively swallow
-      // here too so a rejected pendingFlush can't poison future appends.
-      this.pendingFlush = this.pendingFlush
-        .then(() => this.flush())
-        .catch((err) => {
-          logger.warn(
-            { err: String(err) },
-            'StreamingMessage: pendingFlush rejected',
-          );
-        });
+  private scheduleDraft(): void {
+    if (this.throttleTimer || this.closed || !this.dirty) return;
+    const elapsed = Date.now() - this.lastSentAt;
+    const delay = Math.max(0, DRAFT_THROTTLE_MS - elapsed);
+    this.throttleTimer = setTimeout(() => {
+      this.throttleTimer = null;
+      void this.flushDraft();
     }, delay);
   }
 
-  private async flush(): Promise<void> {
-    if (this.buffer.length === 0) return;
-    this.lastFlushAt = Date.now();
-    const text = this.buffer;
-
-    if (text.length > MAX_MESSAGE_LEN) {
-      await this.flushOverflow(text);
-      return;
-    }
-
+  private async flushDraft(): Promise<void> {
+    if (this.closed || !this.dirty || this.buffer.length === 0) return;
+    this.dirty = false;
+    this.lastSentAt = Date.now();
+    const text = this.buffer.slice(0, DRAFT_MAX_LEN);
     try {
-      if (this.messageId) {
-        await this.deps.editMessage(this.messageId, text);
-      } else {
-        this.messageId = await this.deps.sendMessage(text);
-      }
+      await this.deps.sendDraft(text);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      // Benign: editing with the same content. Telegram throws but it's a
-      // no-op for our purposes — the message body is already what we want.
-      if (/message is not modified/i.test(msg)) return;
-      logger.warn({ err: msg }, 'StreamingMessage: flush failed');
-    }
-  }
-
-  /**
-   * Overflow path — edit the current message with the first MAX chars, then
-   * open a brand-new Telegram message for the rest. The instance's "current
-   * message" pointer moves to the tail; future appends extend it.
-   *
-   * `insideInternal` and `pendingPrefix` are intentionally NOT reset — they
-   * reflect the parser state going forward, which is independent of which
-   * Telegram message we're rendering into.
-   */
-  private async flushOverflow(text: string): Promise<void> {
-    const head = text.slice(0, MAX_MESSAGE_LEN);
-    const tail = text.slice(MAX_MESSAGE_LEN);
-
-    // Seal the old message with the head.
-    try {
-      if (this.messageId) {
-        await this.deps.editMessage(this.messageId, head);
-      } else {
-        this.messageId = await this.deps.sendMessage(head);
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!/message is not modified/i.test(msg)) {
-        logger.warn({ err: msg }, 'StreamingMessage: head flush failed');
-      }
-    }
-
-    // Persist the sealed head's final content to the DB (edits bypassed the
-    // store chokepoint). This segment is now frozen — no more edits to it.
-    if (this.messageId) {
-      await this.persistFinal(this.messageId, head);
-    }
-
-    // Open a fresh message for the tail. Reset the buffer to tail so future
-    // edits target the new message body.
-    this.buffer = tail;
-    this.messageId = undefined;
-    try {
-      this.messageId = await this.deps.sendMessage(tail);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn({ err: msg }, 'StreamingMessage: tail send failed');
-    }
-  }
-
-  /**
-   * Force the final flush and seal the instance. Idempotent. After this,
-   * additional `append()` calls are silently ignored.
-   *
-   * Awaits any in-flight pendingFlush, then forces one more flush of the
-   * remaining buffer (defends against the case where `append()` arrived
-   * inside the debounce window but `finish()` is called before the timer
-   * fires).
-   */
-  async finish(): Promise<void> {
-    if (this.closed) return;
-    if (this.flushTimer) {
-      clearTimeout(this.flushTimer);
-      this.flushTimer = null;
-    }
-    // Drain anything already queued.
-    await this.pendingFlush;
-    // Bug-A fix: reconcile any deferred partial-tag chars. `append()` holds
-    // back trailing bytes that COULD be the start of `<internal>`/`</internal>`
-    // (e.g. a reply ending in `<` or `</`). At end-of-stream no more input can
-    // complete a tag, so those bytes are now decided: if we're not inside an
-    // internal block they're literal visible text and must be shown; if we ARE
-    // inside an (unclosed) internal block they're hidden content → drop.
-    if (this.pendingPrefix && !this.insideInternal) {
-      this.buffer += this.pendingPrefix;
-    }
-    this.pendingPrefix = '';
-    // If the buffer still has unflushed content (likely — the debounce timer
-    // never fired), force one final flush.
-    if (this.buffer.length > 0) {
-      // Don't go through scheduleFlush — we want to await this one.
-      await this.flush();
-    }
-    // Persist the final full text of the current (last) message so the DB
-    // copy matches what the user sees, not the first partial chunk.
-    // Bug-D fix: persist even when messageId is undefined (the send failed) —
-    // storeOutboundMessage synthesizes an id, so the agent's history keeps the
-    // full reply rather than silently losing the tail on a transient failure.
-    if (this.buffer.length > 0) {
-      await this.persistFinal(this.messageId, this.buffer);
-    }
-    this.closed = true;
-  }
-
-  /** Re-store a sealed segment's full text. Never throws. */
-  private async persistFinal(
-    messageId: string | undefined,
-    fullText: string,
-  ): Promise<void> {
-    if (!this.deps.finalizeStore) return;
-    try {
-      await this.deps.finalizeStore(messageId, fullText);
-    } catch (err) {
-      logger.warn(
+      // deps.sendDraft is expected to swallow its own errors; this is a
+      // belt-and-suspenders guard so a rejected promise never escapes.
+      logger.debug(
         { err: String(err) },
-        'StreamingMessage: finalizeStore failed (history copy may be stale)',
+        'StreamingMessage: sendDraft rejected',
       );
     }
   }
 
-  /** Whether anything was actually sent. Used to suppress the result-event delivery. */
-  get hasSent(): boolean {
-    return this.messageId !== undefined;
+  /**
+   * Stop further draft updates and seal the instance. Idempotent. We do NOT
+   * push a final draft or persist anything — the orchestrator sends the real
+   * message via routeOutbound right after this, which supersedes the draft.
+   */
+  finish(): void {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.throttleTimer) {
+      clearTimeout(this.throttleTimer);
+      this.throttleTimer = null;
+    }
   }
 }

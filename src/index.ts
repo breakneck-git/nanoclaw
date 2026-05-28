@@ -45,7 +45,6 @@ import {
   setSession,
   storeChatMetadata,
   storeMessage,
-  storeOutboundMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
@@ -97,6 +96,17 @@ let messageLoopRunning = false;
 // wrote. In-memory only — restored implicitly when the next inbound message
 // arrives. Channels that don't use threads keep the entry undefined.
 const lastThreadId: Record<string, string | undefined> = {};
+
+// Monotonic, non-zero draft-id allocator for native streaming previews
+// (Telegram sendMessageDraft, Bot API 9.5). Each agent TURN gets a fresh id:
+// the same id across a turn's throttled updates makes Telegram animate the
+// draft in place, while a new turn starts a fresh draft bubble. Wraps within
+// int32 range so it stays a valid Telegram integer over a long-lived process.
+let draftIdCounter = 0;
+function nextDraftId(): number {
+  draftIdCounter = (draftIdCounter % 2_000_000_000) + 1;
+  return draftIdCounter;
+}
 
 // Per-chat typing-indicator keepalive. Telegram drops the "typing" action
 // after ~5s, so we re-ping every 4s — but ONLY while the agent is actively
@@ -308,67 +318,40 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   startChatTyping(chatJid);
   let hadError = false;
   let outputSentToUser = false;
-  // Tracks failed outbound delivery from inside the streaming callback.
-  // Without this, channel.sendMessage throwing (per M7) is swallowed by
-  // outputChain.catch in container-runner and the message-loop cursor
-  // would advance as if the user got the reply — losing it permanently.
+  // Tracks failed outbound delivery of the real message in the result
+  // callback. Without this, routeOutbound throwing (per M7) is swallowed by
+  // outputChain.catch in container-runner and the message-loop cursor would
+  // advance as if the user got the reply — losing it permanently.
   let streamingSendFailed = false;
 
-  // Token-level streaming state. Only enabled when the channel exposes
-  // `editMessage` (Telegram today). Other channels fall through to the
-  // legacy one-message-per-turn path via `onOutput`. A fresh
-  // StreamingMessage is created lazily on the FIRST partial chunk after
-  // each result event, so multi-turn agent conversations get one streamed
-  // Telegram message per turn instead of one giant continuously-edited
-  // message that mixes turns together.
-  const supportsStreaming = typeof channel.editMessage === 'function';
+  // Token-level streaming via Telegram's native sendMessageDraft (Bot API
+  // 9.5): an ephemeral, animated "draft" bubble that updates in place as the
+  // agent emits tokens — the purpose-built streaming primitive (smooth, no
+  // edit rate-limit, renders inside forum topics). Only enabled when the
+  // channel exposes `sendMessageDraft` (Telegram private chats today). Other
+  // channels fall through to the one-message-per-turn path via `onOutput`.
+  //
+  // A fresh StreamingMessage (with a fresh non-zero draft id) is created
+  // lazily on the FIRST partial chunk after each result event, so multi-turn
+  // agent conversations animate one draft per turn. The draft is a PREVIEW
+  // ONLY and is never persisted — the orchestrator always sends the real,
+  // stored message via routeOutbound when the result event fires, which
+  // supersedes the draft (Telegram also auto-expires an un-finalized draft
+  // after ~30s).
+  const supportsStreaming = typeof channel.sendMessageDraft === 'function';
   let streaming: StreamingMessage | undefined;
   const ensureStreaming = (): StreamingMessage => {
     if (streaming) return streaming;
+    const draftId = nextDraftId();
     streaming = new StreamingMessage({
-      sendMessage: async (text) => {
-        try {
-          const res = await routeOutbound(channels, chatJid, text, {
-            threadId: lastThreadId[chatJid],
-          });
-          outputSentToUser = true;
-          return res && typeof res === 'object' && 'messageId' in res
-            ? res.messageId
-            : undefined;
-        } catch (err) {
-          logger.error(
-            { chatJid, err },
-            'StreamingMessage send via routeOutbound failed',
-          );
-          streamingSendFailed = true;
-          // Swallow — StreamingMessage's flush handler already logs and
-          // moves on; rethrowing would leave its pendingFlush rejected
-          // forever and wedge subsequent appends. The outer
-          // streamingSendFailed flag will trigger cursor rollback so the
-          // user's prompt isn't silently lost.
-          return undefined;
-        }
-      },
-      editMessage: async (messageId, text) => {
-        if (!channel.editMessage) return;
-        await channel.editMessage(chatJid, messageId, text, {
+      sendDraft: async (text) => {
+        // Best-effort: the channel method swallows its own errors (a draft is
+        // a disposable preview), so a failed draft never blocks the turn or
+        // the real message that follows.
+        if (!channel.sendMessageDraft) return;
+        await channel.sendMessageDraft(chatJid, draftId, text, {
           threadId: lastThreadId[chatJid],
         });
-      },
-      finalizeStore: (messageId, fullText) => {
-        // Rewrite the DB row for this sealed message with its final full
-        // text. The first flush stored a partial via routeOutbound's
-        // SEND/STORE chokepoint; edits bypassed it. INSERT OR REPLACE on
-        // (id, chat_jid) updates that same row so lookup_messages and
-        // context rebuilds see the complete reply, not the first chunk.
-        // messageId may be undefined when the send failed — storeOutboundMessage
-        // synthesizes an `out-…` id so the reply still lands in history.
-        storeOutboundMessage(
-          chatJid,
-          fullText,
-          messageId,
-          channel.botSenderId?.(),
-        );
       },
     });
     return streaming;
@@ -381,28 +364,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     async (result) => {
       // Result-event callback. Fires at the end of each agent turn.
       //
-      // If StreamingMessage delivered text via live edits, finalize it and
-      // SKIP the legacy routeOutbound send — the user already saw the
-      // body. Otherwise (no partials → legacy fallback, or streaming
-      // failed mid-flight), send the full result text via routeOutbound.
-      // CRITICAL: capture liveStreamed AFTER finish(), not before. finish()
-      // force-flushes a debounce-pending buffer — on a fast turn (completes
-      // within FLUSH_DEBOUNCE_MS of the last token) the flush timer has NOT
-      // fired yet, so hasSent is false until finish() actually sends. Reading
-      // hasSent before finish() would see false, then finish() sends the
-      // message, then the legacy routeOutbound below ALSO sends it → the user
-      // gets the reply twice. Capturing after finish() reflects the real send.
-      let liveStreamed = false;
+      // Seal the live draft preview (if any), then ALWAYS send the real,
+      // persisted message via routeOutbound. The draft was ephemeral and was
+      // never stored — the real message supersedes it. finish() is synchronous:
+      // it just stops the throttle timer and ignores any later appends.
       if (streaming) {
-        try {
-          await streaming.finish();
-        } catch (err) {
-          logger.warn(
-            { chatJid, err },
-            'StreamingMessage finish() failed; falling back to result send',
-          );
-        }
-        liveStreamed = streaming.hasSent === true;
+        streaming.finish();
         streaming = undefined;
       }
 
@@ -414,10 +381,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
         const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
         logger.info(
-          { group: group.name, liveStreamed },
+          { group: group.name },
           `Agent output: ${raw.length} chars`,
         );
-        if (text && !liveStreamed) {
+        if (text) {
           try {
             await routeOutbound(channels, chatJid, text, {
               threadId: lastThreadId[chatJid],
@@ -426,7 +393,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           } catch (err) {
             logger.error(
               { chatJid, err },
-              'Failed to deliver streamed agent output',
+              'Failed to deliver agent output',
             );
             streamingSendFailed = true;
           }
@@ -462,15 +429,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   );
 
   // Drain any in-flight streaming state. Defensive: the result-event
-  // callback above normally finalizes it, but a container that exits
-  // without emitting a final result block (timeout edge cases) would
-  // leave a half-flushed StreamingMessage behind.
+  // callback above normally seals it, but a container that exits without
+  // emitting a final result block (timeout edge cases) would leave a live
+  // draft behind. finish() is synchronous — it just stops the throttle timer.
   if (streaming) {
-    try {
-      await streaming.finish();
-    } catch (err) {
-      logger.warn({ chatJid, err }, 'Drain streaming.finish() failed');
-    }
+    streaming.finish();
     streaming = undefined;
   }
 

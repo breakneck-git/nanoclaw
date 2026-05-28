@@ -1277,6 +1277,44 @@ export class TelegramChannel implements Channel {
     }
   }
 
+  /**
+   * Native streaming preview via Telegram's sendMessageDraft (Bot API 9.5).
+   * Renders an ephemeral, animated draft bubble that updates in place as the
+   * agent generates tokens. Same `draftId` across calls ⇒ Telegram animates
+   * the change. Private chats only; the API caps text at 4096 chars. The
+   * draft is a preview — the orchestrator sends the real persisted message
+   * via sendMessage when the turn finishes. Never throws (best-effort): on a
+   * non-private chat or any API error we swallow and the final message still
+   * lands.
+   */
+  async sendMessageDraft(
+    jid: string,
+    draftId: number,
+    text: string,
+    opts?: { threadId?: string },
+  ): Promise<void> {
+    if (!this.bot) return;
+    const numericChatId = parseInt(jid.replace(/^tg:/, ''), 10);
+    if (isNaN(numericChatId)) return;
+    if (text.length === 0) return; // API requires 1-4096 chars
+    const threadId = opts?.threadId ? parseInt(opts.threadId, 10) : undefined;
+    try {
+      await this.bot.api.sendMessageDraft(
+        numericChatId,
+        draftId,
+        text.slice(0, 4096),
+        threadId !== undefined && !isNaN(threadId)
+          ? { message_thread_id: threadId }
+          : undefined,
+      );
+    } catch (err) {
+      logger.debug(
+        { jid, draftId, err: err instanceof Error ? err.message : String(err) },
+        'sendMessageDraft failed (non-private chat or transient); ignoring',
+      );
+    }
+  }
+
   async setTyping(
     jid: string,
     isTyping: boolean,
