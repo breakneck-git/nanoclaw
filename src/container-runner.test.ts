@@ -878,7 +878,13 @@ describe('buildContainerArgs AGENT_MODEL injection', () => {
 
   it('emits -e AGENT_MODEL from the global env var (non-main)', () => {
     process.env.AGENT_MODEL = 'claude-opus-4-8';
-    const { args } = buildContainerArgs([], 'nc-dana', false, {}, 'telegram_dana');
+    const { args } = buildContainerArgs(
+      [],
+      'nc-dana',
+      false,
+      {},
+      'telegram_dana',
+    );
     expect(modelArg(args)).toBe('AGENT_MODEL=claude-opus-4-8');
   });
 
@@ -897,7 +903,13 @@ describe('buildContainerArgs AGENT_MODEL injection', () => {
         String(p) === perGroupEnvPath ? 'AGENT_MODEL=claude-opus-4-8\n' : '',
     );
 
-    const { args } = buildContainerArgs([], 'nc-dana', false, {}, 'telegram_dana');
+    const { args } = buildContainerArgs(
+      [],
+      'nc-dana',
+      false,
+      {},
+      'telegram_dana',
+    );
     expect(modelArg(args)).toBe('AGENT_MODEL=claude-opus-4-8');
   });
 
@@ -916,12 +928,24 @@ describe('buildContainerArgs AGENT_MODEL injection', () => {
         String(p) === perGroupEnvPath ? 'AGENT_MODEL=claude-opus-4-8\n' : '',
     );
 
-    const { args } = buildContainerArgs([], 'nc-main', true, {}, 'telegram_main');
+    const { args } = buildContainerArgs(
+      [],
+      'nc-main',
+      true,
+      {},
+      'telegram_main',
+    );
     expect(modelArg(args)).toBe('AGENT_MODEL=claude-opus-4-8');
   });
 
   it('emits no AGENT_MODEL arg when unset everywhere (container default applies)', () => {
-    const { args } = buildContainerArgs([], 'nc-dana', false, {}, 'telegram_dana');
+    const { args } = buildContainerArgs(
+      [],
+      'nc-dana',
+      false,
+      {},
+      'telegram_dana',
+    );
     expect(modelArg(args)).toBeUndefined();
   });
 });
