@@ -24,6 +24,16 @@ import { safeTruncate } from './safe-truncate.js';
 import { filterAllowedToolPatterns, filterMcpServers } from './mcp-whitelist.js';
 import { extractPartialTextChunk } from './streaming-partial.js';
 
+// Agent model. The host's container-runner injects AGENT_MODEL (from the
+// global .env / OneCLI secrets, or a per-group data/env/<folder>.env override)
+// when set; otherwise we fall back to the default below. Defaulting to the
+// current Sonnet keeps everyday turns fast and cheap for a personal assistant;
+// set AGENT_MODEL=claude-opus-4-8 (or any valid model id) — globally or per
+// group — to override. Changing the env value needs only a NanoClaw restart,
+// not a container image rebuild (process.env is read at runtime here).
+const DEFAULT_AGENT_MODEL = 'claude-sonnet-4-6';
+const AGENT_MODEL = process.env.AGENT_MODEL?.trim() || DEFAULT_AGENT_MODEL;
+
 interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -447,7 +457,7 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
-      model: 'claude-opus-4-7',
+      model: AGENT_MODEL,
       cwd: '/workspace/group',
       // Emit SDKPartialAssistantMessage events as the agent's text streams in.
       // The for-await loop below forwards `text_delta` fragments to the host

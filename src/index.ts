@@ -380,10 +380,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             : JSON.stringify(result.result);
         // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
         const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-        logger.info(
-          { group: group.name },
-          `Agent output: ${raw.length} chars`,
-        );
+        logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
         if (text) {
           try {
             await routeOutbound(channels, chatJid, text, {
@@ -391,10 +388,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             });
             outputSentToUser = true;
           } catch (err) {
-            logger.error(
-              { chatJid, err },
-              'Failed to deliver agent output',
-            );
+            logger.error({ chatJid, err }, 'Failed to deliver agent output');
             streamingSendFailed = true;
           }
         }

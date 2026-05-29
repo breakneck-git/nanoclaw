@@ -31,7 +31,11 @@ import { readEnvFile, readPerGroupEnvFile } from './env.js';
 import { refreshGoogleTokens } from './google-token-refresh.js';
 import { validateAdditionalMounts } from './mount-security.js';
 
-const secretsEnv = readEnvFile(['NOTION_API_KEY', 'GOOGLE_MAPS_API_KEY']);
+const secretsEnv = readEnvFile([
+  'NOTION_API_KEY',
+  'GOOGLE_MAPS_API_KEY',
+  'AGENT_MODEL',
+]);
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
@@ -476,15 +480,35 @@ export function buildContainerArgs(
   // group always uses global values only — per-group overrides are an
   // isolation feature for restricted users (e.g. Dana) who must use THEIR
   // OWN Notion / Maps keys, not the operator's.
+  // Per-group env file (operator-controlled, host-side; users can't write it).
+  // Read once and reused for credential overrides (non-main only — isolation)
+  // and the agent-model override (all groups — see below).
+  const perGroupEnv: Record<string, string> = groupFolder
+    ? readPerGroupEnvFile(groupFolder)
+    : {};
+
   let notionKey = process.env.NOTION_API_KEY || secretsEnv.NOTION_API_KEY;
   let googleMapsKey =
     process.env.GOOGLE_MAPS_API_KEY || secretsEnv.GOOGLE_MAPS_API_KEY;
   if (!isMain && groupFolder) {
-    const perGroup = readPerGroupEnvFile(groupFolder);
-    if (perGroup.NOTION_API_KEY) notionKey = perGroup.NOTION_API_KEY;
-    if (perGroup.GOOGLE_MAPS_API_KEY)
-      googleMapsKey = perGroup.GOOGLE_MAPS_API_KEY;
+    if (perGroupEnv.NOTION_API_KEY) notionKey = perGroupEnv.NOTION_API_KEY;
+    if (perGroupEnv.GOOGLE_MAPS_API_KEY)
+      googleMapsKey = perGroupEnv.GOOGLE_MAPS_API_KEY;
   }
+
+  // Agent model. The default lives in the container (agent-runner). The
+  // operator can override it GLOBALLY via AGENT_MODEL (host .env / OneCLI
+  // secrets) and PER-GROUP via data/env/<folder>.env. The per-group override
+  // applies to ALL groups including main — unlike credentials, the model is a
+  // cost/quality knob the operator controls, not a data-isolation boundary
+  // (e.g. give the main group Opus while restricted groups stay on Sonnet).
+  // A model id is not a secret, so it goes via -e; only emitted when set so the
+  // agent-runner default applies otherwise.
+  const agentModel =
+    perGroupEnv.AGENT_MODEL ||
+    process.env.AGENT_MODEL ||
+    secretsEnv.AGENT_MODEL;
+  if (agentModel) args.push('-e', `AGENT_MODEL=${agentModel}`);
   let envFilePath: string | null = null;
   const envFileLines: string[] = [];
   if (notionKey) envFileLines.push(`NOTION_API_KEY=${notionKey}`);

@@ -845,3 +845,83 @@ describe('buildContainerArgs per-group env file (Part B)', () => {
     expect(wrotePerGroup).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// buildContainerArgs AGENT_MODEL injection.
+//
+// The agent model is overridable GLOBALLY (process.env / global secrets) and
+// PER-GROUP (data/env/<folder>.env). Unlike credentials, the per-group model
+// override applies to ALL groups including main — it's an operator cost/quality
+// knob, not a data-isolation boundary. The model id is not a secret, so it's
+// passed via `-e AGENT_MODEL=...` (argv), not the env-file. When unset, no arg
+// is emitted so the container's built-in default applies.
+// ---------------------------------------------------------------------------
+describe('buildContainerArgs AGENT_MODEL injection', () => {
+  const ORIGINAL_MODEL = process.env.AGENT_MODEL;
+
+  beforeEach(() => {
+    delete process.env.AGENT_MODEL;
+    vi.mocked(fs.existsSync).mockImplementation(() => false);
+    vi.mocked(fs.readFileSync).mockImplementation(() => '');
+  });
+
+  afterEach(() => {
+    if (ORIGINAL_MODEL !== undefined) {
+      process.env.AGENT_MODEL = ORIGINAL_MODEL;
+    } else {
+      delete process.env.AGENT_MODEL;
+    }
+  });
+
+  const modelArg = (args: string[]): string | undefined =>
+    args.find((a) => a.startsWith('AGENT_MODEL='));
+
+  it('emits -e AGENT_MODEL from the global env var (non-main)', () => {
+    process.env.AGENT_MODEL = 'claude-opus-4-8';
+    const { args } = buildContainerArgs([], 'nc-dana', false, {}, 'telegram_dana');
+    expect(modelArg(args)).toBe('AGENT_MODEL=claude-opus-4-8');
+  });
+
+  it('per-group env file overrides the global AGENT_MODEL', () => {
+    process.env.AGENT_MODEL = 'claude-sonnet-4-6';
+    const perGroupEnvPath = path.join(
+      '/tmp/nanoclaw-test-data',
+      'env',
+      'telegram_dana.env',
+    );
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: fs.PathLike) => String(p) === perGroupEnvPath,
+    );
+    vi.mocked(fs.readFileSync).mockImplementation(
+      (p: fs.PathOrFileDescriptor) =>
+        String(p) === perGroupEnvPath ? 'AGENT_MODEL=claude-opus-4-8\n' : '',
+    );
+
+    const { args } = buildContainerArgs([], 'nc-dana', false, {}, 'telegram_dana');
+    expect(modelArg(args)).toBe('AGENT_MODEL=claude-opus-4-8');
+  });
+
+  it('per-group AGENT_MODEL applies to the MAIN group too (unlike credentials)', () => {
+    process.env.AGENT_MODEL = 'claude-sonnet-4-6';
+    const perGroupEnvPath = path.join(
+      '/tmp/nanoclaw-test-data',
+      'env',
+      'telegram_main.env',
+    );
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: fs.PathLike) => String(p) === perGroupEnvPath,
+    );
+    vi.mocked(fs.readFileSync).mockImplementation(
+      (p: fs.PathOrFileDescriptor) =>
+        String(p) === perGroupEnvPath ? 'AGENT_MODEL=claude-opus-4-8\n' : '',
+    );
+
+    const { args } = buildContainerArgs([], 'nc-main', true, {}, 'telegram_main');
+    expect(modelArg(args)).toBe('AGENT_MODEL=claude-opus-4-8');
+  });
+
+  it('emits no AGENT_MODEL arg when unset everywhere (container default applies)', () => {
+    const { args } = buildContainerArgs([], 'nc-dana', false, {}, 'telegram_dana');
+    expect(modelArg(args)).toBeUndefined();
+  });
+});
