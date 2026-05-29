@@ -26,12 +26,17 @@ import { extractPartialTextChunk } from './streaming-partial.js';
 
 // Agent model. The host's container-runner injects AGENT_MODEL (from the
 // global .env / OneCLI secrets, or a per-group data/env/<folder>.env override)
-// when set; otherwise we fall back to the default below. Defaulting to the
-// current Sonnet keeps everyday turns fast and cheap for a personal assistant;
-// set AGENT_MODEL=claude-opus-4-8 (or any valid model id) — globally or per
-// group — to override. Changing the env value needs only a NanoClaw restart,
-// not a container image rebuild (process.env is read at runtime here).
-const DEFAULT_AGENT_MODEL = 'claude-sonnet-4-6';
+// when set; otherwise we fall back to the default below.
+//
+// Values may be Claude Code FAMILY ALIASES — 'opus' | 'sonnet' | 'haiku' —
+// which the Agent SDK resolves to the CURRENT version of that family (so we
+// auto-track new releases without bumping a pinned id, exactly like
+// `claude --model opus` in the CLI), or a full model id (e.g.
+// 'claude-opus-4-8') to pin an exact version. Defaulting to 'sonnet' keeps
+// everyday turns fast and cheap for a personal assistant; set AGENT_MODEL=opus
+// — globally or per group — for max capability. Changing the env value needs
+// only a NanoClaw restart, not a container image rebuild.
+const DEFAULT_AGENT_MODEL = 'sonnet';
 const AGENT_MODEL = process.env.AGENT_MODEL?.trim() || DEFAULT_AGENT_MODEL;
 
 interface ContainerInput {
