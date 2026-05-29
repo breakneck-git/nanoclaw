@@ -1,7 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 import { _initTestDatabase, db, storeChatMetadata } from './db.js';
-import { getAvailableGroups, _setRegisteredGroups } from './index.js';
+import {
+  getAvailableGroups,
+  _setRegisteredGroups,
+  isPrivateChat,
+} from './index.js';
 import { routeOutbound } from './router.js';
 import { logger } from './logger.js';
 import type { Channel } from './types.js';
@@ -24,6 +28,30 @@ describe('JID ownership patterns', () => {
   it('WhatsApp DM JID: ends with @s.whatsapp.net', () => {
     const jid = '12345678@s.whatsapp.net';
     expect(jid.endsWith('@s.whatsapp.net')).toBe(true);
+  });
+});
+
+// --- isPrivateChat (DMs never require a trigger) ---
+
+describe('isPrivateChat', () => {
+  it('Telegram private chat (positive id) is private', () => {
+    expect(isPrivateChat('tg:222222222')).toBe(true);
+    expect(isPrivateChat('tg:111111111')).toBe(true);
+  });
+
+  it('Telegram group/supergroup (negative id) is NOT private', () => {
+    expect(isPrivateChat('tg:-1001234567890')).toBe(false);
+    expect(isPrivateChat('tg:-100')).toBe(false);
+  });
+
+  it('WhatsApp DM is private, WhatsApp group is not', () => {
+    expect(isPrivateChat('12345678@s.whatsapp.net')).toBe(true);
+    expect(isPrivateChat('12345678@g.us')).toBe(false);
+  });
+
+  it('unknown channel jids default to NOT private (group config governs)', () => {
+    expect(isPrivateChat('dc:987654321')).toBe(false);
+    expect(isPrivateChat('slack:C123')).toBe(false);
   });
 });
 

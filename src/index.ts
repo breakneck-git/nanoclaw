@@ -108,6 +108,22 @@ function nextDraftId(): number {
   return draftIdCounter;
 }
 
+/**
+ * True when `jid` is a 1:1 private chat (DM) rather than a group / supergroup /
+ * channel. A person messaging the bot directly is unambiguously addressing it,
+ * so DMs NEVER require a trigger — regardless of the group's requiresTrigger.
+ *
+ * Telegram: private chats carry a positive user id (`tg:123…`); groups,
+ * supergroups and channels are negative (`tg:-100…`). WhatsApp: `@s.whatsapp.net`
+ * is a 1:1 DM, `@g.us` a group. Other channels fall back to "not private" so the
+ * group's explicit requiresTrigger setting still governs them.
+ */
+export function isPrivateChat(jid: string): boolean {
+  if (jid.startsWith('tg:')) return !jid.startsWith('tg:-');
+  if (jid.endsWith('@s.whatsapp.net')) return true;
+  return false;
+}
+
 // Per-chat typing-indicator keepalive. Telegram drops the "typing" action
 // after ~5s, so we re-ping every 4s — but ONLY while the agent is actively
 // working a turn. The container lingers up to IDLE_TIMEOUT after a reply
@@ -272,8 +288,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (missedMessages.length === 0) return true;
 
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
+  // For non-main groups, check if trigger is required and present. Private
+  // DMs never require a trigger (isPrivateChat) — only group chats do.
+  if (
+    !isMainGroup &&
+    group.requiresTrigger !== false &&
+    !isPrivateChat(chatJid)
+  ) {
     const allowlistCfg = loadSenderAllowlist();
     const hasTrigger = missedMessages.some(
       (m) =>
@@ -601,7 +622,11 @@ async function startMessageLoop(): Promise<void> {
           }
 
           const isMainGroup = group.isMain === true;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
+          // Private DMs never need a trigger — only group chats do.
+          const needsTrigger =
+            !isMainGroup &&
+            group.requiresTrigger !== false &&
+            !isPrivateChat(chatJid);
 
           // For non-main groups, only act on trigger messages.
           // Non-trigger messages accumulate in DB and get pulled as
