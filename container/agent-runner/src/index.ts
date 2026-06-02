@@ -83,6 +83,22 @@ const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
+// Outbound message IPC dir (same one the nanoclaw send_message tool writes to).
+// The host watches it and delivers files of shape { type:'message', chatJid,
+// text, groupFolder, timestamp } to the user.
+const MESSAGES_DIR = '/workspace/ipc/messages';
+
+// Overload retry: when a call to Anthropic stays overloaded (429/503/529) past
+// the SDK's and proxy's own retries, re-run the whole turn on this backoff
+// (ms): 1, 4, 8, 16, 32, 64 — 6 retries spanning ~125s. After the 2nd retry we
+// send the user a short "service is busy, hang on" notice so a long wait isn't
+// silent. Non-overload turns never enter this loop.
+const OVERLOAD_BACKOFF_MS = [1000, 4000, 8000, 16000, 32000, 64000];
+const OVERLOAD_NOTIFY_AFTER_ATTEMPT = 2;
+const OVERLOAD_NOTICE_TEXT =
+  '⏳ Сейчас ИИ-сервис перегружен, повторяю запрос. Отвечу через минуту — не пропаду.';
+const OVERLOAD_PATTERN = /(\b(429|503|529)\b)|overloaded/i;
+
 // Compiled-output directory for the runner — used to locate sibling scripts
 // (ipc-mcp-stdio.js, lazy-mcp-proxy.js) that get spawned as child processes.
 const RUNNER_DIST_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -157,6 +173,39 @@ function writePartial(chunk: string): void {
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
+}
+
+/**
+ * Push an immediate message to the user from the harness (not the agent),
+ * by writing the same IPC file the `send_message` MCP tool uses. Best-effort:
+ * never throws. Used for the overload "hang on" notice.
+ */
+function sendInterimMessage(
+  chatJid: string,
+  groupFolder: string,
+  text: string,
+): void {
+  try {
+    fs.mkdirSync(MESSAGES_DIR, { recursive: true });
+    const filepath = path.join(MESSAGES_DIR, `${Date.now()}-overload.json`);
+    const tmp = `${filepath}.tmp`;
+    fs.writeFileSync(
+      tmp,
+      JSON.stringify({
+        type: 'message',
+        chatJid,
+        text,
+        groupFolder,
+        timestamp: new Date().toISOString(),
+      }),
+    );
+    fs.renameSync(tmp, filepath);
+    log('Sent overload notice to user');
+  } catch (err) {
+    log(
+      `Failed to send overload notice: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
@@ -402,7 +451,7 @@ async function runQuery(
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; overloaded?: boolean; overloadText?: string }> {
   const stream = new MessageStream();
   stream.push(prompt);
 
@@ -435,6 +484,10 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  // Set when a result/throw is a transient Anthropic overload — main() retries
+  // the turn instead of emitting this as the reply.
+  let overloaded = false;
+  let overloadText: string | undefined;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -617,8 +670,17 @@ async function runQuery(
       // send it as the "reminder"). Classify it as an error so the host skips
       // delivery; scheduled tasks then retry on their next run.
       const isError = (message as { is_error?: boolean }).is_error === true;
-      log(`Result #${resultCount}: subtype=${message.subtype} is_error=${isError}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
-      if (isError) {
+      const isTransientOverload =
+        isError && OVERLOAD_PATTERN.test(textResult || '');
+      log(`Result #${resultCount}: subtype=${message.subtype} is_error=${isError} overloaded=${isTransientOverload}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      if (isTransientOverload) {
+        // Transient overload — do NOT emit. Signal main() to retry the turn
+        // with backoff (and a user notice). End the stream now; the turn
+        // produced no usable output.
+        overloaded = true;
+        overloadText = textResult || 'Anthropic overloaded';
+        break;
+      } else if (isError) {
         writeOutput({
           status: 'error',
           result: null,
@@ -636,8 +698,8 @@ async function runQuery(
   }
 
   ipcPolling = false;
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, overloaded: ${overloaded}`);
+  return { newSessionId, lastAssistantUuid, closedDuringQuery, overloaded, overloadText };
 }
 
 interface ScriptResult {
@@ -755,10 +817,60 @@ async function main(): Promise<void> {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
-      if (queryResult.newSessionId) {
-        sessionId = queryResult.newSessionId;
+      // Overload retry loop for THIS turn. A transient Anthropic overload
+      // (429/503/529 past the SDK's/proxy's own retries) re-runs the turn on
+      // OVERLOAD_BACKOFF_MS (1/4/8/16/32/64s), notifying the user after the
+      // 2nd retry. A normal turn returns overloaded=false on the first attempt
+      // and breaks out immediately — behavior unchanged.
+      let queryResult: Awaited<ReturnType<typeof runQuery>> | undefined;
+      let overloadNoticeSent = false;
+      for (let attempt = 0; ; attempt++) {
+        if (attempt > 0) {
+          const waitMs = OVERLOAD_BACKOFF_MS[attempt - 1];
+          log(
+            `Overloaded — retry ${attempt}/${OVERLOAD_BACKOFF_MS.length} in ${Math.round(waitMs / 1000)}s`,
+          );
+          await new Promise((r) => setTimeout(r, waitMs));
+        }
+        try {
+          queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          // A transient overload may surface as a thrown error rather than a
+          // result. Treat it like an overloaded result so the retry continues;
+          // anything else propagates to the outer handler below.
+          if (!OVERLOAD_PATTERN.test(m)) throw err;
+          queryResult = { closedDuringQuery: false, overloaded: true, overloadText: m };
+        }
+        if (queryResult.newSessionId) {
+          sessionId = queryResult.newSessionId;
+        }
+        if (!queryResult.overloaded) break;
+        if (attempt >= OVERLOAD_BACKOFF_MS.length) {
+          log(`Overload retries exhausted (${OVERLOAD_BACKOFF_MS.length})`);
+          writeOutput({
+            status: 'error',
+            result: null,
+            newSessionId: sessionId,
+            error: queryResult.overloadText || 'Anthropic overloaded',
+          });
+          break;
+        }
+        if (attempt === OVERLOAD_NOTIFY_AFTER_ATTEMPT && !overloadNoticeSent) {
+          sendInterimMessage(
+            containerInput.chatJid,
+            containerInput.groupFolder,
+            OVERLOAD_NOTICE_TEXT,
+          );
+          overloadNoticeSent = true;
+        }
       }
+
+      // Retries exhausted (error already emitted) — end this container turn.
+      if (!queryResult || queryResult.overloaded) {
+        break;
+      }
+
       if (queryResult.lastAssistantUuid) {
         resumeAt = queryResult.lastAssistantUuid;
       }
