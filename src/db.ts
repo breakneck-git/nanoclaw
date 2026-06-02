@@ -158,6 +158,16 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Add thread_id column if it doesn't exist (migration for existing DBs).
+  // Pins a task's delivery to the forum topic it was created in; NULL means the
+  // General topic. Pre-migration tasks get NULL → General (not the live
+  // last-active-thread cursor).
+  try {
+    database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN thread_id TEXT`);
+  } catch {
+    /* column already exists */
+  }
+
   // Add is_bot_message column if it doesn't exist (migration for existing DBs)
   try {
     database.exec(
@@ -771,8 +781,8 @@ export function createTask(
 ): void {
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, script, schedule_type, schedule_value, context_mode, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, script, schedule_type, schedule_value, context_mode, next_run, status, created_at, thread_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -786,6 +796,7 @@ export function createTask(
     task.next_run,
     task.status,
     task.created_at,
+    task.thread_id ?? null,
   );
 }
 

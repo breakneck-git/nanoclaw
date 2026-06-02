@@ -73,7 +73,11 @@ export interface SchedulerDependencies {
     containerName: string,
     groupFolder: string,
   ) => void;
-  sendMessage: (jid: string, text: string) => Promise<void>;
+  sendMessage: (
+    jid: string,
+    text: string,
+    threadId?: string,
+  ) => Promise<void>;
 }
 
 async function runTask(
@@ -212,7 +216,13 @@ async function runTask(
           // nor (b) get swallowed by outputChain.catch and let recordTaskRun
           // log status: 'success' for a task whose result the user never got.
           try {
-            await deps.sendMessage(task.chat_jid, streamedOutput.result);
+            // Deliver to the task's pinned topic (captured at creation;
+            // undefined → General), NOT the chat's live last-active thread.
+            await deps.sendMessage(
+              task.chat_jid,
+              streamedOutput.result,
+              task.thread_id ?? undefined,
+            );
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.error(

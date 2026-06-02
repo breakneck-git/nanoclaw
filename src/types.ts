@@ -79,6 +79,13 @@ export interface ScheduledTask {
   last_result: string | null;
   status: 'active' | 'paused' | 'completed';
   created_at: string;
+  /**
+   * Forum topic the task delivers into, captured at creation time. `null`/
+   * undefined means the General topic. Pinning this (instead of routing to the
+   * chat's live last-active thread) keeps a reminder in the thread it was set
+   * up in — and pre-thread tasks (no value) land in General.
+   */
+  thread_id?: string | null;
 }
 
 export interface TaskRunLog {

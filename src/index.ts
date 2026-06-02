@@ -874,13 +874,14 @@ async function main(): Promise<void> {
     queue,
     onProcess: (groupJid, proc, containerName, groupFolder) =>
       queue.registerProcess(groupJid, proc, containerName, groupFolder),
-    sendMessage: async (jid, rawText) => {
+    sendMessage: async (jid, rawText, threadId) => {
       const text = formatOutbound(rawText);
       if (!text) return;
       try {
-        await routeOutbound(channels, jid, text, {
-          threadId: lastThreadId[jid],
-        });
+        // Use the task's pinned thread (passed by the scheduler), NOT the live
+        // lastThreadId cursor — a reminder belongs in the topic it was created
+        // in (General when unset), regardless of where the user last wrote.
+        await routeOutbound(channels, jid, text, { threadId });
       } catch (err) {
         // Round-11 narrow catch: only swallow "No channel for JID". Rethrow
         // other errors so the outer task-scheduler catch records the task as
@@ -903,6 +904,7 @@ async function main(): Promise<void> {
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
+    currentThreadId: (jid) => lastThreadId[jid],
     syncGroups: async (force: boolean) => {
       await Promise.all(
         channels

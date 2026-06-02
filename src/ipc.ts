@@ -53,6 +53,12 @@ export interface IpcDeps {
   ) => Promise<{ messageId?: string } | void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
+  /**
+   * Optional: the forum topic the chat is currently in (the live last-active
+   * thread cursor). Used to pin a scheduled task to the thread it was created
+   * in. Returns undefined for the General topic / channels without threads.
+   */
+  currentThreadId?: (jid: string) => string | undefined;
   syncGroups: (force: boolean) => Promise<void>;
   getAvailableGroups: () => AvailableGroup[];
   writeGroupsSnapshot: (
@@ -1035,6 +1041,11 @@ export async function processTaskIpc(
           next_run: nextRun,
           status: 'active',
           created_at: new Date().toISOString(),
+          // Pin the task to the topic the user is scheduling from, so the
+          // reminder lands there (not the chat's live last-active thread).
+          // undefined → General. Cross-group scheduling by main captures the
+          // target chat's current thread (or General).
+          thread_id: deps.currentThreadId?.(targetJid) ?? null,
         });
         logger.info(
           { taskId, sourceGroup, targetFolder, contextMode },

@@ -52,6 +52,40 @@ describe('task scheduler', () => {
     expect(task?.status).toBe('paused');
   });
 
+  it('persists thread_id on a task and round-trips it; omitted → null (General)', () => {
+    // Reminder created from a forum topic → pinned to that thread.
+    createTask({
+      id: 'task-in-thread',
+      group_folder: 'telegram_main',
+      chat_jid: 'tg:222222222',
+      prompt: 'remind in thread',
+      schedule_type: 'cron',
+      schedule_value: '0 14 * * *',
+      context_mode: 'isolated',
+      next_run: new Date().toISOString(),
+      status: 'active',
+      created_at: new Date().toISOString(),
+      thread_id: '1573612',
+    });
+    expect(getTaskById('task-in-thread')?.thread_id).toBe('1573612');
+
+    // Reminder created without a thread (General / pre-threads) → null, so the
+    // scheduler delivers to General rather than the live last-active thread.
+    createTask({
+      id: 'task-general',
+      group_folder: 'telegram_main',
+      chat_jid: 'tg:222222222',
+      prompt: 'remind general',
+      schedule_type: 'cron',
+      schedule_value: '0 14 * * *',
+      context_mode: 'isolated',
+      next_run: new Date().toISOString(),
+      status: 'active',
+      created_at: new Date().toISOString(),
+    });
+    expect(getTaskById('task-general')?.thread_id ?? null).toBeNull();
+  });
+
   it('computeNextRun anchors interval tasks to scheduled time to prevent drift', () => {
     const scheduledTime = new Date(Date.now() - 2000).toISOString(); // 2s ago
     const task = {
