@@ -50,6 +50,7 @@ export interface IpcDeps {
   sendMessage: (
     jid: string,
     text: string,
+    opts?: { threadId?: string; pinThread?: boolean },
   ) => Promise<{ messageId?: string } | void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
@@ -418,7 +419,13 @@ export function startIpcWatcher(deps: IpcDeps): void {
             // Parse stage: malformed JSON / missing fields → permanent
             // quarantine. The file isn't recoverable on retry, so move it
             // out of the way so the watcher doesn't loop on it.
-            let data: { type?: string; chatJid?: string; text?: string };
+            let data: {
+              type?: string;
+              chatJid?: string;
+              text?: string;
+              threadId?: string;
+              pinThread?: boolean;
+            };
             try {
               data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
             } catch (err) {
@@ -450,7 +457,16 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  // pinThread (set by scheduled-task notices) → honor threadId
+                  // verbatim, incl. undefined = General. Otherwise the
+                  // orchestrator routes to the chat's live thread.
+                  await deps.sendMessage(data.chatJid, data.text, {
+                    threadId:
+                      typeof data.threadId === 'string'
+                        ? data.threadId
+                        : undefined,
+                    pinThread: data.pinThread === true,
+                  });
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',

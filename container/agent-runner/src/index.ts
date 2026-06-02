@@ -23,6 +23,11 @@ import { fileURLToPath } from 'url';
 import { safeTruncate } from './safe-truncate.js';
 import { filterAllowedToolPatterns, filterMcpServers } from './mcp-whitelist.js';
 import { extractPartialTextChunk } from './streaming-partial.js';
+import {
+  isOverloadError,
+  overloadRetryStep,
+  OVERLOAD_BACKOFF_MS,
+} from './overload-retry.js';
 
 // Agent model. The host's container-runner injects AGENT_MODEL (from the
 // global .env / OneCLI secrets, or a per-group data/env/<folder>.env override)
@@ -48,6 +53,10 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
+  // Forum topic this turn should reply into (scheduled tasks pass the task's
+  // pinned thread; undefined = General). Used to route the overload notice to
+  // the same place the reminder lands, not the chat's live last-active thread.
+  threadId?: string;
 }
 
 interface ContainerOutput {
@@ -88,16 +97,10 @@ const IPC_POLL_MS = 500;
 // text, groupFolder, timestamp } to the user.
 const MESSAGES_DIR = '/workspace/ipc/messages';
 
-// Overload retry: when a call to Anthropic stays overloaded (429/503/529) past
-// the SDK's and proxy's own retries, re-run the whole turn on this backoff
-// (ms): 1, 4, 8, 16, 32, 64 — 6 retries spanning ~125s. After the 2nd retry we
-// send the user a short "service is busy, hang on" notice so a long wait isn't
-// silent. Non-overload turns never enter this loop.
-const OVERLOAD_BACKOFF_MS = [1000, 4000, 8000, 16000, 32000, 64000];
-const OVERLOAD_NOTIFY_AFTER_ATTEMPT = 2;
+// "Please wait" notice sent to the user after the 2nd overload retry. The
+// backoff / notify policy itself lives in overload-retry.ts (unit-tested).
 const OVERLOAD_NOTICE_TEXT =
   '⏳ Сейчас ИИ-сервис перегружен, повторяю запрос. Отвечу через минуту — не пропаду.';
-const OVERLOAD_PATTERN = /(\b(429|503|529)\b)|overloaded/i;
 
 // Compiled-output directory for the runner — used to locate sibling scripts
 // (ipc-mcp-stdio.js, lazy-mcp-proxy.js) that get spawned as child processes.
@@ -180,25 +183,28 @@ function log(message: string): void {
  * by writing the same IPC file the `send_message` MCP tool uses. Best-effort:
  * never throws. Used for the overload "hang on" notice.
  */
-function sendInterimMessage(
-  chatJid: string,
-  groupFolder: string,
-  text: string,
-): void {
+function sendInterimMessage(containerInput: ContainerInput, text: string): void {
   try {
     fs.mkdirSync(MESSAGES_DIR, { recursive: true });
     const filepath = path.join(MESSAGES_DIR, `${Date.now()}-overload.json`);
     const tmp = `${filepath}.tmp`;
-    fs.writeFileSync(
-      tmp,
-      JSON.stringify({
-        type: 'message',
-        chatJid,
-        text,
-        groupFolder,
-        timestamp: new Date().toISOString(),
-      }),
-    );
+    const data: Record<string, unknown> = {
+      type: 'message',
+      chatJid: containerInput.chatJid,
+      text,
+      groupFolder: containerInput.groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    // Scheduled tasks: pin the notice to the task's thread (undefined =
+    // General) so it lands where the reminder itself will — not the chat's
+    // live last-active thread. `pinThread` tells the host to honor threadId
+    // verbatim (incl. General) instead of falling back to the live cursor.
+    // Interactive turns omit this and route to the live thread as usual.
+    if (containerInput.isScheduledTask) {
+      data.pinThread = true;
+      if (containerInput.threadId) data.threadId = containerInput.threadId;
+    }
+    fs.writeFileSync(tmp, JSON.stringify(data));
     fs.renameSync(tmp, filepath);
     log('Sent overload notice to user');
   } catch (err) {
@@ -670,8 +676,7 @@ async function runQuery(
       // send it as the "reminder"). Classify it as an error so the host skips
       // delivery; scheduled tasks then retry on their next run.
       const isError = (message as { is_error?: boolean }).is_error === true;
-      const isTransientOverload =
-        isError && OVERLOAD_PATTERN.test(textResult || '');
+      const isTransientOverload = isError && isOverloadError(textResult);
       log(`Result #${resultCount}: subtype=${message.subtype} is_error=${isError} overloaded=${isTransientOverload}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
       if (isTransientOverload) {
         // Transient overload — do NOT emit. Signal main() to retry the turn
@@ -825,13 +830,6 @@ async function main(): Promise<void> {
       let queryResult: Awaited<ReturnType<typeof runQuery>> | undefined;
       let overloadNoticeSent = false;
       for (let attempt = 0; ; attempt++) {
-        if (attempt > 0) {
-          const waitMs = OVERLOAD_BACKOFF_MS[attempt - 1];
-          log(
-            `Overloaded — retry ${attempt}/${OVERLOAD_BACKOFF_MS.length} in ${Math.round(waitMs / 1000)}s`,
-          );
-          await new Promise((r) => setTimeout(r, waitMs));
-        }
         try {
           queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
         } catch (err) {
@@ -839,14 +837,16 @@ async function main(): Promise<void> {
           // A transient overload may surface as a thrown error rather than a
           // result. Treat it like an overloaded result so the retry continues;
           // anything else propagates to the outer handler below.
-          if (!OVERLOAD_PATTERN.test(m)) throw err;
+          if (!isOverloadError(m)) throw err;
           queryResult = { closedDuringQuery: false, overloaded: true, overloadText: m };
         }
         if (queryResult.newSessionId) {
           sessionId = queryResult.newSessionId;
         }
         if (!queryResult.overloaded) break;
-        if (attempt >= OVERLOAD_BACKOFF_MS.length) {
+
+        const step = overloadRetryStep(attempt);
+        if (step.exhausted) {
           log(`Overload retries exhausted (${OVERLOAD_BACKOFF_MS.length})`);
           writeOutput({
             status: 'error',
@@ -856,14 +856,14 @@ async function main(): Promise<void> {
           });
           break;
         }
-        if (attempt === OVERLOAD_NOTIFY_AFTER_ATTEMPT && !overloadNoticeSent) {
-          sendInterimMessage(
-            containerInput.chatJid,
-            containerInput.groupFolder,
-            OVERLOAD_NOTICE_TEXT,
-          );
+        if (step.notify && !overloadNoticeSent) {
+          sendInterimMessage(containerInput, OVERLOAD_NOTICE_TEXT);
           overloadNoticeSent = true;
         }
+        log(
+          `Overloaded — retry ${attempt + 1}/${OVERLOAD_BACKOFF_MS.length} in ${Math.round((step.nextWaitMs ?? 0) / 1000)}s`,
+        );
+        await new Promise((r) => setTimeout(r, step.nextWaitMs ?? 0));
       }
 
       // Retries exhausted (error already emitted) — end this container turn.

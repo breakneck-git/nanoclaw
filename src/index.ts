@@ -897,10 +897,14 @@ async function main(): Promise<void> {
   });
   const ipcBaseDir = path.join(DATA_DIR, 'ipc');
   startIpcWatcher({
-    sendMessage: (jid, text) => {
-      return routeOutbound(channels, jid, text, {
-        threadId: lastThreadId[jid],
-      });
+    sendMessage: (jid, text, opts) => {
+      // pinThread (scheduled-task overload notice) → use the given threadId
+      // verbatim, including undefined = General. Otherwise fall back to the
+      // chat's live last-active thread (interactive send_message / notices).
+      const threadId = opts?.pinThread
+        ? opts.threadId
+        : (opts?.threadId ?? lastThreadId[jid]);
+      return routeOutbound(channels, jid, text, { threadId });
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

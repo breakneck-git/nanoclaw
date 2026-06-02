@@ -200,6 +200,9 @@ async function runTask(
         isScheduledTask: true,
         assistantName: ASSISTANT_NAME,
         script: task.script || undefined,
+        // Pin the overload notice to the task's thread (undefined = General),
+        // matching where the reminder result is delivered.
+        threadId: task.thread_id ?? undefined,
       },
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),

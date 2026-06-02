@@ -58,6 +58,10 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
+  // Forum topic this turn should reply into (scheduled tasks pass the task's
+  // pinned thread; undefined = General). Forwarded to the container so the
+  // overload notice lands where the reminder will, not the live thread.
+  threadId?: string;
 }
 
 export interface ContainerOutput {
