@@ -610,12 +610,28 @@ async function runQuery(
     if (message.type === 'result') {
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
-      writeOutput({
-        status: 'success',
-        result: textResult || null,
-        newSessionId
-      });
+      // The SDK sets is_error=true even on a subtype:'success' result when the
+      // turn ended in an API error — e.g. a 529 overload that exhausted retries,
+      // surfaced as result text "API Error: 529 ...". Delivering that as a normal
+      // reply would message the user the raw error (and a scheduled task would
+      // send it as the "reminder"). Classify it as an error so the host skips
+      // delivery; scheduled tasks then retry on their next run.
+      const isError = (message as { is_error?: boolean }).is_error === true;
+      log(`Result #${resultCount}: subtype=${message.subtype} is_error=${isError}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      if (isError) {
+        writeOutput({
+          status: 'error',
+          result: null,
+          error: textResult || 'Agent returned an error result',
+          newSessionId,
+        });
+      } else {
+        writeOutput({
+          status: 'success',
+          result: textResult || null,
+          newSessionId
+        });
+      }
     }
   }
 
