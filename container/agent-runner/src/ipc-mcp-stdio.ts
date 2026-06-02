@@ -34,6 +34,11 @@ const CONTACTS_JSON_PATH = path.join(IPC_DIR, 'contacts.json');
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
 const groupFolder = process.env.NANOCLAW_GROUP_FOLDER!;
 const isMain = process.env.NANOCLAW_IS_MAIN === '1';
+// Scheduled tasks pin outbound messages to the task's thread (PIN='1';
+// THREAD_ID '' = General) so send_message lands where the reminder does, not
+// the chat's live last-active thread. Interactive turns leave PIN off.
+const threadPin = process.env.NANOCLAW_THREAD_PIN === '1';
+const threadId = process.env.NANOCLAW_THREAD_ID || undefined;
 
 /**
  * Validate that a "YYYY-MM-DDTHH:MM[:SS]" string is a real calendar date.
@@ -153,7 +158,7 @@ server.tool(
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
   },
   async (args) => {
-    const data: Record<string, string | undefined> = {
+    const data: Record<string, string | boolean | undefined> = {
       type: 'message',
       chatJid,
       text: args.text,
@@ -161,6 +166,13 @@ server.tool(
       groupFolder,
       timestamp: new Date().toISOString(),
     };
+    // Scheduled tasks: pin to the task's thread (undefined = General) so the
+    // host honors it verbatim instead of routing to the live last-active
+    // thread. Interactive turns leave this off (host uses the live thread).
+    if (threadPin) {
+      data.pinThread = true;
+      if (threadId) data.threadId = threadId;
+    }
 
     writeIpcFile(MESSAGES_DIR, data);
 

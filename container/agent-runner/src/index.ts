@@ -573,6 +573,12 @@ async function runQuery(
               NANOCLAW_CHAT_JID: containerInput.chatJid,
               NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
               NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+              // Pin send_message to the task's thread for scheduled tasks
+              // (undefined/'' = General), so progress messages land where the
+              // reminder does — not the chat's live last-active thread.
+              // Interactive turns leave PIN off and route to the live thread.
+              NANOCLAW_THREAD_ID: containerInput.threadId ?? '',
+              NANOCLAW_THREAD_PIN: containerInput.isScheduledTask ? '1' : '0',
             },
           },
           gmail: {
