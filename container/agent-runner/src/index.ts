@@ -495,12 +495,37 @@ async function runQuery(
   let overloaded = false;
   let overloadText: string | undefined;
 
-  // Load global CLAUDE.md as additional system context (shared across all groups)
+  // Persona append: groups/global/CLAUDE.md for non-main groups (main groups
+  // use their own group CLAUDE.md, auto-loaded from cwd /workspace/group).
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
   if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
+
+  // Always-on instructions: standing defaults applied to EVERY turn of EVERY
+  // group (e.g. "be concise"). Single source of truth at groups/global/
+  // always-on.md — non-main groups see it via the /workspace/global mount;
+  // main groups see it under the read-only project mount.
+  let alwaysOn: string | undefined;
+  for (const p of [
+    '/workspace/global/always-on.md',
+    '/workspace/project/groups/global/always-on.md',
+  ]) {
+    try {
+      if (fs.existsSync(p)) {
+        alwaysOn = fs.readFileSync(p, 'utf-8');
+        break;
+      }
+    } catch {
+      /* ignore unreadable path */
+    }
+  }
+  if (alwaysOn) log(`Always-on instructions loaded (${alwaysOn.length} chars)`);
+
+  // Compose the system-prompt append: persona (non-main) + always-on (all).
+  const systemPromptAppend =
+    [globalClaudeMd, alwaysOn].filter(Boolean).join('\n\n') || undefined;
 
   // Discover additional directories mounted at /workspace/extra/*
   // These are passed to the SDK so their CLAUDE.md files are loaded automatically
@@ -532,8 +557,8 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
+      systemPrompt: systemPromptAppend
+        ? { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend }
         : undefined,
       allowedTools: filterAllowedToolPatterns(
         [
