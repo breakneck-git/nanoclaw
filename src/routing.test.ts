@@ -60,12 +60,9 @@ describe('isPrivateChat', () => {
 
 describe('lastThreadOf', () => {
   it('returns the latest message thread (reply in the same topic)', () => {
-    expect(
-      lastThreadOf([
-        { thread_id: '111' },
-        { thread_id: '222' },
-      ]),
-    ).toBe('222');
+    expect(lastThreadOf([{ thread_id: '111' }, { thread_id: '222' }])).toBe(
+      '222',
+    );
   });
 
   it('thread-less latest message → undefined (General), even after a threaded one', () => {
