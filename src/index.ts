@@ -124,6 +124,24 @@ export function isPrivateChat(jid: string): boolean {
   return false;
 }
 
+/**
+ * The forum topic an outbound reply should target for a batch of inbound
+ * messages: the LATEST message's thread (the topic the user wrote in), or
+ * `undefined` = General when it has none — a General-topic message, or an
+ * external trigger such as an inbound email delivered to the chat. Returns
+ * `undefined` for an empty batch.
+ *
+ * Telegram backfills thread_id on every inbound (see telegram deliverInbound),
+ * so a missing value here genuinely means "no thread → General", NOT a dropped
+ * reading. We must NOT keep a stale thread cursor for thread-less triggers —
+ * doing so is what sent email/General replies into the last-active topic.
+ */
+export function lastThreadOf(
+  messages: { thread_id?: string | null }[],
+): string | undefined {
+  return messages[messages.length - 1]?.thread_id ?? undefined;
+}
+
 // Per-chat typing-indicator keepalive. Telegram drops the "typing" action
 // after ~5s, so we re-ping every 4s — but ONLY while the agent is actively
 // working a turn. The container lingers up to IDLE_TIMEOUT after a reply
@@ -604,15 +622,14 @@ async function startMessageLoop(): Promise<void> {
           const group = registeredGroups[chatJid];
           if (!group) continue;
 
-          // Track the last thread/topic id we saw inbound for this chat so
-          // outbound replies land in the same Telegram forum topic.
-          const newestThread =
-            groupMessages[groupMessages.length - 1]?.thread_id;
-          // Don't clobber a known-good thread cursor with a null reading.
-          // SQLite returns NULL (→ JS null) for messages stored without a
-          // thread_id; treat that as "no signal" not "send to General".
-          if (newestThread !== undefined && newestThread !== null) {
-            lastThreadId[chatJid] = newestThread;
+          // Route this batch's reply to the latest message's topic — General
+          // (undefined) when it has none, including external triggers like an
+          // inbound email delivered to this chat. We do NOT keep a stale thread
+          // cursor for thread-less triggers (that sent email/General replies
+          // into the last-active topic). Telegram backfills thread_id on every
+          // inbound, so a missing value here means General, not a lost reading.
+          if (groupMessages.length > 0) {
+            lastThreadId[chatJid] = lastThreadOf(groupMessages);
           }
 
           const channel = findChannel(channels, chatJid);

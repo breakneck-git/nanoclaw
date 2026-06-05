@@ -5,6 +5,7 @@ import {
   getAvailableGroups,
   _setRegisteredGroups,
   isPrivateChat,
+  lastThreadOf,
 } from './index.js';
 import { routeOutbound } from './router.js';
 import { logger } from './logger.js';
@@ -52,6 +53,37 @@ describe('isPrivateChat', () => {
   it('unknown channel jids default to NOT private (group config governs)', () => {
     expect(isPrivateChat('dc:987654321')).toBe(false);
     expect(isPrivateChat('slack:C123')).toBe(false);
+  });
+});
+
+// --- lastThreadOf (reply-thread routing; thread-less triggers → General) ---
+
+describe('lastThreadOf', () => {
+  it('returns the latest message thread (reply in the same topic)', () => {
+    expect(
+      lastThreadOf([
+        { thread_id: '111' },
+        { thread_id: '222' },
+      ]),
+    ).toBe('222');
+  });
+
+  it('thread-less latest message → undefined (General), even after a threaded one', () => {
+    // e.g. user was in topic 111, then an inbound email (no thread) arrives:
+    // the reply must go to General, NOT stay in 111.
+    expect(
+      lastThreadOf([
+        { thread_id: '111' },
+        { thread_id: null }, // email / General-topic message
+      ]),
+    ).toBeUndefined();
+  });
+
+  it('null / undefined / empty all → undefined (General)', () => {
+    expect(lastThreadOf([{ thread_id: null }])).toBeUndefined();
+    expect(lastThreadOf([{ thread_id: undefined }])).toBeUndefined();
+    expect(lastThreadOf([{}])).toBeUndefined();
+    expect(lastThreadOf([])).toBeUndefined();
   });
 });
 
