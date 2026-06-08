@@ -1,7 +1,7 @@
 import https from 'https';
 import http from 'http';
 import FormData from 'form-data';
-import { Api, Bot, type Context } from 'grammy';
+import { Api, Bot, InputFile, type Context } from 'grammy';
 import type { Message } from 'grammy/types';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
@@ -1198,6 +1198,39 @@ export class TelegramChannel implements Channel {
       // Log AND propagate so callers (router, scheduler, IPC, agent stream)
       // don't advance state machines as if the message was delivered.
       logger.error({ jid, err }, 'Failed to send Telegram message');
+      throw err;
+    }
+  }
+
+  /**
+   * Send a local file as a Telegram document (any type — APK, PDF, zip, …).
+   * `opts.threadId` routes it into a forum topic; `opts.caption` adds text
+   * (capped at Telegram's 1024-char caption limit). Telegram bots cap uploads
+   * at 50 MB — the caller validates size before invoking. Throws on failure so
+   * the IPC handler can report it.
+   */
+  async sendFile(
+    jid: string,
+    filePath: string,
+    opts?: { caption?: string; threadId?: string },
+  ): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return;
+    }
+    const numericId = parseInt(jid.replace(/^tg:/, ''), 10);
+    if (isNaN(numericId)) throw new Error(`Invalid Telegram jid: ${jid}`);
+    const threadId = opts?.threadId ? parseInt(opts.threadId, 10) : undefined;
+    const other: { message_thread_id?: number; caption?: string } = {};
+    if (threadId !== undefined && !isNaN(threadId)) {
+      other.message_thread_id = threadId;
+    }
+    if (opts?.caption) other.caption = opts.caption.slice(0, 1024);
+    try {
+      await this.bot.api.sendDocument(numericId, new InputFile(filePath), other);
+      logger.info({ jid, filePath, threadId }, 'Telegram file sent');
+    } catch (err) {
+      logger.error({ jid, filePath, err }, 'Failed to send Telegram file');
       throw err;
     }
   }

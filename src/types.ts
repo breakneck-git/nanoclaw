@@ -149,6 +149,14 @@ export interface Channel {
     text: string,
     opts?: SendMessageOptions,
   ): Promise<void>;
+  // Optional: send a local file as an attachment (Telegram document). Channels
+  // without this capability can't deliver files. `opts.caption` adds text,
+  // `opts.threadId` routes it into a forum topic.
+  sendFile?(
+    jid: string,
+    filePath: string,
+    opts?: { caption?: string; threadId?: string },
+  ): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
   // Optional: channel-specific identifier for the bot/sender (e.g. bot user ID).

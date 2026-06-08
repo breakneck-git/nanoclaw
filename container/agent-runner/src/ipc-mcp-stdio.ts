@@ -180,6 +180,81 @@ server.tool(
   },
 );
 
+const WORKSPACE_DIR = '/workspace/group';
+const TELEGRAM_FILE_CAP = 50 * 1024 * 1024; // Telegram bot upload limit (50 MB)
+
+server.tool(
+  'send_file',
+  "Send a file from your workspace to the chat as an attachment (Telegram document). Use this to deliver files you created or have — APK, PDF, zip, images, etc. — instead of pasting a link. `path` is relative to your workspace (/workspace/group). Max 50 MB (Telegram limit); for larger files, upload elsewhere and send a link.",
+  {
+    path: z
+      .string()
+      .describe('File path inside your workspace, e.g. "report.pdf" or "build/app.apk"'),
+    caption: z
+      .string()
+      .optional()
+      .describe('Optional caption text sent alongside the file'),
+  },
+  async (args) => {
+    const rel = args.path.startsWith(WORKSPACE_DIR + '/')
+      ? args.path.slice(WORKSPACE_DIR.length + 1)
+      : args.path;
+    const abs = path.resolve(WORKSPACE_DIR, rel);
+    if (abs !== WORKSPACE_DIR && !abs.startsWith(WORKSPACE_DIR + '/')) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text' as const,
+            text: 'ERROR: path must be inside your workspace (/workspace/group).',
+          },
+        ],
+      };
+    }
+    let stat: fs.Stats | null = null;
+    try {
+      stat = fs.statSync(abs);
+    } catch {
+      stat = null;
+    }
+    if (!stat || !stat.isFile()) {
+      return {
+        isError: true,
+        content: [
+          { type: 'text' as const, text: `ERROR: file not found: ${args.path}` },
+        ],
+      };
+    }
+    if (stat.size > TELEGRAM_FILE_CAP) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text' as const,
+            text: `ERROR: file is ${(stat.size / 1048576).toFixed(1)} MB; Telegram caps bot uploads at 50 MB. Upload it elsewhere and send a link instead.`,
+          },
+        ],
+      };
+    }
+    const data: Record<string, string | boolean | undefined> = {
+      type: 'file',
+      chatJid,
+      path: path.relative(WORKSPACE_DIR, abs),
+      caption: args.caption || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    if (threadPin) {
+      data.pinThread = true;
+      if (threadId) data.threadId = threadId;
+    }
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: 'File sent.' }] };
+  },
+);
+
 server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools. Returns the task ID for future reference. To modify an existing task, use update_task instead.

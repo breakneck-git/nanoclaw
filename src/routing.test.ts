@@ -6,6 +6,7 @@ import {
   _setRegisteredGroups,
   isPrivateChat,
   lastThreadOf,
+  resolveWithinDir,
 } from './index.js';
 import { routeOutbound } from './router.js';
 import { logger } from './logger.js';
@@ -81,6 +82,32 @@ describe('lastThreadOf', () => {
     expect(lastThreadOf([{ thread_id: undefined }])).toBeUndefined();
     expect(lastThreadOf([{}])).toBeUndefined();
     expect(lastThreadOf([])).toBeUndefined();
+  });
+});
+
+// --- resolveWithinDir (send_file path containment) ---
+
+describe('resolveWithinDir', () => {
+  it('resolves files inside the base dir', () => {
+    expect(resolveWithinDir('/base/group', 'report.pdf')).toBe(
+      '/base/group/report.pdf',
+    );
+    expect(resolveWithinDir('/base/group', 'build/app.apk')).toBe(
+      '/base/group/build/app.apk',
+    );
+    expect(resolveWithinDir('/base/group', './x')).toBe('/base/group/x');
+  });
+
+  it('rejects traversal and absolute escapes (returns null)', () => {
+    expect(resolveWithinDir('/base/group', '../other/secret')).toBeNull();
+    expect(resolveWithinDir('/base/group', '../../etc/passwd')).toBeNull();
+    expect(resolveWithinDir('/base/group', '/etc/passwd')).toBeNull();
+    expect(resolveWithinDir('/base/group', '..')).toBeNull();
+  });
+
+  it('does not treat a sibling prefix dir as inside', () => {
+    // /base/group-secrets must NOT count as inside /base/group
+    expect(resolveWithinDir('/base/group', '../group-secrets/x')).toBeNull();
   });
 });
 

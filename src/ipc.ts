@@ -52,6 +52,18 @@ export interface IpcDeps {
     text: string,
     opts?: { threadId?: string; pinThread?: boolean },
   ) => Promise<{ messageId?: string } | void>;
+  /**
+   * Optional: send a file from a group's workspace to a chat. `relPath` is
+   * relative to `sourceGroupFolder`'s host folder; the impl resolves + validates
+   * containment, then delivers via the channel. Absent when no file-capable
+   * channel is wired.
+   */
+  sendFile?: (
+    jid: string,
+    sourceGroupFolder: string,
+    relPath: string,
+    opts?: { caption?: string; threadId?: string; pinThread?: boolean },
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   /**
@@ -425,6 +437,8 @@ export function startIpcWatcher(deps: IpcDeps): void {
               text?: string;
               threadId?: string;
               pinThread?: boolean;
+              path?: string;
+              caption?: string;
             };
             try {
               data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
@@ -475,6 +489,49 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (
+                data.type === 'file' &&
+                data.chatJid &&
+                data.path
+              ) {
+                // Outbound file: same authorization as a message. The path is
+                // relative to the SOURCE group's workspace; the orchestrator
+                // resolves it against that group's host folder and validates
+                // containment before sending (defence in depth — the MCP tool
+                // already restricted it to /workspace/group).
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  if (deps.sendFile) {
+                    await deps.sendFile(data.chatJid, sourceGroup, data.path, {
+                      caption:
+                        typeof data.caption === 'string'
+                          ? data.caption
+                          : undefined,
+                      threadId:
+                        typeof data.threadId === 'string'
+                          ? data.threadId
+                          : undefined,
+                      pinThread: data.pinThread === true,
+                    });
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup, path: data.path },
+                      'IPC file sent',
+                    );
+                  } else {
+                    logger.warn(
+                      { chatJid: data.chatJid, sourceGroup },
+                      'IPC file requested but no file-capable channel wired',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC file attempt blocked',
                   );
                 }
               }

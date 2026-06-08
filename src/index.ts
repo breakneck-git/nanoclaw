@@ -142,6 +142,21 @@ export function lastThreadOf(
   return messages[messages.length - 1]?.thread_id ?? undefined;
 }
 
+/**
+ * Resolve `relPath` against `baseDir` and return the absolute path ONLY if it
+ * stays inside `baseDir` (no `..` traversal, no absolute escape); otherwise
+ * null. The security boundary for agent-supplied file paths (e.g. send_file):
+ * an agent may only reference files inside its own group workspace.
+ */
+export function resolveWithinDir(
+  baseDir: string,
+  relPath: string,
+): string | null {
+  const full = path.resolve(baseDir, relPath);
+  if (full === baseDir || full.startsWith(baseDir + path.sep)) return full;
+  return null;
+}
+
 // Per-chat typing-indicator keepalive. Telegram drops the "typing" action
 // after ~5s, so we re-ping every 4s — but ONLY while the agent is actively
 // working a turn. The container lingers up to IDLE_TIMEOUT after a reply
@@ -922,6 +937,30 @@ async function main(): Promise<void> {
         ? opts.threadId
         : (opts?.threadId ?? lastThreadId[jid]);
       return routeOutbound(channels, jid, text, { threadId });
+    },
+    sendFile: async (jid, sourceGroupFolder, relPath, opts) => {
+      // Resolve the file against the SOURCE group's host folder and verify it
+      // stays inside it (defence in depth — the agent's MCP tool already
+      // restricted it to /workspace/group). Then deliver via the channel.
+      const groupDir = resolveGroupFolderPath(sourceGroupFolder);
+      const full = resolveWithinDir(groupDir, relPath);
+      if (!full) {
+        throw new Error(`File path escapes group folder: ${relPath}`);
+      }
+      if (!fs.existsSync(full) || !fs.statSync(full).isFile()) {
+        throw new Error(`File not found: ${relPath}`);
+      }
+      const channel = findChannel(channels, jid);
+      if (!channel?.sendFile) {
+        throw new Error(`No file-capable channel for JID: ${jid}`);
+      }
+      const threadId = opts?.pinThread
+        ? opts.threadId
+        : (opts?.threadId ?? lastThreadId[jid]);
+      await channel.sendFile(jid, full, {
+        caption: opts?.caption,
+        threadId,
+      });
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
