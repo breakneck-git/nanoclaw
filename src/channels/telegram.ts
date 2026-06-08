@@ -1227,7 +1227,11 @@ export class TelegramChannel implements Channel {
     }
     if (opts?.caption) other.caption = opts.caption.slice(0, 1024);
     try {
-      await this.bot.api.sendDocument(numericId, new InputFile(filePath), other);
+      await this.bot.api.sendDocument(
+        numericId,
+        new InputFile(filePath),
+        other,
+      );
       logger.info({ jid, filePath, threadId }, 'Telegram file sent');
     } catch (err) {
       logger.error({ jid, filePath, err }, 'Failed to send Telegram file');

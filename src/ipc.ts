@@ -491,11 +491,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     'Unauthorized IPC message attempt blocked',
                   );
                 }
-              } else if (
-                data.type === 'file' &&
-                data.chatJid &&
-                data.path
-              ) {
+              } else if (data.type === 'file' && data.chatJid && data.path) {
                 // Outbound file: same authorization as a message. The path is
                 // relative to the SOURCE group's workspace; the orchestrator
                 // resolves it against that group's host folder and validates
