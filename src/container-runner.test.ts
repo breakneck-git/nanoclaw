@@ -963,7 +963,8 @@ describe('buildContainerArgs AGENT_EFFORT injection', () => {
   });
 
   afterEach(() => {
-    if (ORIGINAL_EFFORT !== undefined) process.env.AGENT_EFFORT = ORIGINAL_EFFORT;
+    if (ORIGINAL_EFFORT !== undefined)
+      process.env.AGENT_EFFORT = ORIGINAL_EFFORT;
     else delete process.env.AGENT_EFFORT;
   });
 
@@ -985,7 +986,13 @@ describe('buildContainerArgs AGENT_EFFORT injection', () => {
           ? 'AGENT_MODEL=opus\nAGENT_EFFORT=high\n'
           : '',
     );
-    const { args } = buildContainerArgs([], 'nc-main', true, {}, 'telegram_main');
+    const { args } = buildContainerArgs(
+      [],
+      'nc-main',
+      true,
+      {},
+      'telegram_main',
+    );
     expect(effortArg(args)).toBe('AGENT_EFFORT=high');
   });
 
