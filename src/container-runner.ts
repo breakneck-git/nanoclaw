@@ -35,6 +35,7 @@ const secretsEnv = readEnvFile([
   'NOTION_API_KEY',
   'GOOGLE_MAPS_API_KEY',
   'AGENT_MODEL',
+  'AGENT_EFFORT',
 ]);
 import { RegisteredGroup } from './types.js';
 
@@ -513,6 +514,15 @@ export function buildContainerArgs(
     process.env.AGENT_MODEL ||
     secretsEnv.AGENT_MODEL;
   if (agentModel) args.push('-e', `AGENT_MODEL=${agentModel}`);
+
+  // Agent effort (low | medium | high | max — 'max' is Opus-only). Same
+  // global + per-group resolution as the model. Unset → the SDK default
+  // ('high'). Not a secret → -e.
+  const agentEffort =
+    perGroupEnv.AGENT_EFFORT ||
+    process.env.AGENT_EFFORT ||
+    secretsEnv.AGENT_EFFORT;
+  if (agentEffort) args.push('-e', `AGENT_EFFORT=${agentEffort}`);
   let envFilePath: string | null = null;
   const envFileLines: string[] = [];
   if (notionKey) envFileLines.push(`NOTION_API_KEY=${notionKey}`);

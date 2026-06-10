@@ -44,6 +44,17 @@ import {
 const DEFAULT_AGENT_MODEL = 'sonnet';
 const AGENT_MODEL = process.env.AGENT_MODEL?.trim() || DEFAULT_AGENT_MODEL;
 
+// Agent effort — low | medium | high | max ('max' is Opus-only). 'high' is the
+// SDK default. Set per group (or globally) via AGENT_EFFORT; unset/invalid →
+// omitted, so the SDK default ('high') applies.
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'max'] as const;
+const AGENT_EFFORT: (typeof EFFORT_LEVELS)[number] | undefined = (() => {
+  const e = process.env.AGENT_EFFORT?.trim().toLowerCase();
+  return e && (EFFORT_LEVELS as readonly string[]).includes(e)
+    ? (e as (typeof EFFORT_LEVELS)[number])
+    : undefined;
+})();
+
 interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -547,6 +558,8 @@ async function runQuery(
     prompt: stream,
     options: {
       model: AGENT_MODEL,
+      // undefined → SDK default effort ('high'). 'max' is Opus-only.
+      effort: AGENT_EFFORT,
       cwd: '/workspace/group',
       // Emit SDKPartialAssistantMessage events as the agent's text streams in.
       // The for-await loop below forwards `text_delta` fragments to the host

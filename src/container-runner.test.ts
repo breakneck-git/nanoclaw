@@ -949,3 +949,54 @@ describe('buildContainerArgs AGENT_MODEL injection', () => {
     expect(modelArg(args)).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// buildContainerArgs AGENT_EFFORT injection (mirrors AGENT_MODEL).
+// ---------------------------------------------------------------------------
+describe('buildContainerArgs AGENT_EFFORT injection', () => {
+  const ORIGINAL_EFFORT = process.env.AGENT_EFFORT;
+
+  beforeEach(() => {
+    delete process.env.AGENT_EFFORT;
+    vi.mocked(fs.existsSync).mockImplementation(() => false);
+    vi.mocked(fs.readFileSync).mockImplementation(() => '');
+  });
+
+  afterEach(() => {
+    if (ORIGINAL_EFFORT !== undefined) process.env.AGENT_EFFORT = ORIGINAL_EFFORT;
+    else delete process.env.AGENT_EFFORT;
+  });
+
+  const effortArg = (args: string[]): string | undefined =>
+    args.find((a) => a.startsWith('AGENT_EFFORT='));
+
+  it('per-group env file emits -e AGENT_EFFORT', () => {
+    const perGroupEnvPath = path.join(
+      '/tmp/nanoclaw-test-data',
+      'env',
+      'telegram_main.env',
+    );
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p: fs.PathLike) => String(p) === perGroupEnvPath,
+    );
+    vi.mocked(fs.readFileSync).mockImplementation(
+      (p: fs.PathOrFileDescriptor) =>
+        String(p) === perGroupEnvPath
+          ? 'AGENT_MODEL=opus\nAGENT_EFFORT=high\n'
+          : '',
+    );
+    const { args } = buildContainerArgs([], 'nc-main', true, {}, 'telegram_main');
+    expect(effortArg(args)).toBe('AGENT_EFFORT=high');
+  });
+
+  it('emits no AGENT_EFFORT arg when unset (SDK default applies)', () => {
+    const { args } = buildContainerArgs(
+      [],
+      'nc-bzik',
+      false,
+      {},
+      'telegram_bzik',
+    );
+    expect(effortArg(args)).toBeUndefined();
+  });
+});
