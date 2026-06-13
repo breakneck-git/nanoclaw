@@ -62,14 +62,29 @@ Use Slack mrkdwn syntax. Run `/slack-formatting` for the full reference. Key rul
 - `>` for block quotes
 - No `##` headings — use `*Bold text*` instead
 
-### WhatsApp/Telegram channels (folder starts with `whatsapp_` or `telegram_`)
+### Telegram channels (folder starts with `telegram_`)
+
+Telegram renders FULL Markdown (rich messages, parsed on our side). Use it
+freely when it makes the answer clearer:
+- `#` / `##` / `###` headings
+- `**bold**` (or `*bold*`), `*italic*` (or `_italic_`), `~~strikethrough~~`
+- `` `inline code` `` and ```` ``` ```` fenced code blocks (with a language)
+- `-` / `*` bullet lists, `1.` numbered lists, `>` blockquotes, `---` dividers
+- `[text](url)` links
+- GitHub-style tables: `| col | col |` with a `|---|---|` separator row (and
+  `:--` / `:-:` / `--:` for column alignment)
+
+The old single-`*bold*` syntax still works too. Format for clarity, not
+decoration. (If some construct doesn't render it degrades to plain text, never lost.)
+
+### WhatsApp channels (folder starts with `whatsapp_`)
 
 - `*bold*` (single asterisks, NEVER **double**)
 - `_italic_` (underscores)
 - `•` bullet points
 - ` ``` ` code blocks
 
-No `##` headings. No `[links](url)`. No `**double stars**`.
+No `##` headings. No `[links](url)`. No `**double stars**`. (WhatsApp has no rich messages.)
 
 ### Discord channels (folder starts with `discord_`)
 

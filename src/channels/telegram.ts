@@ -552,6 +552,33 @@ async function sendTelegramMessage(
  */
 export const _test_sendTelegramMessage = sendTelegramMessage;
 
+// --- Bot API 10.1 Rich Messages -------------------------------------------
+// sendRichMessage renders FULL Markdown (tables, headings, lists, blockquotes,
+// nested formatting) by passing the agent's Markdown as InputRichMessage.markdown
+// — Telegram parses it into rich blocks server-side. grammy 1.41.1 has no typed
+// method yet (Bot API 10.1 shipped 2026-06-11), so we call the raw API.
+//
+// Rich content cap is 32768 chars (vs 4096 plain). If the bot's datacenter
+// hasn't rolled out 10.1, the first call 404s and we sticky-disable rich for the
+// process, falling back to the proven Markdown(→plain) path. Any per-message
+// content rejection (400) also falls back — so a message is NEVER lost.
+const RICH_MAX_LENGTH = 32768;
+let richMessagesSupported = true;
+
+/**
+ * True when a sendRichMessage failure means the METHOD itself is unavailable
+ * (e.g. a datacenter without Bot API 10.1), as opposed to a per-message content
+ * problem. Used to sticky-disable rich attempts for the rest of the process.
+ */
+export function isRichUnavailableError(err: unknown): boolean {
+  const e = err as { error_code?: number; description?: string };
+  const d = (e?.description ?? '').toLowerCase();
+  return (
+    e?.error_code === 404 ||
+    /method not found|not supported|unknown method/.test(d)
+  );
+}
+
 export class TelegramChannel implements Channel {
   name = 'telegram';
 
@@ -1150,6 +1177,57 @@ export class TelegramChannel implements Channel {
     });
   }
 
+  /**
+   * Attempt a Bot API 10.1 rich message (full Markdown → server-parsed rich
+   * blocks). Returns the messageId on success, or null to signal the caller to
+   * fall back to the Markdown/plain path. Never throws for content/parse issues
+   * (returns null); only re-throws transport errors (429/5xx/network) so the
+   * caller's retry/backoff still applies. Sticky-disables rich on a
+   * method-unavailable error.
+   */
+  private async trySendRich(
+    chatId: number,
+    text: string,
+    options: { message_thread_id?: number },
+  ): Promise<string | null> {
+    if (!this.bot) return null;
+    // grammy's bot.api.raw is a Proxy that returns a callable for any method
+    // name. Guard defensively: if it isn't callable (a grammy build without the
+    // raw proxy, or a test fake without `api.raw`), fall back instead of throwing.
+    const rawApi = (this.bot.api as { raw?: Record<string, unknown> }).raw;
+    const sendRich = rawApi?.['sendRichMessage'];
+    if (typeof sendRich !== 'function') return null;
+    const payload: Record<string, unknown> = {
+      chat_id: chatId,
+      rich_message: { markdown: text },
+      ...options,
+    };
+    try {
+      const msg = await (
+        sendRich as (p: unknown) => Promise<{ message_id: number }>
+      )(payload);
+      return String(msg.message_id);
+    } catch (err) {
+      if (isRichUnavailableError(err)) {
+        richMessagesSupported = false;
+        logger.warn(
+          { err },
+          'sendRichMessage unavailable — disabling rich for this process, using Markdown',
+        );
+        return null;
+      }
+      const e = err as { error_code?: number };
+      if (e?.error_code === 400) {
+        // Content/parse rejection → fall back (message still delivered plain).
+        logger.debug({ err }, 'sendRichMessage rejected content; falling back');
+        return null;
+      }
+      // Transport error (429/5xx/network): rethrow so retry/backoff decides —
+      // a fallback send would hit the same failure.
+      throw err;
+    }
+  }
+
   async sendMessage(
     jid: string,
     text: string,
@@ -1166,6 +1244,29 @@ export class TelegramChannel implements Channel {
       const options = threadId
         ? { message_thread_id: parseInt(threadId, 10) }
         : {};
+
+      // Rich path (Bot API 10.1): send the agent's full Markdown as one rich
+      // message (tables, headings, …) up to 32768 chars. On any content
+      // rejection or if rich is unavailable, trySendRich returns null and we
+      // fall through to the chunked Markdown/plain path below — never losing a
+      // message.
+      if (
+        richMessagesSupported &&
+        text.length > 0 &&
+        text.length <= RICH_MAX_LENGTH
+      ) {
+        const numId = parseInt(numericId, 10);
+        if (!isNaN(numId)) {
+          const richId = await this.trySendRich(numId, text, options);
+          if (richId !== null) {
+            logger.info(
+              { jid, length: text.length, threadId },
+              'Telegram rich message sent',
+            );
+            return { messageId: richId };
+          }
+        }
+      }
 
       // Telegram has a 4096 UTF-16 code-unit limit per message. Naive
       // slice(i, i+4096) cuts surrogate pairs (e.g. emoji at offset 4095

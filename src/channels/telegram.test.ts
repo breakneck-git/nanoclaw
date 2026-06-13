@@ -7,6 +7,7 @@ import {
   _testProcessContactsFromContext,
   _testBotSenderId,
   _test_sendTelegramMessage,
+  isRichUnavailableError,
   TelegramChannel,
 } from './telegram.js';
 import * as db from '../db.js';
@@ -519,6 +520,41 @@ describe('deliverInbound — exception isolation', () => {
   });
 });
 
+describe('isRichUnavailableError (sticky-disable classifier)', () => {
+  it('treats 404 / method-not-found as the method being unavailable', () => {
+    expect(
+      isRichUnavailableError({
+        error_code: 404,
+        description: 'Not Found: method not found',
+      }),
+    ).toBe(true);
+    expect(
+      isRichUnavailableError({
+        error_code: 400,
+        description: 'Bad Request: method not supported',
+      }),
+    ).toBe(true);
+  });
+
+  it('treats per-message content/parse 400s as recoverable (NOT unavailable)', () => {
+    // A content rejection must fall back per-message, not disable rich forever.
+    expect(
+      isRichUnavailableError({
+        error_code: 400,
+        description: 'Bad Request: rich message must be non-empty',
+      }),
+    ).toBe(false);
+    expect(
+      isRichUnavailableError({
+        error_code: 400,
+        description: "Bad Request: can't parse rich message",
+      }),
+    ).toBe(false);
+    expect(isRichUnavailableError({ error_code: 429 })).toBe(false);
+    expect(isRichUnavailableError(undefined)).toBe(false);
+  });
+});
+
 describe('sendTelegramMessage narrowed catch', () => {
   it('Markdown 400 parse-error retries plain', async () => {
     const api = {
@@ -636,6 +672,57 @@ describe('TelegramChannel.sendMessage multi-chunk', () => {
       'Telegram API error during chunk 2',
     );
     expect(sendMessageMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('TelegramChannel.sendMessage rich (Bot API 10.1)', () => {
+  function makeRichChannel(opts: {
+    rich?: ReturnType<typeof vi.fn>;
+    sendMessage?: ReturnType<typeof vi.fn>;
+  }) {
+    const channel = new TelegramChannel('test-token', {
+      onMessage: vi.fn(),
+      onChatMetadata: vi.fn(),
+      registeredGroups: () => ({}),
+    });
+    const sendMessage =
+      opts.sendMessage ?? vi.fn().mockResolvedValue({ message_id: 9 } as any);
+    const rich =
+      opts.rich ?? vi.fn().mockResolvedValue({ message_id: 77 } as any);
+    (channel as any).bot = {
+      api: { sendMessage, raw: { sendRichMessage: rich } },
+    };
+    return { channel, sendMessage, rich };
+  }
+
+  it('sends the agent Markdown via sendRichMessage and returns its id (no plain send)', async () => {
+    const md = '## Title\n\n| a | b |\n|---|---|\n| 1 | 2 |';
+    const { channel, sendMessage, rich } = makeRichChannel({});
+    const r = await channel.sendMessage('tg:42', md);
+    expect(r).toEqual({ messageId: '77' });
+    expect(rich).toHaveBeenCalledTimes(1);
+    const payload = rich.mock.calls[0][0];
+    expect(payload.chat_id).toBe(42);
+    expect(payload.rich_message).toEqual({ markdown: md });
+    expect(sendMessage).not.toHaveBeenCalled(); // no fallback
+  });
+
+  it('threads message_thread_id into the rich payload', async () => {
+    const { channel, rich } = makeRichChannel({});
+    await channel.sendMessage('tg:42', 'hi', { threadId: '1573612' });
+    expect(rich.mock.calls[0][0].message_thread_id).toBe(1573612);
+  });
+
+  it('falls back to the Markdown/plain path on a content 400 (message not lost)', async () => {
+    const rich = vi
+      .fn()
+      .mockRejectedValue({ error_code: 400, description: "can't parse rich" });
+    const sendMessage = vi.fn().mockResolvedValue({ message_id: 5 } as any);
+    const { channel } = makeRichChannel({ rich, sendMessage });
+    const r = await channel.sendMessage('tg:42', 'text');
+    expect(r).toEqual({ messageId: '5' });
+    expect(rich).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledTimes(1); // fell back to plain path
   });
 });
 
