@@ -28,6 +28,16 @@ import {
 } from '../sender-allowlist.js';
 import { queueEnrich } from './telegram-enrich.js';
 import { buildMetaBlock, type BuildMetaBlockExtras } from './telegram-meta.js';
+import { PollWatchdog } from './telegram-poll-watchdog.js';
+
+/**
+ * Long-poll liveness thresholds. grammy issues a getUpdates roughly every 30s
+ * (the default long-poll timeout) when healthy, so a gap far beyond that means
+ * the loop has parked on a dead connection. We check every 30s and treat a
+ * 120s gap (4× the poll interval) as a stall.
+ */
+const POLL_STALL_THRESHOLD_MS = 120_000;
+const POLL_CHECK_INTERVAL_MS = 30_000;
 
 /**
  * Test-only re-export at module scope so tests can drive the contact pipeline
@@ -585,6 +595,7 @@ export class TelegramChannel implements Channel {
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
   private botToken: string;
+  private pollWatchdogTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
@@ -704,6 +715,33 @@ export class TelegramChannel implements Channel {
         baseFetchConfig: { agent: https.globalAgent, compress: true },
       },
     });
+
+    // Long-poll liveness watchdog. grammy parks forever on `await getUpdates`
+    // if the connection goes half-open (established TCP, server silent, no
+    // client-side timeout) — `isRunning()` stays true while the bot is silent.
+    // The transformer stamps every getUpdates; the timer exits the process when
+    // polling stalls, so launchd/systemd relaunches with a fresh connection.
+    const pollWatchdog = new PollWatchdog({
+      now: () => Date.now(),
+      stallThresholdMs: POLL_STALL_THRESHOLD_MS,
+      onStall: (sinceMs) => {
+        logger.error(
+          { sinceMs },
+          'Telegram long-poll stalled — no getUpdates progress; exiting for supervisor restart',
+        );
+        process.exit(1);
+      },
+    });
+    this.bot.api.config.use((prev, method, payload, signal) => {
+      if (method === 'getUpdates') pollWatchdog.recordPoll();
+      return prev(method, payload, signal);
+    });
+    this.pollWatchdogTimer = setInterval(
+      () => pollWatchdog.check(),
+      POLL_CHECK_INTERVAL_MS,
+    );
+    // The watchdog must not, by itself, keep the process alive.
+    this.pollWatchdogTimer.unref();
 
     // Command to get chat ID (useful for registration)
     this.bot.command('chatid', (ctx) => {
@@ -1349,6 +1387,10 @@ export class TelegramChannel implements Channel {
   }
 
   async disconnect(): Promise<void> {
+    if (this.pollWatchdogTimer) {
+      clearInterval(this.pollWatchdogTimer);
+      this.pollWatchdogTimer = null;
+    }
     if (this.bot) {
       this.bot.stop();
       this.bot = null;
