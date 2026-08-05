@@ -38,6 +38,12 @@ import { PollWatchdog } from './telegram-poll-watchdog.js';
  */
 const POLL_STALL_THRESHOLD_MS = 120_000;
 const POLL_CHECK_INTERVAL_MS = 30_000;
+/**
+ * Gap between two watchdog ticks that means the process was suspended (host
+ * sleep) rather than merely busy. 3x the interval leaves room for scheduling
+ * jitter and GC pauses without reading them as a suspension.
+ */
+const POLL_FREEZE_THRESHOLD_MS = POLL_CHECK_INTERVAL_MS * 3;
 
 /**
  * Test-only re-export at module scope so tests can drive the contact pipeline
@@ -724,12 +730,19 @@ export class TelegramChannel implements Channel {
     const pollWatchdog = new PollWatchdog({
       now: () => Date.now(),
       stallThresholdMs: POLL_STALL_THRESHOLD_MS,
+      freezeThresholdMs: POLL_FREEZE_THRESHOLD_MS,
       onStall: (sinceMs) => {
         logger.error(
           { sinceMs },
           'Telegram long-poll stalled — no getUpdates progress; exiting for supervisor restart',
         );
         process.exit(1);
+      },
+      onFreeze: (frozenMs) => {
+        logger.info(
+          { frozenMs },
+          'Host was suspended (watchdog timer skipped) — re-arming instead of restarting',
+        );
       },
     });
     this.bot.api.config.use((prev, method, payload, signal) => {
