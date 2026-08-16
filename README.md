@@ -1,3 +1,23 @@
+> **Fork of [qwibitai/nanoclaw](https://github.com/qwibitai/nanoclaw) at [`6d4f972`](https://github.com/qwibitai/nanoclaw/commit/6d4f972ad02aba57a799dcf49c4160f2d1f2c0c8) (2026-03-25, v1.2.31) — upstream has since rewritten the architecture, so this is a hard fork, not a branch waiting to merge.**
+>
+> Upstream moved on by ~1885 commits: Telegram was rebuilt on the Chat SDK bridge (`@chat-adapter/telegram`), `src/ipc.ts` was removed, and the DB and CLI layers were restructured. Of the files under `src/`, only 14 names still exist in both trees and none of them are identical. Upstream commits cannot be merged here, and the work here does not apply there unmodified.
+>
+> **What this fork is: a working, production-running Telegram assistant** built on the pre-rewrite core, with the following added on top:
+>
+> - **Full Markdown in replies** — headings, tables, lists, blockquotes and links via Bot API 10.1 Rich Messages, with a three-tier fallback (rich → Markdown → plain) so a message is never lost
+> - **Token-level streaming** using native `sendMessageDraft`
+> - **Forum topic support** — `message_thread_id` persisted end to end, replies land in the originating topic, topics auto-named from the first message via an LLM
+> - **Self-healing long-poll** — a watchdog that restarts the process on a genuine poll stall while distinguishing it from host sleep, so a sleeping laptop no longer triggers restarts
+> - **Per-group model and effort** — `AGENT_MODEL` / `AGENT_EFFORT` per group, exact model IDs or family aliases
+> - **Overload resilience** — retries the turn on Anthropic 529 with backoff and tells the user it is waiting
+> - **Outbound files** — `send_file` for attachments up to 50 MB
+> - **Per-group isolation** — MCP whitelist with a fail-closed allowlist, restricted-user groups, per-group credentials via `save_credential`
+> - **Richer agent IPC** — `view_media`, `lookup_messages`, `lookup_contacts`, `annotate_contact`
+> - **Scheduled tasks** pinned to the thread they were created in, so reminders never surface in the wrong conversation
+> - **Gmail channel** alongside Telegram
+>
+> Personal configuration (chat IDs, credentials, group memory, transcripts) is not tracked in this repository.
+
 <p align="center">
   <img src="assets/nanoclaw-logo.png" alt="NanoClaw" width="400">
 </p>
