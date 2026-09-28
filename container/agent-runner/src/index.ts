@@ -28,6 +28,11 @@ import {
   overloadRetryStep,
   OVERLOAD_BACKOFF_MS,
 } from './overload-retry.js';
+import {
+  isMissingSessionError,
+  resultErrorText,
+  withMissingSessionFallback,
+} from './missing-session.js';
 
 // Agent model. The host's container-runner injects AGENT_MODEL (from the
 // global .env / OneCLI secrets, or a per-group data/env/<folder>.env override)
@@ -468,7 +473,7 @@ async function runQuery(
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; overloaded?: boolean; overloadText?: string }> {
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; overloaded?: boolean; overloadText?: string; missingSession?: boolean }> {
   const stream = new MessageStream();
   stream.push(prompt);
 
@@ -505,6 +510,7 @@ async function runQuery(
   // the turn instead of emitting this as the reply.
   let overloaded = false;
   let overloadText: string | undefined;
+  let missingSession = false;
 
   // Persona append: groups/global/CLAUDE.md for non-main groups (main groups
   // use their own group CLAUDE.md, auto-loaded from cwd /workspace/group).
@@ -712,17 +718,25 @@ async function runQuery(
 
     if (message.type === 'result') {
       resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
+      const isError = (message as { is_error?: boolean }).is_error === true;
+      // Error subtypes carry their text in `errors[]`, not `result`.
+      const textResult = isError
+        ? resultErrorText(message as { subtype?: string; result?: string; errors?: string[] })
+        : 'result' in message ? (message as { result?: string }).result : null;
       // The SDK sets is_error=true even on a subtype:'success' result when the
       // turn ended in an API error — e.g. a 529 overload that exhausted retries,
       // surfaced as result text "API Error: 529 ...". Delivering that as a normal
       // reply would message the user the raw error (and a scheduled task would
       // send it as the "reminder"). Classify it as an error so the host skips
       // delivery; scheduled tasks then retry on their next run.
-      const isError = (message as { is_error?: boolean }).is_error === true;
       const isTransientOverload = isError && isOverloadError(textResult);
       log(`Result #${resultCount}: subtype=${message.subtype} is_error=${isError} overloaded=${isTransientOverload}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
-      if (isTransientOverload) {
+      if (isError && isMissingSessionError(textResult)) {
+        // Resumed session's transcript is gone — do NOT emit. main() re-runs
+        // the turn without resume (see missing-session.ts).
+        missingSession = true;
+        break;
+      } else if (isTransientOverload) {
         // Transient overload — do NOT emit. Signal main() to retry the turn
         // with backoff (and a user notice). End the stream now; the turn
         // produced no usable output.
@@ -748,7 +762,7 @@ async function runQuery(
 
   ipcPolling = false;
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, overloaded: ${overloaded}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery, overloaded, overloadText };
+  return { newSessionId, lastAssistantUuid, closedDuringQuery, overloaded, overloadText, missingSession };
 }
 
 interface ScriptResult {
@@ -875,7 +889,17 @@ async function main(): Promise<void> {
       let overloadNoticeSent = false;
       for (let attempt = 0; ; attempt++) {
         try {
-          queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+          const turn = await withMissingSessionFallback(
+            sessionId,
+            (sid) => runQuery(prompt, sid, mcpServerPath, containerInput, sdkEnv, sid ? resumeAt : undefined),
+            (dead) => log(`Session ${dead} not found (transcript deleted) — starting a fresh session`),
+          );
+          if (turn.sessionId !== sessionId) {
+            // Dropped the dead session: resumeAt pointed into it.
+            sessionId = turn.sessionId;
+            resumeAt = undefined;
+          }
+          queryResult = turn.result;
         } catch (err) {
           const m = err instanceof Error ? err.message : String(err);
           // A transient overload may surface as a thrown error rather than a
@@ -912,6 +936,17 @@ async function main(): Promise<void> {
 
       // Retries exhausted (error already emitted) — end this container turn.
       if (!queryResult || queryResult.overloaded) {
+        break;
+      }
+
+      // A fresh session can't be "missing"; if it is, surface it rather than
+      // report an empty success that silently swallows the message.
+      if (queryResult.missingSession) {
+        writeOutput({
+          status: 'error',
+          result: null,
+          error: 'Session not found even without resume',
+        });
         break;
       }
 
