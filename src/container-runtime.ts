@@ -12,10 +12,71 @@ import { logger } from './logger.js';
 const envConfig = readEnvFile([
   'CREDENTIAL_PROXY_HOST',
   'CONTAINER_HOST_GATEWAY',
+  'CONTAINER_RUNTIME',
 ]);
 
+export type ContainerRuntime = 'container' | 'docker';
+
+/**
+ * Pick the runtime: CONTAINER_RUNTIME (same name container/build.sh reads)
+ * wins; otherwise Apple container on macOS, docker everywhere else.
+ */
+export function resolveContainerRuntime(
+  platform: NodeJS.Platform,
+  override?: string,
+): ContainerRuntime {
+  if (override) {
+    if (override === 'container' || override === 'docker') return override;
+    throw new Error(
+      `Unknown CONTAINER_RUNTIME "${override}" — use "container" or "docker"`,
+    );
+  }
+  return platform === 'darwin' ? 'container' : 'docker';
+}
+
 /** The container runtime binary name. */
-export const CONTAINER_RUNTIME_BIN = 'container';
+export const CONTAINER_RUNTIME_BIN: ContainerRuntime = resolveContainerRuntime(
+  os.platform(),
+  process.env.CONTAINER_RUNTIME || envConfig.CONTAINER_RUNTIME,
+);
+
+/** Command that succeeds only when the runtime is up. */
+export function statusCommand(rt: ContainerRuntime): string {
+  return rt === 'docker' ? 'docker info' : 'container system status';
+}
+
+/** Command that starts the runtime; null when systemd owns it (docker). */
+export function startCommand(rt: ContainerRuntime): string | null {
+  return rt === 'docker' ? null : 'container system start';
+}
+
+/** Command listing running containers, in the shape parseRunningNanoclaw reads. */
+export function listRunningCommand(rt: ContainerRuntime): string {
+  return rt === 'docker'
+    ? "docker ps --filter name=nanoclaw- --format '{{.Names}}'"
+    : 'container ls --format json';
+}
+
+/** Names of running nanoclaw-* containers from listRunningCommand output. */
+export function parseRunningNanoclaw(
+  rt: ContainerRuntime,
+  stdout: string,
+): string[] {
+  if (rt === 'docker') {
+    return stdout
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((n) => n.startsWith('nanoclaw-'));
+  }
+  const containers: { status: string; configuration: { id: string } }[] =
+    JSON.parse(stdout || '[]');
+  return containers
+    .filter(
+      (c) =>
+        c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'),
+    )
+    .map((c) => c.configuration.id);
+}
 
 /** Hostname/IP containers use to reach the host machine.
  * Apple Container: 192.168.64.1 (vmnet gateway)
@@ -95,12 +156,18 @@ export function stopContainer(name: string): string {
 /** Ensure the container runtime is running, starting it if needed. */
 export function ensureContainerRuntimeRunning(): void {
   try {
-    execSync(`${CONTAINER_RUNTIME_BIN} system status`, { stdio: 'pipe' });
+    execSync(statusCommand(CONTAINER_RUNTIME_BIN), { stdio: 'pipe' });
     logger.debug('Container runtime already running');
   } catch {
     logger.info('Starting container runtime...');
     try {
-      execSync(`${CONTAINER_RUNTIME_BIN} system start`, {
+      const start = startCommand(CONTAINER_RUNTIME_BIN);
+      if (!start) {
+        throw new Error(
+          'Docker is not running (check: systemctl status docker)',
+        );
+      }
+      execSync(start, {
         stdio: 'pipe',
         timeout: 30000,
       });
@@ -119,12 +186,15 @@ export function ensureContainerRuntimeRunning(): void {
       console.error(
         '║  Agents cannot run without a container runtime. To fix:        ║',
       );
-      console.error(
-        '║  1. Ensure Apple Container is installed                        ║',
-      );
-      console.error(
-        '║  2. Run: container system start                                ║',
-      );
+      const [step1, step2] =
+        CONTAINER_RUNTIME_BIN === 'docker'
+          ? ['Ensure Docker is installed', 'Run: systemctl start docker']
+          : [
+              'Ensure Apple Container is installed',
+              'Run: container system start',
+            ];
+      console.error(`║  1. ${step1.padEnd(59)}║`);
+      console.error(`║  2. ${step2.padEnd(59)}║`);
       console.error(
         '║  3. Restart NanoClaw                                           ║',
       );
@@ -139,18 +209,11 @@ export function ensureContainerRuntimeRunning(): void {
 /** Kill orphaned NanoClaw containers from previous runs. */
 export function cleanupOrphans(): void {
   try {
-    const output = execSync(`${CONTAINER_RUNTIME_BIN} ls --format json`, {
+    const output = execSync(listRunningCommand(CONTAINER_RUNTIME_BIN), {
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf-8',
     });
-    const containers: { status: string; configuration: { id: string } }[] =
-      JSON.parse(output || '[]');
-    const orphans = containers
-      .filter(
-        (c) =>
-          c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'),
-      )
-      .map((c) => c.configuration.id);
+    const orphans = parseRunningNanoclaw(CONTAINER_RUNTIME_BIN, output);
     for (const name of orphans) {
       try {
         execSync(stopContainer(name), { stdio: 'pipe' });

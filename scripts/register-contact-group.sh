@@ -10,10 +10,11 @@
 # src/db.ts (migration around line 175). If that column is missing, this
 # script aborts before mutating the DB.
 #
-# Run from anywhere; the DB path is absolute.
+# Run from anywhere; the DB path resolves from this script's location.
 set -euo pipefail
 
-DB="${NANOCLAW_DB:-/Users/breakneck/nanoclaw/store/messages.db}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DB="${NANOCLAW_DB:-$SCRIPT_DIR/../store/messages.db}"
 
 if [[ ! -f "$DB" ]]; then
   echo "ERROR: SQLite DB not found at $DB" >&2

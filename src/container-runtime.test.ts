@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+// Pin the runtime so the command-shape tests below are the same on macOS and
+// Linux; per-platform selection is covered by resolveContainerRuntime tests.
+vi.hoisted(() => {
+  process.env.CONTAINER_RUNTIME = 'container';
+});
+
 // Mock logger
 vi.mock('./logger.js', () => ({
   logger: {
@@ -18,6 +24,11 @@ vi.mock('child_process', () => ({
 
 import {
   CONTAINER_RUNTIME_BIN,
+  resolveContainerRuntime,
+  listRunningCommand,
+  parseRunningNanoclaw,
+  statusCommand,
+  startCommand,
   readonlyMountArgs,
   stopContainer,
   ensureContainerRuntimeRunning,
@@ -30,6 +41,64 @@ beforeEach(() => {
 });
 
 // --- Pure functions ---
+
+describe('resolveContainerRuntime', () => {
+  it('uses Apple container on macOS and docker elsewhere', () => {
+    expect(resolveContainerRuntime('darwin')).toBe('container');
+    expect(resolveContainerRuntime('linux')).toBe('docker');
+  });
+
+  it('lets CONTAINER_RUNTIME override the platform default', () => {
+    expect(resolveContainerRuntime('darwin', 'docker')).toBe('docker');
+    expect(resolveContainerRuntime('linux', 'container')).toBe('container');
+  });
+
+  it('treats an empty override as unset', () => {
+    expect(resolveContainerRuntime('linux', '')).toBe('docker');
+  });
+
+  it('rejects an unknown runtime', () => {
+    expect(() => resolveContainerRuntime('linux', 'podman')).toThrow(/podman/);
+  });
+});
+
+describe('runtime commands', () => {
+  it('docker: lists running nanoclaw containers by name', () => {
+    expect(listRunningCommand('docker')).toBe(
+      "docker ps --filter name=nanoclaw- --format '{{.Names}}'",
+    );
+    expect(statusCommand('docker')).toBe('docker info');
+    expect(startCommand('docker')).toBeNull();
+  });
+
+  it('container: keeps the Apple container commands', () => {
+    expect(listRunningCommand('container')).toBe('container ls --format json');
+    expect(statusCommand('container')).toBe('container system status');
+    expect(startCommand('container')).toBe('container system start');
+  });
+});
+
+describe('parseRunningNanoclaw', () => {
+  it('docker: takes nanoclaw- names from one-per-line output', () => {
+    expect(
+      parseRunningNanoclaw(
+        'docker',
+        'nanoclaw-main-1\nother-thing\nnanoclaw-dana-2\n',
+      ),
+    ).toEqual(['nanoclaw-main-1', 'nanoclaw-dana-2']);
+    expect(parseRunningNanoclaw('docker', '')).toEqual([]);
+  });
+
+  it('container: takes running nanoclaw- ids from JSON output', () => {
+    const out = JSON.stringify([
+      { status: 'running', configuration: { id: 'nanoclaw-a-1' } },
+      { status: 'stopped', configuration: { id: 'nanoclaw-b-2' } },
+      { status: 'running', configuration: { id: 'other' } },
+    ]);
+    expect(parseRunningNanoclaw('container', out)).toEqual(['nanoclaw-a-1']);
+    expect(parseRunningNanoclaw('container', '')).toEqual([]);
+  });
+});
 
 describe('readonlyMountArgs', () => {
   it('returns --mount flag with type=bind and readonly', () => {
