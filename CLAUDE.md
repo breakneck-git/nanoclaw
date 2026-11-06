@@ -57,18 +57,20 @@ npm run build        # Compile TypeScript
 ./container/build.sh # Rebuild agent container
 ```
 
-Service management:
+Service management (prod, on `lenovo-srv0` as `claude`):
 ```bash
-# macOS (launchd)
-launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
-launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist
-launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # restart
-
-# Linux (systemd)
-systemctl --user start nanoclaw
-systemctl --user stop nanoclaw
-systemctl --user restart nanoclaw
+sudo systemctl status nanoclaw
+sudo systemctl restart nanoclaw
+sudo -u nanoclaw tail -f /opt/nanoclaw/logs/nanoclaw.log
 ```
+
+## Прод
+
+- **Прод:** `lenovo-srv0` (ssh `lenovo-srv0-claude`), Debian 13, Docker. Код и состояние — `/opt/nanoclaw` (клон `fork`), пользователь `nanoclaw`, системный юнит `nanoclaw.service` (enabled, `Restart=always`), логи — `/opt/nanoclaw/logs/`. Всё под `nanoclaw`: `sudo -u nanoclaw -H bash -lc "cd /opt/nanoclaw && …"`.
+- **Теста нет.** Проверка до выкатки — `npx vitest run` на сервере.
+- **Выкатка:** commit в `main` → `git push fork main` → на сервере `git pull --ff-only fork main && npm run build` (+ `./container/build.sh`, если менялся `container/`) → `sudo systemctl restart nanoclaw`. Только по слову владельца «прод».
+- **Mac больше не прод:** launchd-задача `com.nanoclaw` выключена (`launchctl disable`). Не включать — второй процесс с тем же Telegram-токеном даёт 409.
+- Сервер (Docker, nftables, юнит, мониторинг, бэкапы) — зона сисадмина; сессия nanoclaw меняет только `/opt/nanoclaw` и `/home/nanoclaw`.
 
 ## Troubleshooting
 

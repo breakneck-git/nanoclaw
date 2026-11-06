@@ -17,6 +17,8 @@
 > - **Gmail channel** alongside Telegram
 >
 > Personal configuration (chat IDs, credentials, group memory, transcripts) is not tracked in this repository.
+>
+> **Where it runs:** production is a Debian 13 (x86_64) server — a systemd unit under a dedicated user, agents in Docker. The runtime is picked per platform, so the same code still runs on macOS with Apple Container.
 
 <p align="center">
   <img src="assets/nanoclaw-logo.png" alt="NanoClaw" width="400">
