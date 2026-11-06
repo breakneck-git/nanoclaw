@@ -22,6 +22,7 @@ import { logger } from './logger.js';
 import {
   CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
+  ContainerRuntime,
   hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
@@ -88,6 +89,7 @@ export interface VolumeMount {
 export function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  runtime: ContainerRuntime = CONTAINER_RUNTIME_BIN,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -105,8 +107,18 @@ export function buildVolumeMounts(
       readonly: true,
     });
 
-    // .env is shadowed inside the container via mount --bind in entrypoint.sh
-    // (Apple Container only supports directory mounts, not file mounts).
+    // Shadow .env so the agent cannot read host secrets. Docker can bind a
+    // single file, and its containers lack CAP_SYS_ADMIN for the entrypoint's
+    // mount --bind — so the host does it. Apple Container only supports
+    // directory mounts; there the entrypoint (running as root in the VM)
+    // shadows .env itself, and skips when .env is no longer a regular file.
+    if (runtime === 'docker') {
+      mounts.push({
+        hostPath: '/dev/null',
+        containerPath: '/workspace/project/.env',
+        readonly: true,
+      });
+    }
 
     // Main also gets its group folder as the working directory
     mounts.push({

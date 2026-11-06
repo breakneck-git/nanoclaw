@@ -1007,3 +1007,34 @@ describe('buildContainerArgs AGENT_EFFORT injection', () => {
     expect(effortArg(args)).toBeUndefined();
   });
 });
+
+// Docker gives containers no CAP_SYS_ADMIN, so the entrypoint's
+// `mount --bind /dev/null .env` fails there and every main-group turn dies.
+// Docker can bind a single file, so the host shadows .env instead.
+describe('buildVolumeMounts .env shadow', () => {
+  const mainGroup = {
+    name: 'Main',
+    folder: 'telegram_main',
+    trigger: '@Andy',
+    added_at: new Date().toISOString(),
+    isMain: true,
+  };
+  const shadow = (mounts: { containerPath: string }[]) =>
+    mounts.find((m) => m.containerPath === '/workspace/project/.env');
+
+  it('docker: main group gets /dev/null read-only over the project .env', () => {
+    vi.mocked(fs.existsSync).mockImplementation(() => false);
+    expect(shadow(buildVolumeMounts(mainGroup, true, 'docker'))).toEqual({
+      hostPath: '/dev/null',
+      containerPath: '/workspace/project/.env',
+      readonly: true,
+    });
+  });
+
+  it('Apple container: no file mount — the entrypoint shadows .env itself', () => {
+    vi.mocked(fs.existsSync).mockImplementation(() => false);
+    expect(
+      shadow(buildVolumeMounts(mainGroup, true, 'container')),
+    ).toBeUndefined();
+  });
+});
