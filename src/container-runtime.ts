@@ -88,36 +88,31 @@ export const CONTAINER_HOST_GATEWAY =
   envConfig.CONTAINER_HOST_GATEWAY ||
   'host.docker.internal';
 
+export interface ProxyBindProbe {
+  platform: NodeJS.Platform;
+  isWsl: boolean;
+  ifaces: NodeJS.Dict<os.NetworkInterfaceInfo[]>;
+  /** Gateway IP of docker's default bridge network, or null if unknown. */
+  bridgeGateway: () => string | null;
+}
+
 /**
- * Address the credential proxy binds to.
- * Docker Desktop (macOS): 127.0.0.1 — the VM routes host.docker.internal to loopback.
- * Docker (Linux): bind to the docker0 bridge IP so only containers can reach it,
- *   falling back to 0.0.0.0 if the interface isn't found.
+ * Address the credential proxy binds to (when CREDENTIAL_PROXY_HOST is unset).
+ * macOS / WSL: 127.0.0.1 — the runtime VM routes host.docker.internal to loopback.
+ * Bare-metal Linux: the docker0 bridge IP, so only containers can reach it.
+ *   docker0 with no running containers is NO-CARRIER and os.networkInterfaces()
+ *   omits it, so fall back to the bridge gateway docker itself reports.
+ * Never 0.0.0.0: the proxy has no authentication and serves real credentials.
  */
-export const PROXY_BIND_HOST =
-  process.env.CREDENTIAL_PROXY_HOST ||
-  envConfig.CREDENTIAL_PROXY_HOST ||
-  detectProxyBindHost();
+export function chooseProxyBindHost(p: ProxyBindProbe): string {
+  if (p.platform === 'darwin' || p.isWsl) return '127.0.0.1';
 
-function detectProxyBindHost(): string {
-  if (os.platform() === 'darwin') return '127.0.0.1';
+  const ipv4 = p.ifaces['docker0']?.find((a) => a.family === 'IPv4');
+  if (ipv4) return ipv4.address;
 
-  // WSL uses Docker Desktop (same VM routing as macOS) — loopback is correct.
-  // Check /proc filesystem, not env vars — WSL_DISTRO_NAME isn't set under systemd.
-  if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
+  const gateway = p.bridgeGateway();
+  if (gateway) return gateway;
 
-  // Bare-metal Linux: bind to the docker0 bridge IP instead of 0.0.0.0
-  const ifaces = os.networkInterfaces();
-  const docker0 = ifaces['docker0'];
-  if (docker0) {
-    const ipv4 = docker0.find((a) => a.family === 'IPv4');
-    if (ipv4) return ipv4.address;
-  }
-
-  // No safe interface found. Refuse to fall back to 0.0.0.0 — the credential
-  // proxy serves real API keys with no authentication. Binding to all
-  // interfaces would expose them to anyone on the network. The user must opt
-  // in explicitly via CREDENTIAL_PROXY_HOST (e.g. a podman/CNI bridge IP).
   throw new Error(
     'Cannot detect a safe credential proxy bind address: no docker0 bridge ' +
       'and not running on macOS/WSL. Refusing to bind to 0.0.0.0 because the ' +
@@ -125,6 +120,39 @@ function detectProxyBindHost(): string {
       'credentials to the network. Set CREDENTIAL_PROXY_HOST in .env to the ' +
       'container-runtime bridge IP (or 127.0.0.1 if your runtime routes ' +
       'host.docker.internal to loopback).',
+  );
+}
+
+function dockerBridgeGateway(): string | null {
+  try {
+    const out = execSync(
+      "docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}} {{end}}'",
+      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 },
+    );
+    return (
+      out
+        .trim()
+        .split(/\s+/)
+        .find((ip) => /^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) ?? null
+    );
+  } catch (err) {
+    logger.warn({ err }, 'docker network inspect bridge failed');
+    return null;
+  }
+}
+
+/** Resolve the proxy bind address. Call after the container runtime is up. */
+export function proxyBindHost(): string {
+  return (
+    process.env.CREDENTIAL_PROXY_HOST ||
+    envConfig.CREDENTIAL_PROXY_HOST ||
+    chooseProxyBindHost({
+      platform: os.platform(),
+      // Check /proc, not env vars — WSL_DISTRO_NAME isn't set under systemd.
+      isWsl: fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop'),
+      ifaces: os.networkInterfaces(),
+      bridgeGateway: dockerBridgeGateway,
+    })
   );
 }
 

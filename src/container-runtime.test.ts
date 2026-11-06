@@ -33,6 +33,7 @@ import {
   stopContainer,
   ensureContainerRuntimeRunning,
   cleanupOrphans,
+  chooseProxyBindHost,
 } from './container-runtime.js';
 import { logger } from './logger.js';
 
@@ -244,5 +245,69 @@ describe('cleanupOrphans', () => {
       { count: 2, names: ['nanoclaw-a-1', 'nanoclaw-b-2'] },
       'Stopped orphaned containers',
     );
+  });
+});
+
+// --- chooseProxyBindHost ---
+
+describe('chooseProxyBindHost', () => {
+  const docker0Up = {
+    docker0: [
+      {
+        address: '172.17.0.1',
+        family: 'IPv4' as const,
+        netmask: '255.255.0.0',
+        mac: '00:00:00:00:00:00',
+        internal: false,
+        cidr: '172.17.0.1/16',
+      },
+    ],
+  };
+  const noGateway = () => null;
+
+  it('uses loopback on macOS', () => {
+    expect(
+      chooseProxyBindHost({
+        platform: 'darwin',
+        isWsl: false,
+        ifaces: {},
+        bridgeGateway: noGateway,
+      }),
+    ).toBe('127.0.0.1');
+  });
+
+  it('uses the docker0 address when the interface is listed', () => {
+    expect(
+      chooseProxyBindHost({
+        platform: 'linux',
+        isWsl: false,
+        ifaces: docker0Up,
+        bridgeGateway: () => '10.9.9.9',
+      }),
+    ).toBe('172.17.0.1');
+  });
+
+  // docker0 with no running containers is NO-CARRIER, and Node's
+  // os.networkInterfaces() omits it — the state right after a host reboot.
+  it('falls back to the docker bridge gateway when docker0 is not listed', () => {
+    expect(
+      chooseProxyBindHost({
+        platform: 'linux',
+        isWsl: false,
+        ifaces: { lo: [] },
+        bridgeGateway: () => '172.17.0.1',
+      }),
+    ).toBe('172.17.0.1');
+  });
+
+  it('refuses to guess when neither docker0 nor the bridge gateway is known', () => {
+    expect(() =>
+      chooseProxyBindHost({
+        platform: 'linux',
+        isWsl: false,
+        ifaces: { lo: [] },
+        bridgeGateway: noGateway,
+      }),
+    ).toThrow(/CREDENTIAL_PROXY_HOST/);
   });
 });
