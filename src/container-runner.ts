@@ -27,7 +27,8 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
-import { readEnvFile, readPerGroupEnvFile } from './env.js';
+import { readEnvFile } from './env.js';
+import { readPerGroupEnvFile } from './group-env.js';
 import { refreshGoogleTokens } from './google-token-refresh.js';
 import { validateAdditionalMounts } from './mount-security.js';
 
