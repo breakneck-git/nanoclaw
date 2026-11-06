@@ -109,6 +109,18 @@ export async function run(args: string[]): Promise<void> {
     });
     buildOk = true;
     logger.info('Container build succeeded');
+    // Same as container/build.sh: drop the now-untagged previous image (its
+    // unpacked snapshot is ~2.4 GB under Apple container). Best effort.
+    try {
+      execSync(
+        runtime === 'apple-container'
+          ? 'container image prune'
+          : 'docker image prune -f',
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+    } catch (err) {
+      logger.warn({ err }, 'Dangling image prune failed');
+    }
   } catch (err) {
     logger.error({ err }, 'Container build failed');
   }

@@ -15,6 +15,15 @@ echo "Image: ${IMAGE_NAME}:${TAG}"
 
 ${CONTAINER_RUNTIME} build -t "${IMAGE_NAME}:${TAG}" .
 
+# A rebuild leaves the previous image untagged; with Apple container each one
+# keeps a ~2.4 GB unpacked snapshot. Drop dangling images only — tagged ones
+# (node, alpine, the new build) stay. Failure here must not fail the build.
+if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+  docker image prune -f || true
+else
+  ${CONTAINER_RUNTIME} image prune || true
+fi
+
 echo ""
 echo "Build complete!"
 echo "Image: ${IMAGE_NAME}:${TAG}"
