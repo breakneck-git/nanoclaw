@@ -8,7 +8,18 @@ cd "$SCRIPT_DIR"
 
 IMAGE_NAME="nanoclaw-agent"
 TAG="${1:-latest}"
-CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-container}"
+
+# Build with the runtime the host will run containers with. The rule
+# (CONTAINER_RUNTIME from env/.env, else Apple container on macOS, docker
+# elsewhere) lives in src/container-runtime.ts — ask it, don't copy it.
+if [ -z "${CONTAINER_RUNTIME:-}" ]; then
+  if [ ! -f ../dist/container-runtime.js ]; then
+    echo "dist/ is missing — run 'npm run build' first (or set CONTAINER_RUNTIME)." >&2
+    exit 1
+  fi
+  CONTAINER_RUNTIME="$(cd .. && LOG_LEVEL=silent node --input-type=module -e \
+    "const m = await import('./dist/container-runtime.js'); console.log(m.CONTAINER_RUNTIME_BIN);")"
+fi
 
 echo "Building NanoClaw agent container image..."
 echo "Image: ${IMAGE_NAME}:${TAG}"
